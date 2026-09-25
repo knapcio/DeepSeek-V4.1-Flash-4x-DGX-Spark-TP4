@@ -3,11 +3,10 @@
 Newest first. Each entry says what changed in the production stack and what was measured; the
 raw results live under `docs/results/`.
 
-## 2026-09-25 v2.2 (candidate)
+## 2026-09-25 v2.2
 
-**Pre-gate.** Mechanisms and the fleet A/B deltas measured while developing them (4-node fleet, greedy output
-byte-identical in every A/B). The release gate (fresh clone, full test chain, README tables) has not run yet;
-its numbers replace these.
+Decode-step overhead removed, all lossless: greedy output byte-identical to v2.1. Fresh-clone release gate,
+raw output: [`docs/results/validation-20260925-v22.txt`](docs/results/validation-20260925-v22.txt).
 
 - **`adapter/l2_prefetch.py`, `DSV41_L2_PREFETCH_WOA=1`, on.** The MXFP8 linear before `wo_a` opens an L2
   prefetch window for `wo_a` while the attention core runs: -0.4 ms/step. The other v3/v4 sub-gates (AHEAD,
@@ -15,22 +14,32 @@ its numbers replace these.
   collectives are hooked at both install sites.
 - **`adapter/spec_sync_free.py`, `DSV41_SPEC_SYNC_FREE=all`, on.** The per-step rank-0 broadcasts of the draft
   token, the verify epilogue and verify_cap's length are dropped (their values are identical on every rank; the
-  draft noise is a counter-based stream shared by the ranks). Audit mode: 0 mismatches over ~60k checks;
-  -0.2 to -0.55 ms/step.
+  draft noise is a counter-based stream shared by the ranks). Audit mode: 0 rank mismatches over ~60k checks.
+  In-boot A/B -0.53 to -0.59 ms/step; the reboot suite gave ~-0.2 ms.
 - **`adapter/eager_glue.py`, `DSV41_EAGER_GLUE=all` (fence, stage, vcap, vcapk), on.** Fewer eager kernels
-  between the draft and verify graphs, bit-identical. `tvglue` / `dglue` dropped after a fleet boot's check
-  failed (stale `out_cache_loc` pointer in a glue graph).
+  between the draft and verify graphs, bit-identical: ~-0.1 to -0.2 ms/step. `tvglue` / `dglue` dropped after
+  a fleet boot's check failed (stale `out_cache_loc` pointer in a glue graph).
 - **Bit-exact bundle, `DSV41_SPLIT_COMPACT_GATHER=1`, on:** compact RoCE columns gather for the replicated
   splits (new `all_gather(columns=...)` kernel in `runtime/b12x`), the `wqkv_a` window GEMM
   (`DSV41_REPLICATED_SPLIT_WINDOW`, default on), and the b12x_next barrier single fill + Triton route planner
-  under determinism (`SOURCE_PATCH` `da662ccc7e2372b5`). -0.4 ms/step prose, -0.45 ms code; sparkDash prose c1
-  median 89.5.
+  under determinism (`SOURCE_PATCH` `da662ccc7e2372b5`). -0.40 ms/step prose, -0.45 ms code. 4-rank gather
+  test PASS (M=6: compact 11.31 us vs 14.88 us for the old path).
+- Includes the ring entry below (`DSV41_ROCE_RING`, #8, off by default).
 - `DSV41_PREFILL_SP_FP8_MOE=1` (MXFP8 MoE-input gathers in prefill SP, b12x_next pre-quantized input): bit-exact
   on every check but flat on real-text prefill. In the code, off, not in the production line.
 - In-boot A/B harness (`adapter/ab_variant.py`, `scripts/ab_inboot.py`, `scripts/repeat_sha.py`), test only, off
   unless `DSV41_AB_VARIANTS` >= 2.
-- Tested and not adopted: fused MXFP8 quantization into q_norm / wo_a / hc (flat), layer-14 Engram lookup on a
-  side stream during verify (~0), fused hc prefill kernel (slower).
+- Fresh clone, sparkDash 1.8.8: prose c1 87.67 -> 89.76 (median of five, 88.97-90.21; second boot 89.04-90.42),
+  code c1 124.76 -> 132.37 (median of three: 124.95 / 132.62 / 132.37), structured c1 156.9, json c1 124.3; c4 per stream
+  prose 41.5, code 64.1, structured 70.2, json 78.7; c16 aggregate prose 340.9, code 436.4, structured 565.5,
+  json 653. Decode step c1 prose 33.26 -> 31.24-32.5 ms, code 38.88 -> 37.4-37.84 ms. Varied prompts
+  58.4 / 94.3 / 71.8 -> 61.1 / 99.0 / 74.7. Prefill 16k-128k 5734-5855, 262k 5286 (one pass; v2.1
+  5793-5936, 5355); real text 4743-4946 from 15k to 123k. 1,011,084-token needle PASS in 324.3 s (head low-water 6,029 MiB). qeval not
+  re-run (greedy output byte-identical to v2.1, which scores 72/75). Two boots, both healthy on the first try.
+- Tested and not adopted: the L2 sub-gates above, fused MXFP8 quantization into q_norm / wo_a / hc (flat),
+  layer-14 Engram lookup on a side stream during verify (~0), fused hc prefill kernel (slower), MoE restructures
+  (the phases already run at 223 GB/s live), CPU pinning (flat). Details in
+  [docs/history.md](docs/history.md#2026-09-25).
 
 ## 2026-09-25 (ring)
 

@@ -460,7 +460,8 @@ step time = the engine's `spec_verify_ct`, time to first token subtracted):
 The switched README's production line (v2, `7ac7123`) with the ring additions, built from this
 repository (`Dockerfile.canary-roce`), measured on the four-Spark ring the same day, against the
 README's v2 numbers (v2.1's `DSV41_PREFILL_SP_FP8` came later; it is fabric-independent and was not in
-this run; the switched README now shows v2.1: prose c1 87.7, prefill ~5.8-5.9k tok/s at 16k-128k). Raw output: [`docs/results/ring-mesh-20260925.txt`](results/ring-mesh-20260925.txt).
+this run; v2.1 on the switched fabric gave prose c1 87.7 and prefill ~5.8-5.9k tok/s at 16k-128k, and the README
+now shows v2.2). Raw output: [`docs/results/ring-mesh-20260925.txt`](results/ring-mesh-20260925.txt).
 
 | | Ring (this) | Switched (README at v2) |
 |---|---:|---:|
