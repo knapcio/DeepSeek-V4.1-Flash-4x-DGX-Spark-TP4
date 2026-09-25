@@ -717,6 +717,8 @@ class RoceOneshotAllReduce:
         dim: int = -1,
         out: Optional[torch.Tensor] = None,
         stream: object = None,
+        columns: Optional[Sequence[int]] = None,
+        column_offset: int = 0,
     ) -> torch.Tensor:
         """Concatenate every rank's ``inp`` along ``dim`` (0 or the last dim).
 
@@ -724,8 +726,15 @@ class RoceOneshotAllReduce:
         directly (no reshape or copy afterwards).  Otherwise the shards are
         gathered contiguously with 16-byte padding and finished with a torch
         reshape, which still keeps the collective on RDMA.
+
+        ``columns`` (ds41): a last-dim gather of unequal shards; see
+        ``_all_gather_columns``.  Without it this method is unchanged.
         """
 
+        if columns is not None:
+            return self._all_gather_columns(
+                inp, columns, column_offset=column_offset, out=out, stream=stream
+            )
         with self._lock:
             self.check_health()
             if not self.should_all_gather(inp, dim):
@@ -790,6 +799,145 @@ class RoceOneshotAllReduce:
                     return result.contiguous()
                 out.copy_(result)
                 return out
+
+    # -- uneven last-dim all-gather ("columns", ds41) -----------------------------
+
+    def _columns_launcher_key(self, col_packs: Sequence[int]) -> tuple[object, ...]:
+        """Cache key of the columns all-gather launcher for one column layout (in packs)."""
+        return self._gather_launcher_key() + (tuple(int(c) for c in col_packs),)
+
+    def _column_packs(self, columns: Sequence[int], element_size: int) -> tuple[int, ...]:
+        """Per-rank 16-byte pack counts of ``columns`` elements, or ValueError."""
+        columns = tuple(int(c) for c in columns)
+        if len(columns) != self.world_size or min(columns) < 1:
+            raise ValueError(
+                f"columns needs one positive width per rank ({self.world_size}), got {columns}"
+            )
+        if any((c * element_size) % PACK_BYTES for c in columns):
+            raise ValueError(
+                f"every column width must be a multiple of 16 bytes, got {columns} x {element_size} B"
+            )
+        return tuple(c * element_size // PACK_BYTES for c in columns)
+
+    def should_all_gather_columns(
+        self, inp: torch.Tensor, columns: Sequence[int]
+    ) -> bool:
+        """Eligible for ``all_gather(columns=...)``: 2-D CUDA tensor on this device, unit column
+        stride, 16-byte widths, and the widest rank's shard within ``max_gather_bytes``.
+
+        Depends only on dtype, shape and the shared ``columns``, never on pointers or on which
+        rank asks, so tensor-parallel ranks take the same decision.
+        """
+
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if not inp.is_cuda or inp.dim() != 2 or inp.device != self.device:
+            return False
+        if inp.is_complex() or inp.is_sparse or inp.dtype == torch.bool:
+            return False
+        try:
+            packs = self._column_packs(columns, inp.element_size())
+        except ValueError:
+            return False
+        nbytes = inp.shape[0] * max(packs) * PACK_BYTES
+        return 0 < nbytes <= self.max_gather_bytes
+
+    def prepare_columns(self, columns: Sequence[int], dtype: torch.dtype = torch.bfloat16) -> None:
+        """Compile the columns all-gather launcher for this layout ahead of CUDA graph capture."""
+        packs = self._column_packs(columns, torch.empty((), dtype=dtype).element_size())
+        with torch.cuda.device(self.device):
+            _allgather_cute.get_columns_launcher(*self._columns_launcher_key(packs))
+
+    def _all_gather_columns(
+        self,
+        inp: torch.Tensor,
+        columns: Sequence[int],
+        *,
+        column_offset: int = 0,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Last-dim gather of unequal shards straight into the concatenated layout.
+
+        Rank ``r`` contributes ``inp[:, column_offset:column_offset + columns[r]]`` (``inp`` may be
+        wider than its shard; rows may be strided, 16-byte aligned) and the result is
+        ``out[M, sum(columns)]`` with rank ``r``'s columns at ``sum(columns[:r])``.  Each rank
+        sends only its own ``M * columns[r]`` elements; there is no padding before the collective
+        and no reorder after it.  Same ordering, capture and failure rules as ``all_gather``.
+        """
+
+        with self._lock:
+            self.check_health()
+            if not self.should_all_gather_columns(inp, columns):
+                raise ValueError("input is not eligible for the RoCE columns all-gather")
+            es = inp.element_size()
+            packs = self._column_packs(columns, es)
+            rows = int(inp.shape[0])
+            own = int(columns[self.rank])
+            column_offset = int(column_offset)
+            if inp.stride(1) != 1 or (inp.stride(0) * es) % PACK_BYTES != 0:
+                raise ValueError("columns all-gather needs unit column stride and 16-byte rows")
+            if (column_offset * es) % PACK_BYTES != 0 or inp.data_ptr() % PACK_BYTES != 0:
+                raise ValueError("columns all-gather needs a 16-byte aligned shard start")
+            if column_offset < 0 or column_offset + own > inp.shape[1]:
+                raise ValueError(
+                    f"shard [{column_offset}, {column_offset + own}) is outside the input's "
+                    f"{inp.shape[1]} columns"
+                )
+            shape = [rows, sum(int(c) for c in columns)]
+            if out is not None and (
+                list(out.shape) != shape
+                or out.dtype != inp.dtype
+                or out.device != inp.device
+                or not out.is_contiguous()
+                or out.data_ptr() % PACK_BYTES != 0
+            ):
+                raise ValueError(
+                    "out must be a contiguous 16-byte aligned tensor on the input's device of "
+                    "the gathered shape"
+                )
+            key = self._columns_launcher_key(packs)
+            context = (
+                torch.cuda.stream(stream) if stream is not None else _nullcontext()
+            )
+            with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                if capturing and not _allgather_cute.is_columns_launcher_prepared(*key):
+                    raise RuntimeError(
+                        "RoCE columns all-gather launcher must be prepared before CUDA graph "
+                        "capture (prepare_columns)"
+                    )
+                launcher = _allgather_cute.get_columns_launcher(*key)
+                if out is None:
+                    out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+                grid_blocks = _grid_blocks(
+                    rows * max(packs), self._threads, self._blocks
+                )
+                stage_counter, tail_counter = self._counter_addresses(grid_blocks)
+                self._order_stream(capturing)
+                launcher(
+                    inp.data_ptr(),
+                    out.data_ptr(),
+                    rows,
+                    inp.stride(0) * es // PACK_BYTES,
+                    column_offset * es // PACK_BYTES,
+                    rows * packs[self.rank] * PACK_BYTES,
+                    self._recv_base,
+                    self._flag_base,
+                    self._send_base,
+                    self._ctrl_base,
+                    self._slot_bytes,
+                    self._epoch_address,
+                    stage_counter,
+                    tail_counter,
+                    self._poison_address,
+                    self.spin_limit,
+                    grid_blocks,
+                )
+                if not capturing:
+                    self.check_health()
+                self._mark_stream(capturing)
+            return out
 
     def _gather_scratch(self, padded: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Fixed device scratch for the padded all-gather path, allocated once.
