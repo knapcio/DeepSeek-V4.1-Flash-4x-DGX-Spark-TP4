@@ -956,6 +956,11 @@ class MoEDynamicKernelBackend:
         self.direct_routing = bool(direct_routing)
         self.external_route_plan = bool(external_route_plan)
         self.materialize_intermediate = bool(materialize_intermediate)
+        # ds41 patch (b12x_next only): set by fused_moe._impl._get_dynamic_kernel under
+        # prequantized_input(). The token-major W4A8-MX front-end then skips its per-token input
+        # quantization; the caller has already written the MXFP8 rows (E4M3 [token, K]) and their
+        # UE8M0 scales ([token, K/32]) into packed_input / packed_input_scale.
+        self.prequantized_input = False
         self.w4a8_m1_materialized = bool(
             self.w4a8_repacked
             and self.direct_routing
@@ -3303,6 +3308,11 @@ class MoEDynamicKernelBackend:
         else:
             output_bytes_per_row = cols // Int32(2)
             mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
+        # ds41 patch: K/32 blocks the shared-input W4A8 producer quantizes per token; none when the
+        # caller supplied the MXFP8 rows (prequantized_input), so a_input is never read.
+        input_quant_blocks = mx_blocks_per_row
+        if cutlass.const_expr(self.prequantized_input):
+            input_quant_blocks = Int32(0)
         cols_u32 = cols // Int32(2)
         scatter_output_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
         total_pairs = Int32(topk_ids.shape[0])
@@ -3671,7 +3681,7 @@ class MoEDynamicKernelBackend:
                                         )
 
                                     blk_idx = lane_id + token_partition * Int32(32)
-                                    while blk_idx < mx_blocks_per_row:
+                                    while blk_idx < input_quant_blocks:
                                         block_start = blk_idx * Int32(32)
                                         values, block_max = _load_bf16x32_to_f32(
                                             a_input,
@@ -3754,7 +3764,7 @@ class MoEDynamicKernelBackend:
                                         blk_idx += Int32(self.input_warps_per_token * 32)
                                 else:
                                     blk_idx = lane_id + token_partition * Int32(32)
-                                    while blk_idx < mx_blocks_per_row:
+                                    while blk_idx < input_quant_blocks:
                                         block_start = blk_idx * Int32(32)
                                         values, block_max = _load_bf16x32_to_f32(
                                             a_input,

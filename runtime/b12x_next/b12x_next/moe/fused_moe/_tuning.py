@@ -395,7 +395,10 @@ def validate_moe_decode_config(
         raise ValueError("the Triton route planner requires dynamic_tile_m=16")
     if config.route_planner == "triton" and not (
         (query.quant_mode == "nvfp4" or (
-            _compact_w4a8_query(query) and not query.deterministic_output
+            # Deterministic output is admitted: the Triton planner only writes the per-expert
+            # row counts and tile prefix (integers, order-free) and resets the barrier words;
+            # route order, FC1/FC2 math and the fixed-order top-k sum are unchanged.
+            _compact_w4a8_query(query)
             and query.controls.get("dynamic_work_source", "materialized_queue")
             in {"materialized_queue", "persistent_grid"}
         )) and query.activation == "silu" and 0 < query.routed_rows <= 256

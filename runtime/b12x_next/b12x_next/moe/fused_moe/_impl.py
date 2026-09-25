@@ -6,6 +6,7 @@ from b12x_next._lib.quant.block_codec import BLOCK_CODECS
 
 import os
 import logging
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -2069,7 +2070,6 @@ def _dynamic_external_route_plan_supported(
         and int(planned_tile_m) == 16
         and 0 < int(routed_rows) <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
         and dynamic_route_mode == "grouped"
-        and not deterministic_output
         and _dynamic_work_source() in {_DYNAMIC_WORK_SOURCE_DEFAULT, "persistent_grid"}
     )
 
@@ -2144,6 +2144,29 @@ _MICRO_KERNEL_CACHE: Dict[Tuple, object] = {}
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, object] = {}
 register_program_cache(_MICRO_KERNEL_CACHE)
 register_program_cache(_DYNAMIC_KERNEL_CACHE)
+# ds41 patch (b12x_next only): pre-quantized W4A8-MX input. Inside ``prequantized_input()`` a
+# dynamic launch resolves the front-end specialization that does not quantize ``a``: the caller
+# has already written the MXFP8 rows (E4M3, [token, K], row stride K) and their UE8M0 scales
+# ([token, K/32]) into the binding's packed_input / packed_input_scale, and ``a`` is only a
+# [M, K] bf16 shape carrier that is never read. Only the token-major split-materialized front-end
+# (shared input across experts, M16/M64/M128 phase kernels) has that layout; anything else raises.
+_PREQUANT_STATE = threading.local()
+
+
+@contextmanager
+def prequantized_input():
+    prev = getattr(_PREQUANT_STATE, "on", False)
+    _PREQUANT_STATE.on = True
+    try:
+        yield
+    finally:
+        _PREQUANT_STATE.on = prev
+
+
+def _prequantized_input_requested() -> bool:
+    return bool(getattr(_PREQUANT_STATE, "on", False))
+
+
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
 # Micro owns the tiny tail below this routed-row cutover; dynamic owns the rest.
 # The measured GLM crossover under CUDA graph replay is 64 routed rows.
@@ -10830,6 +10853,18 @@ def _get_dynamic_kernel(
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
     )
+    prequantized = _prequantized_input_requested()
+    if prequantized:
+        # ds41 patch: appended only when on, so every existing key (and its object cache) is unchanged
+        if not (is_w4a8 and int(trellis_bits) == 0 and share_input_across_experts
+                and materialize_intermediate and not direct_routing):
+            raise ValueError(
+                "prequantized_input needs the token-major split-materialized W4A8-MX front-end "
+                f"(quant_mode={quant_mode}, trellis_bits={trellis_bits}, share_input="
+                f"{share_input_across_experts}, materialized={materialize_intermediate}, "
+                f"direct_routing={direct_routing})"
+            )
+        cache_key = cache_key + ("prequantized_input",)
     reuse_compiled = _first_env(
         "B12X_NEXT_DYNAMIC_REUSE_COMPILED",
         "B12X_NEXT_LEVEL10_REUSE_COMPILED",
@@ -10892,6 +10927,14 @@ def _get_dynamic_kernel(
         # activations against "e2m3" FP6 weights).
         kernel_kwargs["quant_recipe"] = quant_mode
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
+    if prequantized:
+        if not (kernel.w4a8_split_materialized and not kernel.w4a8_m1_materialized
+                and not kernel.w4a8_trellis and kernel.share_input_across_experts):
+            raise ValueError(
+                "prequantized_input: the resolved dynamic kernel is not the token-major "
+                f"split-materialized W4A8-MX front-end (tile {tuple(mma_tiler_mn)})"
+            )
+        kernel.prequantized_input = True
     if is_w4a8:
         launch = _DynamicMoEW4A8Launch(
             kernel,
@@ -11162,6 +11205,41 @@ def _get_dynamic_kernel(
     if reuse_compiled:
         _DYNAMIC_KERNEL_CACHE[cache_key] = compiled
     return compiled, mac
+
+
+# ds41 patch (b12x_next only): the per-launch re-zero of the read-before-write barrier scalars is
+# one fill instead of two. The workspace arena places barrier_epoch right after barrier_count (spec
+# order, each start aligned up to 16 bytes), so when epoch starts within the 16-byte alignment gap
+# after count's last element, one contiguous int32 span covers both; the gap holds no other tensor
+# (any tensor between them would start at or after the gap's end) and nothing reads it. Otherwise
+# (other layouts) the two fills run as before. Same values written, same stream, same order before
+# the MoE launch, so eager, CUDA-graph replay and deterministic runs see identical state.
+def _barrier_state_span(barrier_count: torch.Tensor, barrier_epoch: torch.Tensor):
+    if (
+        barrier_count.dtype != torch.int32
+        or barrier_epoch.dtype != torch.int32
+        or barrier_count.device != barrier_epoch.device
+        or not barrier_count.is_contiguous()
+        or not barrier_epoch.is_contiguous()
+        or barrier_count.untyped_storage().data_ptr()
+        != barrier_epoch.untyped_storage().data_ptr()
+    ):
+        return None
+    count_end = barrier_count.data_ptr() + barrier_count.numel() * 4
+    gap = barrier_epoch.data_ptr() - count_end
+    if gap < 0 or gap >= 16 or gap % 4 != 0:
+        return None
+    elems = barrier_count.numel() + gap // 4 + barrier_epoch.numel()
+    return barrier_count.as_strided((elems,), (1,), barrier_count.storage_offset())
+
+
+def _zero_barrier_state(barrier_count: torch.Tensor, barrier_epoch: torch.Tensor) -> None:
+    span = _barrier_state_span(barrier_count, barrier_epoch)
+    if span is None:
+        barrier_count.zero_()
+        barrier_epoch.zero_()
+    else:
+        span.zero_()
 
 
 def _launch_dynamic_flat(
@@ -11443,8 +11521,7 @@ def _launch_dynamic_flat(
         planned_num_tokens=planned_num_tokens,
     )
     if volatile_launch_state and not external_route_plan:
-        barrier_count.zero_()
-        barrier_epoch.zero_()
+        _zero_barrier_state(barrier_count, barrier_epoch)
 
     if external_route_plan:
         block_e = 1 << (int(E) - 1).bit_length()
@@ -12209,8 +12286,7 @@ def _launch_compact_micro_flat(
     ):
         raise RuntimeError("compiled direct micro MoE kernel cannot launch")
     if volatile_launch_state:
-        barrier_count.zero_()
-        barrier_epoch.zero_()
+        _zero_barrier_state(barrier_count, barrier_epoch)
     micro_cls.launch(
         compiled,
         x=a,
