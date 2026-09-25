@@ -183,7 +183,7 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', ''):
                 from l2_prefetch import install_router as install_l2_prefetch_router
                 install_l2_prefetch_router(module)
-        elif module.__name__ == 'b12x.comm.roce.roce_oneshot':
+        elif module.__name__ in ('b12x.comm.roce.roce_oneshot', 'b12x.comm.roce_ring.roce_oneshot'):
             # Gated on DSV41_L2_PREFETCH: RoCEnante all-reduce/all-gather fork the prefetch branch.
             # Outside sglang; the finder sees its first import whichever package imports it first,
             # and install_model re-checks sys.modules in case it was imported before the finder.
@@ -234,6 +234,7 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                             'sglang.kernels.ops.layernorm.mhc',
                             'sglang.srt.models.deepseek_v2',
                             'b12x.comm.roce.roce_oneshot',
+                            'b12x.comm.roce_ring.roce_oneshot',
                             'sglang.srt.layers.attention.dsv4.metadata'):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)

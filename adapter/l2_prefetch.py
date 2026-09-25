@@ -251,7 +251,7 @@ def install_router(module):
 
 
 def install_roce(module):
-    """Patch b12x.comm.roce.roce_oneshot: launch the prefetch right before each collective."""
+    """Patch b12x.comm.roce(_ring).roce_oneshot: launch the prefetch right before each collective."""
     if not enabled():
         return
     cls = module.RoceOneshotAllReduce
@@ -283,8 +283,9 @@ def install_model(module):
         return
     cls._dsv41_l2_prefetch = True
     import sys
-    if "b12x.comm.roce.roce_oneshot" in sys.modules:  # imported before the finder saw it
-        install_roce(sys.modules["b12x.comm.roce.roce_oneshot"])
+    for name in ("b12x.comm.roce.roce_oneshot", "b12x.comm.roce_ring.roce_oneshot"):
+        if name in sys.modules:  # imported before the finder saw it
+            install_roce(sys.modules[name])
     original = cls.forward
 
     def forward(self, input_ids, positions, forward_batch, *args, **kwargs):
