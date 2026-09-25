@@ -128,6 +128,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DRAFT_TAU', '1').strip() not in ('', '1', '1.0'):
                 from draft_tau import install as install_draft_tau
                 install_draft_tau(module)
+            # Gated on DSV41_EAGER_GLUE (adapter/eager_glue.py): stage / vcap. After draft_tau and
+            # spec_sync_free: its stage cache must be the outermost stage_sampling_params.
+            if os.environ.get('DSV41_EAGER_GLUE', '').strip() not in ('', '0', 'off', 'false'):
+                from eager_glue import install_sampler as install_eager_glue_sampler
+                install_eager_glue_sampler(module)
         elif module.__name__ == 'sglang.kernels.ops.speculative.dspark.dspark_accept':
             # Gated on DSV41_BLOCK_VERIFY: block verification for sampled rows (lossless).
             if os.environ.get('DSV41_BLOCK_VERIFY', '0').strip() not in ('0', 'off', 'false', ''):
@@ -162,6 +167,9 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_draft as install_verify_cap_draft
                 install_verify_cap_draft(module)
+            if os.environ.get('DSV41_EAGER_GLUE', '').strip() not in ('', '0', 'off', 'false'):
+                from eager_glue import install_draft as install_eager_glue_draft
+                install_eager_glue_draft(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_planner':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_planner as install_verify_cap_planner
