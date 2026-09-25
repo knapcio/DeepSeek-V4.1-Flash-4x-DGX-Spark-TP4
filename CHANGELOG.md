@@ -3,6 +3,35 @@
 Newest first. Each entry says what changed in the production stack and what was measured; the
 raw results live under `docs/results/`.
 
+## 2026-09-25 v2.2 (candidate)
+
+**Pre-gate.** Mechanisms and the fleet A/B deltas measured while developing them (4-node fleet, greedy output
+byte-identical in every A/B). The release gate (fresh clone, full test chain, README tables) has not run yet;
+its numbers replace these.
+
+- **`adapter/l2_prefetch.py`, `DSV41_L2_PREFETCH_WOA=1`, on.** The MXFP8 linear before `wo_a` opens an L2
+  prefetch window for `wo_a` while the attention core runs: -0.4 ms/step. The other v3/v4 sub-gates (AHEAD,
+  DRAFT, ENGRAM, LMHEAD, SKIP_N, WOB_MB, MOE) measured flat or slower and stay off. The ring package's
+  collectives are hooked at both install sites.
+- **`adapter/spec_sync_free.py`, `DSV41_SPEC_SYNC_FREE=all`, on.** The per-step rank-0 broadcasts of the draft
+  token, the verify epilogue and verify_cap's length are dropped (their values are identical on every rank; the
+  draft noise is a counter-based stream shared by the ranks). Audit mode: 0 mismatches over ~60k checks;
+  -0.2 to -0.55 ms/step.
+- **`adapter/eager_glue.py`, `DSV41_EAGER_GLUE=all` (fence, stage, vcap, vcapk), on.** Fewer eager kernels
+  between the draft and verify graphs, bit-identical. `tvglue` / `dglue` dropped after a fleet boot's check
+  failed (stale `out_cache_loc` pointer in a glue graph).
+- **Bit-exact bundle, `DSV41_SPLIT_COMPACT_GATHER=1`, on:** compact RoCE columns gather for the replicated
+  splits (new `all_gather(columns=...)` kernel in `runtime/b12x`), the `wqkv_a` window GEMM
+  (`DSV41_REPLICATED_SPLIT_WINDOW`, default on), and the b12x_next barrier single fill + Triton route planner
+  under determinism (`SOURCE_PATCH` `da662ccc7e2372b5`). -0.4 ms/step prose, -0.45 ms code; sparkDash prose c1
+  median 89.5.
+- `DSV41_PREFILL_SP_FP8_MOE=1` (MXFP8 MoE-input gathers in prefill SP, b12x_next pre-quantized input): bit-exact
+  on every check but flat on real-text prefill. In the code, off, not in the production line.
+- In-boot A/B harness (`adapter/ab_variant.py`, `scripts/ab_inboot.py`, `scripts/repeat_sha.py`), test only, off
+  unless `DSV41_AB_VARIANTS` >= 2.
+- Tested and not adopted: fused MXFP8 quantization into q_norm / wo_a / hc (flat), layer-14 Engram lookup on a
+  side stream during verify (~0), fused hc prefill kernel (slower).
+
 ## 2026-09-25 (ring)
 
 - **RoCEnante on a switchless ring, `DSV41_ROCE_RING=1`, off by default, research-only.** A four-node ring has no link between
