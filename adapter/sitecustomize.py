@@ -20,6 +20,12 @@ class EngramLoader(importlib.abc.Loader):
             # hasher. Gated on DSV41_ENGRAM_PREFETCH, inactive by default.
             from engram_prefetch import install as install_engram_prefetch
             install_engram_prefetch(module)
+            # After engram_prefetch: the row join forks an L2 prefetch of the engram.wkv slice.
+            # Gated on DSV41_L2_PREFETCH + DSV41_L2_PREFETCH_ENGRAM (adapter/l2_prefetch.py).
+            if (os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', '')
+                    and os.environ.get('DSV41_L2_PREFETCH_ENGRAM', '0').strip() not in ('0', 'off', 'false', '')):
+                from l2_prefetch import install_engram as install_l2_prefetch_engram
+                install_l2_prefetch_engram(module)
         elif module.__name__ == 'sglang.srt.layers.quantization.fp8_utils':
             from mxfp8_b12x import install
             install(module)
@@ -106,6 +112,12 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DRAFT_HEAD_FP8', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_head_fp8 import install as install_draft_head_fp8
                 install_draft_head_fp8(module)
+            # Gated on DSV41_L2_PREFETCH + DSV41_L2_PREFETCH_DRAFT: the draft forward is bracketed
+            # like the target's, so its collectives prefetch the next stage's weights.
+            if (os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', '')
+                    and os.environ.get('DSV41_L2_PREFETCH_DRAFT', '0').strip() not in ('0', 'off', 'false', '')):
+                from l2_prefetch import install_draft as install_l2_prefetch_draft
+                install_l2_prefetch_draft(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_draft_sampler':
             # Gated on DSV41_DRAFT_TAU (unset or 1 = off): draft proposal temperature.
             if os.environ.get('DSV41_DRAFT_TAU', '1').strip() not in ('', '1', '1.0'):
