@@ -119,6 +119,11 @@ class EngramLoader(importlib.abc.Loader):
                 from l2_prefetch import install_draft as install_l2_prefetch_draft
                 install_l2_prefetch_draft(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_draft_sampler':
+            # Gated on DSV41_SPEC_SYNC_FREE: rank-invariant draft noise, per-step rank-0 broadcasts
+            # dropped / merged / audited (adapter/spec_sync_free.py). Gate checked BEFORE the import.
+            if os.environ.get('DSV41_SPEC_SYNC_FREE', '').strip() not in ('', '0', 'off', 'false'):
+                from spec_sync_free import install_sampler as install_spec_sync_free_sampler
+                install_spec_sync_free_sampler(module)
             # Gated on DSV41_DRAFT_TAU (unset or 1 = off): draft proposal temperature.
             if os.environ.get('DSV41_DRAFT_TAU', '1').strip() not in ('', '1', '1.0'):
                 from draft_tau import install as install_draft_tau
@@ -129,6 +134,11 @@ class EngramLoader(importlib.abc.Loader):
                 from block_verify import install as install_block_verify
                 install_block_verify(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_verify':
+            # Gated on DSV41_SPEC_SYNC_FREE (adapter/spec_sync_free.py). First in this branch: its
+            # merge mode checks the engine's own DsparkVerifyEpilogue._accept source.
+            if os.environ.get('DSV41_SPEC_SYNC_FREE', '').strip() not in ('', '0', 'off', 'false'):
+                from spec_sync_free import install_verify as install_spec_sync_free_verify
+                install_spec_sync_free_verify(module)
             # Gated on DSV41_FOLDED_FENCE: folded results cloned off the persistent verify buffers
             # (sglang#40919 race under overlap scheduling).
             if os.environ.get('DSV41_FOLDED_FENCE', '0').strip() not in ('0', 'off', 'false', ''):
