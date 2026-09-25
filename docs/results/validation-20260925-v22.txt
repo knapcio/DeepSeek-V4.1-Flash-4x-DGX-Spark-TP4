@@ -68,3 +68,14 @@ boot 2 prose c1 per 90.42 agg 90.42
 boot 2 prose c1 per 89.47 agg 89.47
 sha check boot 2 builtin rows 6 vs canonical: ALL MATCH
 V22-DONE
+
+## Addendum: c2 and c8 (same image, same evening, running engine, first run per cell after two warm-ups)
+
+sparkDash 1.8.8, maxTokens 256, per-stream / aggregate tok/s:
+
+| type | c2 | c8 |
+|---|---|---|
+| prose | 62.64 / 122.01 | 31.01 / 238.82 |
+| code | 89.83 / 177.83 | 41.36 / 308.88 |
+| structured | 105.35 / 181.58 | 44.15 / 295.70 |
+| json | 91.59 / 177.59 | 59.84 / 468.81 |

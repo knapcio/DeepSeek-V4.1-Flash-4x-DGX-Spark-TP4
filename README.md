@@ -25,14 +25,14 @@ Production stack v2.2 (the last `EXTRA_CONTAINER_ENV` line of [`.env.tp4.example
 
 **Decode, aggregate tok/s (per stream in brackets)**
 
-| prompt type | c1 | c2 † | c4 | c8 † | c16 |
+| prompt type | c1 | c2 | c4 | c8 | c16 |
 |---|---:|---:|---:|---:|---:|
-| prose | **89.8** | 120.4 (61.9) | 164.1 (41.5) | 237.6 (30.8) | 340.9 (22.2) |
-| code | 132.4 | 175.0 (88.4) | 252.7 (64.1) | 309.8 (41.4) | 436.4 (29.2) |
-| structured | 156.9 | 177.6 (103.3) | 239.6 (70.2) | 295.5 (44.2) | 565.5 (44.3) |
-| json | 124.3 | 174.2 (89.8) | 311.2 (78.7) | 471.5 (60.2) | 653.0 (42.2) |
+| prose | **89.8** | 122.0 (62.6) | 164.1 (41.5) | 238.8 (31.0) | 340.9 (22.2) |
+| code | 132.4 | 177.8 (89.8) | 252.7 (64.1) | 308.9 (41.4) | 436.4 (29.2) |
+| structured | 156.9 | 181.6 (105.4) | 239.6 (70.2) | 295.7 (44.2) | 565.5 (44.3) |
+| json | 124.3 | 177.6 (91.6) | 311.2 (78.7) | 468.8 (59.8) | 653.0 (42.2) |
 
-† c2 and c8 were not re-measured for v2.2: they are the v2.1 table's values, which come from the v2 sweep ([`docs/results/validation-20260925-v2.txt`](docs/results/validation-20260925-v2.txt)). The c1, c4 and c16 columns are from the v2.2 fresh-clone boot. Prose c1 is the median of five runs, 89.76 (88.97-90.21), after the warm-ups; the second boot gave 89.04 / 90.42 / 89.47. Code c1 is the median of three runs (124.95 / 132.62 / 132.37). Greedy output is byte-identical to v2.1's (hash check of 15 outputs on the first boot and 6 on the second). With the deterministic MoE reduction the greedy text is identical run to run, so the sparkDash numbers repeat within about ±1 tok/s; sparkDash's prose c1 is one prompt, and a stack that sums in a different order (another fabric, another all-reduce) follows a different greedy text there, so compare step time or a many-prompt benchmark across stacks. On 45 varied prompts (prose, structured and other catalogs, c1 greedy) the same image runs 61.1 / 99.0 / 74.7 tok/s; decode step 31.2-32.5 ms on prose and 37.4-37.8 ms on code at c1. sparkDash uses a different set of prompts at each concurrency for the non-prose types, so per-stream values are not comparable across columns. Sampled chat at the model card's T=1 / top_p=0.95 with thinking (c1, 18 requests x 800 tokens on two prompt sets) runs 67.2 / 65.9 tok/s (measured on the 2026-09-24 stack; sparkDash benches are greedy, where the draft temperature and block verification do not act).
+The c1, c4 and c16 columns are from the v2.2 fresh-clone boot; c2 and c8 were measured on the same image the same evening, first run of each cell after two warm-ups ([`docs/results/validation-20260925-v22.txt`](docs/results/validation-20260925-v22.txt)). Prose c1 is the median of five runs, 89.76 (88.97-90.21), after the warm-ups; the second boot gave 89.04 / 90.42 / 89.47. Code c1 is the median of three runs (124.95 / 132.62 / 132.37). Greedy output is byte-identical to v2.1's (hash check of 15 outputs on the first boot and 6 on the second). With the deterministic MoE reduction the greedy text is identical run to run, so the sparkDash numbers repeat within about ±1 tok/s; sparkDash's prose c1 is one prompt, and a stack that sums in a different order (another fabric, another all-reduce) follows a different greedy text there, so compare step time or a many-prompt benchmark across stacks. On 45 varied prompts (prose, structured and other catalogs, c1 greedy) the same image runs 61.1 / 99.0 / 74.7 tok/s; decode step 31.2-32.5 ms on prose and 37.4-37.8 ms on code at c1. sparkDash uses a different set of prompts at each concurrency for the non-prose types, so per-stream values are not comparable across columns. Sampled chat at the model card's T=1 / top_p=0.95 with thinking (c1, 18 requests x 800 tokens on two prompt sets) runs 67.2 / 65.9 tok/s (measured on the 2026-09-24 stack; sparkDash benches are greedy, where the draft temperature and block verification do not act).
 
 **Prefill, cold, tok/s by prompt length** (one pass, same boot)
 
