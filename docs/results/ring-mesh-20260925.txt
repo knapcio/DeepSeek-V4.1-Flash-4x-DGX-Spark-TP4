@@ -1,0 +1,75 @@
+four DGX Spark (GB10) as a switchless ring, dual plane (4 RDMA functions per node), patched NCCL 2.30.7 (NCCL_SWITCHLESS_RING_ONLY=1)
+image: Dockerfile.canary-roce built from this repository = 7ac7123 (v2) + the ring changes; FROM lmsysorg/sglang:dev-dsv41 @ sha256:4a5d132a
+env: the v2 production EXTRA_CONTAINER_ENV with EP_SIZE=1, plus scripts/ring_mesh/plan.py's line:
+  DSV41_ROCE_RING=1 SGLANG_ROCE_ALLREDUCE=1 SGLANG_ROCE_MAX_SIZE=262144 DSV41_ROCE_GATHER=262144 B12X_ROCE_HCA=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1
+  B12X_ROCE_PEER_HCA_MAPS=1=1/3,2=0/3,3=0/2;0=0/2,2=1/3,3=1/2;0=1/2,1=0/2,3=1/3;0=1/3,1=0/3,2=0/2 B12X_ROCE_TWO_WAVE_THRESHOLD_BYTES=0
+mesh: dsv41-mesh.service on every node, hairpin_queue_size 8192, 8 routes / 8 tc rules (all in_hw) / 8 markers; ring order (sparkring) 0 -> 3 -> 2 -> 1 in TP ranks
+boot: RoCEnante ready: world=4 hcas=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1 gid_index=3 max_size=262144
+      DSV41_ROCE_GATHER ready: max 262144 bytes per rank; DSV41_L2_PREFETCH: RoCE collectives prefetch the next weights into L2; DSV41_PREFILL_SP=1 ARMED
+      proxy built from roce_ring/_roce_proxy.c (roce_proxy-8300454e819a61f5.so)
+max_total_num_tokens=5561856   (6335488 and 6350848 on the two previous boots)
+
+# decode step, engine spec_verify_ct (prose-type x4, code x1, 400 greedy tokens, ttft subtracted, 2 reps)
+prompt0: ms/step= 32.98  tok/step=2.02  tok/s=  61.3
+prompt1: ms/step= 33.28  tok/step=2.01  tok/s=  60.4
+prompt2: ms/step= 32.40  tok/step=1.94  tok/s=  59.9
+prompt3: ms/step= 38.07  tok/step=3.74  tok/s=  98.2
+prompt4: ms/step= 33.54  tok/step=2.23  tok/s=  66.6
+ALL: median ms/step 33.28  (n=10)
+# decode step on sparkDash's prose and json prompts (256 tokens, ttft subtracted, 5 reps)
+prose: ms/step 36.94  tok/step 3.01  decode tok/s 81.2  (n=5)
+json : ms/step 40.27  tok/step 5.45  decode tok/s 134.7  (n=5)
+# ms per step at concurrency c (c distinct prompts, 300 greedy tokens, e2e/verify_ct incl. ttft)
+c1: 35.2ms/step (2.31 tok/step) c2: 47.8ms/step (2.07 tok/step) c4: 69.7ms/step (2.08 tok/step) c8: 104.0ms/step (2.13 tok/step)
+
+# sparkDash 1.8.8, 256 new tokens, temperature 0, thinking off, 2 prose c1 warm-ups discarded
+prose c1 per 80.89 agg 80.89
+prose c2 per 58.39 agg 114.61
+prose c4 per 39.36 agg 154.62
+prose c8 per 28.06 agg 221.27
+prose c16 per 22.95 agg 345.12
+code c1 per 120.54 agg 120.54
+code c2 per 88.73 agg 175.66
+code c4 per 62.76 agg 234.14
+code c8 per 41.23 agg 302.97
+code c16 per 29.8 agg 446.57
+structured c1 per 150.19 agg 150.19
+structured c2 per 86.27 agg 168.99
+structured c4 per 70.22 agg 262.9
+structured c8 per 42.94 agg 284.41
+structured c16 per 48.96 agg 547.67
+json c1 per 134.17 agg 134.17
+json c2 per 91.76 agg 179.03
+json c4 per 72.82 agg 288.3
+json c8 per 53.78 agg 417.44
+json c16 per 43.63 agg 671.52
+prefill [(4117, 3152.55), (16406, 5456.64), (32786, 5567.43), (65560, 5539.67), (131093, 5392.59), (262164, 4970.74)]
+
+# qeval (scripts/qeval.py, 75 tasks, c1), three runs after the benches
+72/75 passed (96.0%), wall 1.9 min, median 81.81 tok/s; failed: code_interval_intersect, json_escape, math_m9
+71/75 passed (94.7%), wall 2.0 min, median 84.74 tok/s; failed: code_interval_intersect, json_escape, math_m9, reason_r12
+72/75 passed (96.0%), wall 1.9 min, median 85.93 tok/s; failed: code_interval_intersect, json_escape, math_m9
+
+# phrase needle (code in the middle of numbered filler records)
+{"target": 6000, "prompt_tokens": 5845, "needle_at": "50%", "expected": "RING-6000-COBALT", "got": "RING-6000-COBALT", "result": "PASS", "seconds": 1.4, "prefill_tok_s": 4184}
+{"target": 64000, "prompt_tokens": 64331, "needle_at": "50%", "expected": "RING-4162-COBALT", "got": "RING-4162-COBALT", "result": "PASS", "seconds": 12.6, "prefill_tok_s": 5090}
+{"target": 1011000, "prompt_tokens": 1030651, "needle_at": "50%", "expected": "RING-3727-COBALT", "got": "RING-3727-COBALT", "result": "PASS", "seconds": 305.1, "prefill_tok_s": 3378}
+
+# one change at a time, same ring, 2026-09-25
+NCCL ring vs RoCEnante over the mesh (c5cee32 stack, 80 KB cap, sparkring proxy): qeval median 76.34 -> 79.53 tok/s, both 72/75;
+  per task ms/step -5.2 % median (51 tasks >= 64 tokens, faster on 50), tokens/step +0.0 % median (-17 % .. +14 %)
+proxy ROCE_IDLE_SPINS 200000 -> 20000000 (256 KB cap): ms/step c1 40.6 -> 37.1, c2 53.1 -> 49.4, c4 74.7 -> 70.3, c8 113.5 -> 110.8;
+  active proxy thread in clock_nanosleep during c1 decode: 82/300 samples -> 0/300
+80 KB cap, two-wave default -> 256 KB cap, two-wave off (hairpin 8192): ms/step c1 40.5 -> 40.6, c2 53.6 -> 53.1, c4 75.7 -> 74.7, c8 112.5 -> 113.5
+c5cee32 -> v2 (both with the mesh and the proxy fix): ms/step c1 37.1 -> 36.1, c2 49.4 -> 48.4, c4 70.3 -> 69.4, c8 110.8 -> 108.3
+
+# all-reduce us/op in CUDA graphs (40 per graph, 100 replays), 4 ranks over the mesh; drops = sum over 16 functions of rx_out_of_buffer
+hairpin 1024, two-wave 128K: 60K:23 80K:30 100K:42 120K:126 160K:73 200K:137 240K:90 360K:164 480K:191 720K:326 960K:449
+hairpin 1024, drops: rows 1-8 (<=80K) 0; 100K 163 rx_out_of_buffer + 50 out_of_sequence; one 60K-960K sweep (two-wave off) 259612 rx_out_of_buffer + 55327 out_of_sequence
+hairpin 8192, two-wave 128K: 60K:24 80K:30 100K:35 120K:40 160K:53 240K:75 360K:89 480K:117 (0 drops) 720K:217 960K:274 (64 drops)
+hairpin 8192, two-wave off:  120K:40 160K:47 180K:50 240K:60 360K:78 480K:95 (0 drops)
+ib_write_lat 61440 B, flow label 16383: opposite node via a neighbour 9.99-10.18 us (4 paths), direct neighbour 8.47 us; neighbour IpForwDatagrams unchanged
+
+# tested and not adopted
+scheduler process pinned to the X925 cores (5-9,15-19): qeval 79.53 -> 75.15 (-5.5 %)
+RoCE proxy threads alone on dedicated X925 cores: qeval 78.96 -> 78.08 (within run-to-run spread)

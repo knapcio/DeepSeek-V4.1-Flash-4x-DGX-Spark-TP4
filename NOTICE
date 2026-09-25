@@ -18,6 +18,12 @@ Third-party components and their licences:
 - runtime/flash_mla_sm120.py is derived from SGLang and remains under the Apache
   License 2.0 (LICENSE.sglang); the page-split changes are distributed under the
   same terms.
+- runtime/b12x/b12x/comm/roce_ring is the path-aware RoCEnante package of
+  FujitsuPolycom/sparkring (commit f16b5f4), itself derived from local-inference-lab/b12x
+  (RoCEnante, PR 295); Apache License 2.0 (runtime/b12x/LICENSE). Origin and local
+  changes: runtime/b12x/roce_ring-provenance.json. scripts/ring_mesh/plan.py drives
+  sparkring's fabric planner and the units run sparkring's RDMA-TX marker; neither is
+  vendored here (both come from a sparkring checkout, Apache License 2.0).
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

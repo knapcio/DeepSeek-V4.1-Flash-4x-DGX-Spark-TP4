@@ -5,6 +5,10 @@
 default and changes nothing when off**: the switch only decides whether the ring
 NCCL environment and the overlay mount are injected.
 
+The production line's RoCEnante needs a path to the opposite node as well; how to build it in the
+neighbours' ConnectX-7 hardware is in
+[RoCEnante on the ring](#rocenante-on-the-ring-hardware-forwarded-opposite-node-paths).
+
 ## Why the defaults do not boot on a ring
 
 ```
@@ -409,12 +413,169 @@ NCCL_DEBUG_SUBSYS=INIT,ENV,NET    # add NET while validating; drop it afterwards
 * **Do not also set `NCCL_SWITCHLESS_RING_ONLY=1` with a switched fabric.** The ring
   skips the tree, which is a performance loss when the tree is reachable.
 * **A ring is not a non-blocking fabric.** Opposite ranks talk through a transit
-  node, so a four-node ring's bisection bandwidth is one link, not two. Expect the
-  decode numbers below rather than the switched ones.
+  node, so a four-node ring's bisection bandwidth is one link, not two. Without the
+  opposite-node paths below, expect the decode numbers under Measured rather than the switched ones.
+
+## RoCEnante on the ring: hardware-forwarded opposite-node paths
+
+RoCEnante's one-shot all-reduce and all-gather write every rank's payload straight into every
+peer's buffers, and a four-node ring has no link between opposite nodes, so out of the box a ring
+runs the production line with `SGLANG_ROCE_ALLREDUCE=0` and the collectives go through the patched
+NCCL (~56 us per decode-size all-reduce, ~90 of them per decode step). The missing path can be built
+without a switch or extra cables, in the neighbours' ConnectX-7 hardware, with the design of
+[FujitsuPolycom/sparkring](https://github.com/FujitsuPolycom/sparkring) (`cx7_hairpin_diagonal`,
+commit `f16b5f4`):
+
+- the sender's NIC re-tags the RDMA packets of the opposite-node queue pairs (flow label 16383, i.e.
+  UDP source port 65535) from EtherType 0x0800 to 0x88b5 (an RDMA-TX flow rule, `mlx5-rdma-tx-rewrite-probe`);
+- a `/32` route sends them to the neighbour on that cable;
+- on the neighbour a `skip_sw` tc flower rule matches the tag and the two MACs, restores 0x0800,
+  rewrites the destination MAC and redirects the packet out of its other port (mlx5 hairpin queues).
+
+No CPU touches the forwarded packets and the kernel forwards nothing (`nstat IpForwDatagrams` stays
+flat); a marked packet that misses the rule is dropped, never routed in software. Every rank uses
+two paths per peer over its four RDMA functions: the neighbours over their own cable, the opposite
+node through each neighbour (one path per PCIe domain). `DSV41_ROCE_RING=1` makes the SG17 overlay
+load `b12x.comm.roce_ring`, sparkring's path-aware RoCEnante (provenance and local changes in
+`runtime/b12x/roce_ring-provenance.json`), instead of `b12x.comm.roce`; unset, nothing changes.
+`DSV41_L2_PREFETCH` hooks either package.
+
+### What each step is worth
+
+Same four-Spark ring, same day, one change at a time (qeval = `scripts/qeval.py`, 75 tasks at c1;
+step time = the engine's `spec_verify_ct`, time to first token subtracted):
+
+| Step | Effect |
+|---|---|
+| NCCL ring -> RoCEnante over the mesh (c5cee32 stack, 80 KB cap) | decode step -5.2 % (median over 51 qeval tasks, faster on 50), qeval median 76.3 -> 79.5 tok/s |
+| proxy idle spins 200000 -> 20000000 (the SG17 value) | c1 step 40.6 -> 37.1 ms (-8.6 %), c2 -7 %, c4 -6 %, c8 -2 %; with 200000 the proxy was asleep in 27 % of samples during decode |
+| `hairpin_queue_size` 8192, 256 KB cap, two-wave off | c2 -1 %, c4 -1.3 %; c1 unchanged (its collectives are 50-60 KB) |
+| this README's v2 (prefill SP, L2 prefetch, draft head) | c1-c8 step -1 to -3 %, prefill +17-18 % at 16k-128k, +10 % at 262k |
+
+### Results
+
+The switched README's production line (v2, `7ac7123`) with the ring additions, built from this
+repository (`Dockerfile.canary-roce`), measured on the four-Spark ring the same day, against the
+README's v2 numbers (v2.1's `DSV41_PREFILL_SP_FP8` came later; it is fabric-independent and was not in
+this run). Raw output: [`docs/results/ring-mesh-20260925.txt`](results/ring-mesh-20260925.txt).
+
+| | Ring (this) | Switched (README at v2) |
+|---|---:|---:|
+| qeval median tok/s (75 tasks), pass | 84.7 (median of 3 runs), 72/75 | 83.5, 72/75 |
+| decode step, prose-type prompts | 33.3 ms (2.0 tok/step) | 33.0 ms (2.27 tok/step) |
+| decode step, code-type prompts | 38.1 ms (3.74 tok/step) | 39.2 ms (3.87 tok/step) |
+| sparkDash 1.8.8 prose c1 / c16 | 80.9 / 345.1 | 86.5 / 342.7 |
+| code c1 / c16 | 120.5 / 446.6 | 122.6 / 438.3 |
+| structured c1 / c16 | 150.2 / 547.7 | 152.4 / 572.2 |
+| json c1 / c16 | 134.2 / 671.5 | 118.9 / 659.9 |
+| prefill 16k-128k / 262k | 5,393-5,567 / 4,971 | 5,644-5,818 / 5,214 |
+| phrase needle | PASS at 1,030,651 tokens (305 s) | PASS at 1,011,084 tokens (322 s) |
+
+The step-time prompts differ (the README's are not published), so the two columns are near but not
+identical acceptance. Prose c1 on sparkDash is the single-prompt case under Mesh pitfalls below. Prefill
+stays 4-5 % under the switched fabric at 16k-128k and 5 % at 262k: the large prefill collectives run on
+NCCL over the ring's one-link bisection. The KV pool was 5.56 M tokens on this boot and 6.33-6.35 M on
+the two before it (the fast loader's boot-to-boot spread).
+
+### Setup
+
+1. **The ring as above**, with both planes addressed (four RDMA functions per node, MTU 9000, the
+   RoCEv2 GID at index 3), and the NIC profile sparkring's hardware forwarding was qualified on:
+   `hairpin_num_queues` 4, `flow_steering_mode` `hmfs`, eswitch `legacy`, `hw-tc-offload on` on all
+   four fabric netdevs (sparkring's
+   [driver configuration notes](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_SPARK_MTP3_MESH_QUICKSTART.md#connectx-7-driver-configuration-for-hardware-forwarding)).
+   `scripts/ring_mesh/inventory.sh` prints all of it per node; `plan.py` refuses a node whose links,
+   MTU, GID, TC offload or steering mode do not match.
+2. **The source marker**, built on every node from a sparkring checkout at `f16b5f4`
+   (source sha256 `8684a696…`; it built to `2828c07e…` here, the binary sparkring records):
+
+   ```bash
+   git clone https://github.com/FujitsuPolycom/sparkring ~/sparkring && git -C ~/sparkring checkout f16b5f4
+   sudo install -d /opt/dsv41-mesh/bin
+   cc -O2 -Wall -Wextra ~/sparkring/spark_transport/fabric/cx7_hairpin_diagonal/native/mlx5_rdma_tx_rewrite_probe.c \
+      -o /tmp/mlx5-rdma-tx-rewrite-probe -libverbs -lmlx5 && sudo install -m 755 /tmp/mlx5-rdma-tx-rewrite-probe /opt/dsv41-mesh/bin/
+   ```
+3. **The plan**, from the head, with the hosts in TP rank order (the head, then `WORKER_HOSTS`):
+
+   ```bash
+   python3 scripts/ring_mesh/plan.py --sparkring ~/sparkring --out ring-mesh spark1 spark2 spark3 spark4
+   ```
+
+   It inventories the nodes over SSH, reads the cabling from the fabric subnets, numbers the ring the
+   way sparkring's planner needs it (every f0 port cabled to the next node's f1; it refuses anything
+   else), and has sparkring's planner build the RoCEnante selection: per node two `/32` routes, two
+   tc rules and two markers. It writes `mesh-up-<host>.sh` / `mesh-down-<host>.sh` and `env.txt`,
+   the `EXTRA_CONTAINER_ENV` additions with the per-rank peer maps already translated to the TP rank
+   order (sparkring numbers the ring by cabling direction, which need not match it).
+4. **Install on every node** with the engine stopped (applying the hairpin size re-initialises each
+   fabric function); `$HOST` is that node's name as given to `plan.py`:
+
+   ```bash
+   sudo install -m 755 ring-mesh/mesh-up-$HOST.sh /opt/dsv41-mesh/mesh-up.sh
+   sudo install -m 755 ring-mesh/mesh-down-$HOST.sh /opt/dsv41-mesh/mesh-down.sh
+   sudo install -m 755 scripts/ring_mesh/hairpin.sh /opt/dsv41-mesh/
+   sudo install -m 644 scripts/ring_mesh/dsv41-mesh.service scripts/ring_mesh/dsv41-mesh-marker@.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now dsv41-mesh
+   ```
+
+   `dsv41-mesh.service` runs at every boot: it waits for the fabric links, sets `hairpin_queue_size`
+   (a `driverinit` parameter that resets at boot) and applies the routes, rules and markers; `mesh-up.sh`
+   refuses a rule that did not land in hardware. Start the engine after it is active.
+5. **Verify the path** before booting the engine: every rule shows `in_hw` (`tc -s filter show dev
+   <netdev> ingress`), and an RDMA write to the opposite node goes through the neighbour's rule, not its
+   kernel (`ib_write_lat -d <dev> -x 3 --flow_label=16383` against the opposite node's port: ~10 us at
+   61 KB here against 8.5 us to a direct neighbour; the neighbour's rule counters rise and its
+   `IpForwDatagrams` does not).
+6. **`.env.tp4`**: build `Dockerfile.canary-roce` as usual and append `env.txt` to the production
+   `EXTRA_CONTAINER_ENV`, replacing its `B12X_ROCE_HCA`, `SGLANG_ROCE_MAX_SIZE` and `DSV41_ROCE_GATHER`.
+   The boot log shows `RoCEnante ready: world=4 hcas=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1`
+   and `DSV41_L2_PREFETCH: RoCE collectives prefetch the next weights into L2`.
+
+### The size cap and the hairpin queues
+
+The forwarded traffic crosses the neighbour in a hairpin queue, and at the driver default
+(`hairpin_queue_size` 1024) a burst of more than ~100 KB per message overflows it:
+`rx_out_of_buffer` rises on the forwarding ports, the far end counts `out_of_sequence` /
+`packet_seq_err`, and go-back-N retransmits make a 120 KB all-reduce 3-4x slower than NCCL. Measured
+in CUDA graphs, all four ranks, drops summed over all 16 functions:
+
+| all-reduce | 60 KB | 100 KB | 120 KB | 240 KB | 480 KB | 960 KB |
+|---|---:|---:|---:|---:|---:|---:|
+| queue 1024: us/op | 23 | 36 | 111-141 | 91-109 | 167-191 | 378-449 |
+| queue 1024: drops | 0 | 163 | many | many | many | many |
+| queue 8192, two-wave off: us/op | 24 | 35 | 40 | 60 | 95 | 274 (two-wave on) |
+| queue 8192: drops | 0 | 0 | 0 | 0 | 0 | 64 |
+
+At 1024 keep `SGLANG_ROCE_MAX_SIZE=DSV41_ROCE_GATHER=81920` (every c1 decode collective is 50-60 KB, so
+c1 loses nothing); at 8192 the 256 KB cap also moves c2-c4 and the draft's 129 KB vocabulary gathers.
+`plan.py` picks the cap from the smallest queue it finds. The package's two-wave schedule (direct
+paths first, forwarded paths after, from 128 KB) only costs once nothing drops:
+`B12X_ROCE_TWO_WAVE_THRESHOLD_BYTES=0` turns it off.
+
+### Mesh pitfalls
+
+- **Never re-initialise a fabric function, stop `dsv41-mesh` or a marker while the engine runs.**
+  Opposite-node traffic stops, and a re-init drops every RDMA queue pair on that function; the RoCE
+  health check then fails the step. `hairpin.sh` skips functions already at the value, so re-running
+  it with the same value is safe.
+- The marker rewrites every RDMA packet with UDP source port 65535 on its device, whatever the
+  destination: keep that port reserved on the fabric.
+- Without the mesh neither package has a path to the opposite node (`DSV41_ROCE_RING=1` or not): a
+  ring without it runs `SGLANG_ROCE_ALLREDUCE=0` and no `DSV41_ROCE_GATHER`, as before.
+- **Measuring.** The mesh changes the reduction order, so sparkDash's single greedy prose prompt takes
+  a different text and its acceptance moves with it: here prose c1 read 72.0 on the mesh against 76.4 on
+  NCCL while the step was 5 % faster. Compare step time (`spec_verify_ct`) or qeval's median over its
+  75 tasks; that median itself moves 2-3 % from run to run (81.8 / 84.7 / 85.9 on one boot here), so take
+  the median of several runs.
+- CPU pinning does not help: the scheduler on the X925 cores measured -5.5 %, the proxy threads alone
+  on dedicated X925 cores neutral.
+
+Rollback: `DSV41_ROCE_RING=0 SGLANG_ROCE_ALLREDUCE=0` without `DSV41_ROCE_GATHER` in `.env.tp4`, then
+`sudo systemctl disable --now dsv41-mesh` on every node (removes the markers, rules and routes).
 
 ## Measured
 
-Four GB10 Sparks in a ring (`a-b-c-d-a`, no switch), TP4 / EP2, 1M context,
+The ring without the opposite-node paths (collectives on NCCL): four GB10 Sparks in a ring (`a-b-c-d-a`, no switch), TP4 / EP2, 1M context,
 DSpark k=5, local weights (`NFS_SHARE=0`), canary image, this switch on. sparkDash's
 benchmark panel, one engine, no other load.
 

@@ -3,6 +3,35 @@
 Newest first. Each entry says what changed in the production stack and what was measured; the
 raw results live under `docs/results/`.
 
+## 2026-09-25 (ring)
+
+- **RoCEnante on a switchless ring, `DSV41_ROCE_RING=1`, off by default.** A four-node ring has no link between
+  opposite nodes, so RoCEnante could not run there and the production line's collectives went through NCCL. The
+  opposite-node path is now built in the neighbours' ConnectX-7 hardware with FujitsuPolycom/sparkring's
+  `cx7_hairpin_diagonal` (commit `f16b5f4`: an RDMA-TX marker re-tags the opposite-node queue pairs' packets, a
+  `skip_sw` tc rule on the neighbour restores and redirects them, no CPU or kernel forwarding), and
+  `DSV41_ROCE_RING=1` makes the SG17 overlay load `runtime/b12x/b12x/comm/roce_ring`, sparkring's path-aware
+  RoCEnante (two paths per peer over all four RDMA functions; origin and local changes in
+  `runtime/b12x/roce_ring-provenance.json`). `scripts/ring_mesh/` inventories the nodes, reads the cabling,
+  runs sparkring's planner and writes the per-node routes / rules / markers, the boot unit and the
+  `EXTRA_CONTAINER_ENV` line with per-rank peer maps (`B12X_ROCE_PEER_HCA_MAPS`) for the TP rank order. On
+  the ring, same day, one change at a time: NCCL -> RoCEnante decode step -5.2 % (51 qeval tasks, faster on 50),
+  qeval 76.3 -> 79.5; with v2 on top qeval 84.7 (median of 3, 72/75), decode step within a few percent of the
+  switched README, prefill 5-5.5k, phrase needle PASS at 1,030,651 tokens. Details:
+  [switchless-ring.md](docs/switchless-ring.md#rocenante-on-the-ring-hardware-forwarded-opposite-node-paths),
+  raw output: [`docs/results/ring-mesh-20260925.txt`](docs/results/ring-mesh-20260925.txt).
+- `roce_ring` keeps the SG17 proxy's `ROCE_IDLE_SPINS` (20,000,000; sparkring ships 200,000, at which the
+  proxy slept in 27 % of samples during decode): c1 step 40.6 -> 37.1 ms, c2 -7 %, c4 -6 %.
+- `hairpin_queue_size` 8192 on the fabric functions (`scripts/ring_mesh/hairpin.sh`, re-applied at boot): at
+  the default 1024 the neighbour's forwarding queue overflows above ~100 KB per message; at 8192 all-reduces
+  up to 480 KB run without a drop, so `SGLANG_ROCE_MAX_SIZE`/`DSV41_ROCE_GATHER` go to 256 KB (c2-c4 -1 %) with
+  `B12X_ROCE_TWO_WAVE_THRESHOLD_BYTES=0`.
+- `runtime/roce_tp4_adapt.py`: the package is chosen at runtime from `DSV41_ROCE_RING`; the `ROCE single-rail`
+  warning fires for one HCA only (it fired for any count but two). `adapter/l2_prefetch.py` and
+  `adapter/sitecustomize.py` hook either package. `tests/test_roce_ring.py` (CPU) runs in the image build.
+- Tested and not adopted: the scheduler pinned to the X925 cores (qeval -5.5 %), the RoCE proxy threads
+  alone on dedicated X925 cores (within noise), the two-wave schedule once nothing drops.
+
 ## 2026-09-25
 
 - **`DSV41_PREFILL_SP_FP8=1`, on:** the prefill attention-input gather of 17 of the 21 full-row layers carries
