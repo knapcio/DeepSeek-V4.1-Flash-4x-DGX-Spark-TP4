@@ -389,6 +389,77 @@ Explicit reference rank0 server argv (API key omitted; deployment should still u
 
 ## Independent observations and limits
 
+### sparkDash results: contributor R5 vs the author's published v2.3
+
+The following uses the author's table layout. **These are different fleets and sampling schedules: percentages are observed differences from published values, not an isolated optimization gain or a formal benchmark ranking.** Negative differences are retained as well as positive ones. R5 data are the archived initial run already included in this PR; no new measurement is implied.
+
+Author source: [README at 58f23215](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/blob/58f232155917d388b6053eca079c617fd306c33c/README.md#current-results), measured 2026-09-29. Contributor source: [sanitized R5 result JSON](results/r5-wired-20261007.json), measured 2026-10-03. Difference = (R5 / author − 1) × 100, calculated from the displayed values.
+
+**Contributor R5 Decode, aggregate tok/s (per stream in brackets)**
+
+| prompt type | c1 | c2 | c4 | c8 | c16 |
+|---|---:|---:|---:|---:|---:|
+| prose | 84.44 | 119.90 (61.10) | 156.30 (40.58) | 224.74 (29.53) | 347.41 (22.98) |
+| code | 129.86 | 182.57 (92.21) | 238.28 (62.85) | 323.61 (43.34) | 453.12 (30.19) |
+| structured | 156.14 | 174.54 (89.39) | 267.76 (74.12) | 257.64 (44.93) | 537.83 (43.17) |
+| json | 135.26 | 188.32 (96.68) | 295.06 (74.49) | 440.73 (56.85) | 673.80 (44.15) |
+
+**Author Decode, aggregate tok/s (per stream in brackets)**
+
+| prompt type | c1 | c2 | c4 | c8 | c16 |
+|---|---:|---:|---:|---:|---:|
+| prose | 89.7 | 125.2 (64.2) | 165.9 (41.9) | 244.6 (31.7) | 357.2 (23.2) |
+| code | 131.9 | 181.4 (91.7) | 248.0 (63.5) | 328.6 (44.0) | 456.3 (30.5) |
+| structured | 157.8 | 184.6 (106.9) | 242.1 (70.6) | 300.6 (44.6) | 603.4 (47.1) |
+| json | 130.4 | 179.9 (92.8) | 319.8 (80.9) | 477.3 (61.0) | 693.2 (44.8) |
+
+**Aggregate Decode: R5 vs author, observed difference**
+
+| prompt type | c1 | c2 | c4 | c8 | c16 |
+|---|---:|---:|---:|---:|---:|
+| prose | -5.86% | -4.23% | -5.79% | -8.12% | -2.74% |
+| code | -1.55% | +0.64% | -3.92% | -1.52% | -0.70% |
+| structured | -1.05% | -5.45% | +10.60% | -14.29% | -10.87% |
+| json | +3.73% | +4.68% | -7.74% | -7.66% | -2.80% |
+
+**Per-stream Decode: R5 vs author, observed difference**
+
+| prompt type | c1 | c2 | c4 | c8 | c16 |
+|---|---:|---:|---:|---:|---:|
+| prose | -5.86% | -4.83% | -3.15% | -6.85% | -0.95% |
+| code | -1.55% | +0.56% | -1.02% | -1.50% | -1.02% |
+| structured | -1.05% | -16.38% | +4.99% | +0.74% | -8.34% |
+| json | +3.73% | +4.18% | -7.92% | -6.80% | -1.45% |
+
+**Prefill, salted/cold-prefix repeated-token prompts, tok/s**
+
+| fleet | 4k | 16k | 32k | 64k | 128k | 262k |
+|---|---:|---:|---:|---:|---:|---:|
+| Author, switched | 4688.00 | 5583.00 | 5650.00 | 5664.00 | 5398.00 | Not published in this table |
+| Contributor R5, ring | 3142.73 | 5287.15 | 5694.98 | 5888.80 | 5462.13 | 5112.71 |
+| R5 vs author, observed difference | -32.96% | -5.30% | +0.80% | +3.97% | +1.19% | N/A |
+
+“Cold” refers to salted prefix prompts, not an empty Engram row cache. The repeated-token filler can favor Engram caching on both fleets. The 4k result is displayed for completeness and should not determine the overall conclusion; 262k has no matching entry in the author's current table. See the JSON for actual prompt tokens and TTFT. A positive aggregate difference does not necessarily mean a positive per-stream difference.
+
+**Configuration and measurement differences**
+
+| Item | Author's published v2.3 | Contributor R5 |
+|---|---|---|
+| Hardware / parallelism | Four DGX Spark GB10, TP4/EP1 | Four DGX Spark GB10, TP4/EP1 |
+| Source line | v2.3 at 58f23215 | Same upstream source ref, local wired capacity profile |
+| Fabric | Switched RoCE | Four-cable switchless ring, hardware-forwarded diagonal paths |
+| Prefill chunk | 4096 | 8192 |
+| RoCEnante all-reduce/gather cap | 2097152 bytes | 262144 bytes |
+| Context / token pool | 1M context; reported boot pool 6.80M | 1048576 context; configured max-total-tokens 6500000 |
+| GPU clock | Explicit 2200-MHz SM cap | Equivalence to that cap not established in the exported measurement record |
+| Benchmark / generation | sparkDash1.8.8, max256 tokens, temperature0, thinking off | Same core benchmark/version and generation settings |
+| Decode discarded warmup | Two prose c1 runs before sweep | Manager-internal32-token warmup each job; two extra discarded jobs at each type's c2/c8 |
+| Decode repetitions | Each c1 median of3, c4 median of2; c2/c8/c16 once | Prose c1 median of5, code c1 median of3, remaining cells once |
+| Prefill warmup / samples | 4k warmup; median of runs2 and3 of three runs per length | Manager512-token warmup; one six-length sweep |
+| Native initialization | Not specified in the published comparison protocol | WARMUP=1, head quick smoke, workers skip smoke |
+| Monitoring | README recommends10-second GPU/bandwidth polling | sparkDash remained running; polling equivalence not established here |
+
+
 The accompanying [sanitized measurements](results/r5-wired-20261007.json) contain the initial local R5 sweep. These are **sparkDash diagnostic observations, not a formal benchmark ranking, a universal performance guarantee, or proof of root cause**. They are not an equal-protocol comparison against the upstream README's switched fleet.
 
 Protocol: sparkDash 1.8.8, commit `754f40a7454fed1d26d47d1d68dd7bef930ce5ca`, original DecodeBench/PrefillBench managers driven from a workstation. The private orchestration runner SHA256 is `c00e8ae3ec50422b0d5475a9417a2016f1fb76d6ab2779c6a278d7841aac2d53`; it is identified here for provenance, not distributed as a public runner. Prompt types in order: prose, code, structured, json; concurrency 1,2,4,8,16 per type. Prose c1 repeats five times, code c1 three, others once; each c2/c8 has two extra discarded warmup jobs. Every decode job has the manager's internal 32-token warmup; Prefill has its internal 512-token warmup and one sweep over 4096/16384/32768/65536/131072/262144. Total 42 decode jobs plus one Prefill job. Native model warmup remains as above. Greedy/temperature 0, thinking off, decode max output 256. Per-cell repeated statistics are medians; per-stream decode and aggregate decode are separate fields.
