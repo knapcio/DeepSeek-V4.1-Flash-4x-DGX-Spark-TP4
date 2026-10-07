@@ -138,6 +138,10 @@ DSV41_L2_PREFETCH: model forward bracketed (decode/verify only); v3: wo_a window
 
 The simpler images (`Dockerfile` on the stock base, `Dockerfile.canary` without RoCEnante), each layer on its own, and the **switchless ring** for fleets without a RoCE switch are in [docs/optional-setups.md](docs/optional-setups.md). What the image is pinned to and what would let it move: [docs/upstream-watch.md](docs/upstream-watch.md).
 
+## Independent deployment profiles
+
+- [R5 wired switchless-ring profile](docs/r5-wired-profile.md): a contributor's pinned TP4/EP1, 8192-row Prefill configuration, synthetic cabling/address examples, complete environment and recorded sparkDash results. This is an opt-in deployment record, not an upstream release or a replacement for the production profile above.
+
 ## Measuring
 
 - Bench with sparkDash's decode and prefill benches, never with a hand-rolled loop; discard the first two runs after a boot (cold Engram row cache, first-run warm-up).
