@@ -503,6 +503,29 @@ NCCL_DEBUG_SUBSYS=INIT,ENV,NET    # add NET while validating; drop it afterwards
   node, so a four-node ring's bisection bandwidth is one link, not two. Without the
   opposite-node paths below, expect the decode numbers under Measured rather than the switched ones.
 
+### After recabling, a reboot or a netplan change
+
+Field reports from other ring fleets
+([#40](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/40),
+[#41](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/41) on Mia's repo, by
+ChrisLou-bioinfo and ZackO2o); not reproduced on this fleet, which is switched:
+
+* **The RoCE v2 IPv4 GID can move from index 3 to 4** after repeated `netplan apply` or a cable
+  re-seat, leaving index 3 empty; boots then fail with "no common IPv4 RoCE v2 GID" or
+  `ibv_modify_qp(RTR): Connection timed out`. A link bounce does not restore it;
+  `modprobe -r mlx5_ib && modprobe mlx5_ib` re-registers the addresses at index 3. To find the index
+  that carries a port's ring address: the GID ends in `ffff:<ipv4 as hex>` and its
+  `gid_attrs/types/<idx>` reads `RoCE v2`.
+* **Sample `carrier`, not the IB port state.** A port can read `4: ACTIVE` while
+  `/sys/class/net/<iface>/carrier` drops to 0 every few seconds (symptoms: many `non-fatal async
+  event` warnings, `ibv_modify_qp` timeouts, boots dying in collective setup). Re-seating fixed it.
+* **Check NFS weights by shard count behind a `timeout`**, not `mountpoint`: a soft mount can
+  report present while `ls` on it blocks forever.
+* **TX can collapse to ~14 Gb/s on every fabric function** after experiments with the mesh
+  markers (RX stays full, error counters stay zero). Only `modprobe -r mlx5_core && modprobe
+  mlx5_core` or a reboot cleared it. The reporter suspects a marker's flow rule left in the NIC
+  after the marker was killed, so stop the mesh through its unit rather than with `pkill`.
+
 ## RoCEnante on the ring: hardware-forwarded opposite-node paths
 
 **Status: research-only**, as sparkring labels its hardware-forwarded mesh (`plan.py` writes `"status": "research-only"`).
@@ -528,7 +551,10 @@ two paths per peer over its four RDMA functions: the neighbours over their own c
 node through each neighbour (one path per PCIe domain). `DSV41_ROCE_RING=1` makes the SG17 overlay
 load `b12x.comm.roce_ring`, sparkring's path-aware RoCEnante (provenance and local changes in
 `runtime/b12x/roce_ring-provenance.json`), instead of `b12x.comm.roce`; unset, nothing changes.
-`DSV41_L2_PREFETCH` hooks either package.
+`DSV41_L2_PREFETCH` hooks either package. It hooks only these RoCEnante one-shot modules: on a ring
+boot with `SGLANG_ROCE_ALLREDUCE=0` the collectives go through NCCL, the prefetch learns no plan
+(`collectives=0 ... this graph runs without prefetch` on every captured graph) and is inert, with no
+error. That is expected; it costs nothing, and it gains nothing either.
 
 ### What each step is worth
 
