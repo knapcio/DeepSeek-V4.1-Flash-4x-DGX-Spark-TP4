@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "scope": "Historical sparkDash diagnostics; no formal ranking or causal claim",
+  "published": "2026-10-07",
+  "upstream_ref": "58f232155917d388b6053eca079c617fd306c33c",
+  "r5_frozen_baseline_sha256": "e7166bac85d2250fe3b6c4c8d5ea4134ed12b68b61e48910bf169a253864852d",
+  "runner_sha256": "c00e8ae3ec50422b0d5475a9417a2016f1fb76d6ab2779c6a278d7841aac2d53",
+  "exclusions": [
+    "R5 structured c8 extra warmup had completion97/decode96; excluded from formal statistics"
+  ],
+  "notes": [
+    "One recorded R5 run, not an isolated optimization benefit or cross-fleet performance claim",
+    "Aggregate and mean per-stream decode are separate metrics",
+    "Fixed repeated decode prompts may hit prefix cache",
+    "UUID-salted repeated-token Prefill is not natural text",
+    "All formal R5 streams completed256/decode255; short extra-warmup output excluded"
+  ],
+  "runs": {
+    "r5_initial": {
+      "source_sha256": "ac9e0d9d0ef93322ddba1998c9dd0ad13d542a846228f554c85c72e8cbb714d5",
+      "status": "completed",
+      "decode": [
+        {
+          "type": "prose",
+          "concurrency": 1,
+          "repeats": 5,
+          "aggregateDecodeTps": 84.44,
+          "meanDecodeTps": 84.44,
+          "medianTtftMs": 230.41
+        },
+        {
+          "type": "prose",
+          "concurrency": 2,
+          "repeats": 1,
+          "aggregateDecodeTps": 119.9,
+          "meanDecodeTps": 61.1,
+          "medianTtftMs": 240.25
+        },
+        {
+          "type": "prose",
+          "concurrency": 4,
+          "repeats": 1,
+          "aggregateDecodeTps": 156.3,
+          "meanDecodeTps": 40.58,
+          "medianTtftMs": 306.31
+        },
+        {
+          "type": "prose",
+          "concurrency": 8,
+          "repeats": 1,
+          "aggregateDecodeTps": 224.74,
+          "meanDecodeTps": 29.53,
+          "medianTtftMs": 269.61
+        },
+        {
+          "type": "prose",
+          "concurrency": 16,
+          "repeats": 1,
+          "aggregateDecodeTps": 347.41,
+          "meanDecodeTps": 22.98,
+          "medianTtftMs": 821.86
+        },
+        {
+          "type": "code",
+          "concurrency": 1,
+          "repeats": 3,
+          "aggregateDecodeTps": 129.86,
+          "meanDecodeTps": 129.86,
+          "medianTtftMs": 256.33
+        },
+        {
+          "type": "code",
+          "concurrency": 2,
+          "repeats": 1,
+          "aggregateDecodeTps": 182.57,
+          "meanDecodeTps": 92.21,
+          "medianTtftMs": 243.03
+        },
+        {
+          "type": "code",
+          "concurrency": 4,
+          "repeats": 1,
+          "aggregateDecodeTps": 238.28,
+          "meanDecodeTps": 62.85,
+          "medianTtftMs": 303.47
+        },
+        {
+          "type": "code",
+          "concurrency": 8,
+          "repeats": 1,
+          "aggregateDecodeTps": 323.61,
+          "meanDecodeTps": 43.34,
+          "medianTtftMs": 414.86
+        },
+        {
+          "type": "code",
+          "concurrency": 16,
+          "repeats": 1,
+          "aggregateDecodeTps": 453.12,
+          "meanDecodeTps": 30.19,
+          "medianTtftMs": 700.73
+        },
+        {
+          "type": "structured",
+          "concurrency": 1,
+          "repeats": 1,
+          "aggregateDecodeTps": 156.14,
+          "meanDecodeTps": 156.14,
+          "medianTtftMs": 219.67
+        },
+        {
+          "type": "structured",
+          "concurrency": 2,
+          "repeats": 1,
+          "aggregateDecodeTps": 174.54,
+          "meanDecodeTps": 89.39,
+          "medianTtftMs": 234.35
+        },
+        {
+          "type": "structured",
+          "concurrency": 4,
+          "repeats": 1,
+          "aggregateDecodeTps": 267.76,
+          "meanDecodeTps": 74.12,
+          "medianTtftMs": 246.31
+        },
+        {
+          "type": "structured",
+          "concurrency": 8,
+          "repeats": 1,
+          "aggregateDecodeTps": 257.64,
+          "meanDecodeTps": 44.93,
+          "medianTtftMs": 278.81
+        },
+        {
+          "type": "structured",
+          "concurrency": 16,
+          "repeats": 1,
+          "aggregateDecodeTps": 537.83,
+          "meanDecodeTps": 43.17,
+          "medianTtftMs": 324.26
+        },
+        {
+          "type": "json",
+          "concurrency": 1,
+          "repeats": 1,
+          "aggregateDecodeTps": 135.26,
+          "meanDecodeTps": 135.26,
+          "medianTtftMs": 262.97
+        },
+        {
+          "type": "json",
+          "concurrency": 2,
+          "repeats": 1,
+          "aggregateDecodeTps": 188.32,
+          "meanDecodeTps": 96.68,
+          "medianTtftMs": 276.85
+        },
+        {
+          "type": "json",
+          "concurrency": 4,
+          "repeats": 1,
+          "aggregateDecodeTps": 295.06,
+          "meanDecodeTps": 74.49,
+          "medianTtftMs": 272.42
+        },
+        {
+          "type": "json",
+          "concurrency": 8,
+          "repeats": 1,
+          "aggregateDecodeTps": 440.73,
+          "meanDecodeTps": 56.85,
+          "medianTtftMs": 336.18
+        },
+        {
+          "type": "json",
+          "concurrency": 16,
+          "repeats": 1,
+          "aggregateDecodeTps": 673.8,
+          "meanDecodeTps": 44.15,
+          "medianTtftMs": 490.23
+        }
+      ],
+      "prefill": [
+        {
+          "targetTokens": 4096,
+          "promptTokens": 4114,
+          "completionTokens": 2,
+          "prefillTps": 3142.73,
+          "ttftMs": 1309.05,
+          "error": null
+        },
+        {
+          "targetTokens": 16384,
+          "promptTokens": 16404,
+          "completionTokens": 2,
+          "prefillTps": 5287.15,
+          "ttftMs": 3102.62,
+          "error": null
+        },
+        {
+          "targetTokens": 32768,
+          "promptTokens": 32789,
+          "completionTokens": 2,
+          "prefillTps": 5694.98,
+          "ttftMs": 5757.53,
+          "error": null
+        },
+        {
+          "targetTokens": 65536,
+          "promptTokens": 65554,
+          "completionTokens": 2,
+          "prefillTps": 5888.8,
+          "ttftMs": 11131.99,
+          "error": null
+        },
+        {
+          "targetTokens": 131072,
+          "promptTokens": 131091,
+          "completionTokens": 2,
+          "prefillTps": 5462.13,
+          "ttftMs": 23999.99,
+          "error": null
+        },
+        {
+          "targetTokens": 262144,
+          "promptTokens": 262162,
+          "completionTokens": 2,
+          "prefillTps": 5112.71,
+          "ttftMs": 51276.54,
+          "error": null
+        }
+      ]
+    }
+  }
+}
