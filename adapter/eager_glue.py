@@ -273,6 +273,11 @@ def _vcapk_update(vc, confidence, bs):
             or confidence.dim() != 2 or confidence.shape[1] != 5 or confidence.stride(1) != 1
             or not confidence.is_cuda or confidence.shape[0] != bs or bs > 1024 or vc.STRIDE != 6):
         return False
+    if getattr(vc, "_STS_PATH", "") and vc._state.get("sts_t") is not None:
+        # DSV41_VERIFY_CAP_STS: the kernel implements the raw rule. The calibrated rule runs the
+        # torch reference (set_live_from_confidence), which is also what the kernel's own
+        # reference check would compare against -- so the fused path just steps aside.
+        return False
     capturing = torch.cuda.is_current_stream_capturing()
     if not capturing and _vcapk["checks"] < CHECKS:
         # reference first (it writes and shares the live buffer), then the kernel into a scratch row

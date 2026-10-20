@@ -41,6 +41,40 @@ if ENABLED:
         _state["fixed"] = int(SPEC)
 
 
+# DSV41_VERIFY_CAP_STS=/state/dspark_sts.json: per-position temperature scaling of the head's
+# survival (p' = sigmoid(logit(p) / T), scripts/dspark_sts_fit.py fits the T). The rule reads a
+# probability the head never calibrated; this rescales it before the rule sees it, so the same
+# conf:T cuts where the head's own accuracy says to. Raw confidences stay in _state["last_conf"]
+# (and in DSV41_VERIFY_CAP_LOG), so a later refit sees the same uncalibrated stream.
+_STS_PATH = os.environ.get("DSV41_VERIFY_CAP_STS", "").strip()
+if _STS_PATH:
+    import json
+
+    with open(_STS_PATH, "r", encoding="utf-8") as _f:
+        _temps = [float(v) for v in json.load(_f)["temperatures"]]
+    assert all(v > 0 for v in _temps), f"DSV41_VERIFY_CAP_STS: non-positive temperature {_temps}"
+    _gamma = STRIDE - 1
+    assert len(_temps) in (1, _gamma), (
+        f"DSV41_VERIFY_CAP_STS: {_STS_PATH} has {len(_temps)} temperatures, "
+        f"expected 1 or one per draft ({_gamma})")
+    if len(_temps) == 1:
+        _temps = _temps * _gamma
+    _state["sts_t"] = None          # the tensor, on the confidence's device, lazily
+    print(f"[verify_cap] confidence calibration {_STS_PATH}: temperatures {_temps}", flush=True)
+
+
+def calibrate(confidence):
+    """p' = sigmoid(logit(p) / T) per position. No-op unless DSV41_VERIFY_CAP_STS is set."""
+    temps = _state.get("sts_t")
+    if temps is None or confidence is None:
+        return confidence
+    if temps.device != confidence.device:
+        temps = _state["sts_t"] = temps.to(confidence.device)
+    c = confidence.float().clamp(1e-6, 1.0 - 1e-6)
+    z = torch.log(c) - torch.log1p(-c)
+    return torch.sigmoid(z / temps)
+
+
 def _capturing():
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
@@ -67,7 +101,7 @@ def set_live_from_confidence(confidence, bs):
         return
     buf = live_buf(confidence.device)
     _state["last_conf"] = confidence
-    cum = torch.cumprod(confidence.float().clamp(0, 1), dim=1)
+    cum = torch.cumprod(calibrate(confidence).float().clamp(0, 1), dim=1)
     thr = _state["thr"]
     if isinstance(thr, list):
         if _state.get("thr_t") is None or _state["thr_t"].device != cum.device:
