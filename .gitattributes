@@ -1,0 +1,3 @@
+# Unified diffs necessarily encode blank context lines with a prefix that
+# otherwise looks like trailing whitespace when the patch file is reviewed.
+*.patch -whitespace

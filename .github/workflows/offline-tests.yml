@@ -32,6 +32,7 @@ jobs:
             tests/test_sglang_bounded_replay_patch.py \
             tests/test_sglang_layer20_tail_patch.py \
             tests/test_sglang_prefill_interval_min_bs_patch.py \
+            tests/test_sglang_parallel_prompt_encode_patch.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_remote_dotenv.py \
             tests/test_upstream_launcher_ports.py
@@ -43,6 +44,7 @@ jobs:
             runtime/sglang/deepseekv41_detector.py \
             scripts/verify_sglang_layer20_tail.py \
             scripts/verify_sglang_prefill_interval_min_bs.py \
+            scripts/verify_sglang_parallel_prompt_encode.py \
             tests/test_sps_engram_guard.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_v41_tool_constraint.py

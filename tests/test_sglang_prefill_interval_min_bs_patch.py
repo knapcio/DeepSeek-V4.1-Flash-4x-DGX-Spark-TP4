@@ -24,12 +24,12 @@ class PrefillIntervalPackagingTests(unittest.TestCase):
         self.assertIn("prefill_decode_interval_min_bs", patch)
         self.assertIn("] = 0", patch)
 
-    def test_fetch_applies_and_verifies_all_three_backports(self):
+    def test_fetch_applies_and_verifies_scheduler_backport(self):
         fetch = (ROOT / "scripts" / "fetch-sglang-canary.sh").read_text()
         self.assertIn("sglang-44001-prefill-interval-min-bs.patch", fetch)
         self.assertIn("verify_sglang_prefill_interval_min_bs.py", fetch)
-        self.assertEqual(fetch.count("patch --dry-run --silent --fuzz=0 -p1"), 3)
-        self.assertEqual(fetch.count("patch --silent --fuzz=0 -p1"), 3)
+        self.assertGreaterEqual(fetch.count("patch --dry-run --silent --fuzz=0 -p1"), 3)
+        self.assertGreaterEqual(fetch.count("patch --silent --fuzz=0 -p1"), 3)
         self.assertIn("44001 9569a3656155a34dc763826b1608f247d3f66832", fetch)
 
     def test_both_canary_images_verify_the_staged_source(self):

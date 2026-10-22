@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Backport SGLang #41259's exact, content-verified parallel prompt encoder and
+  #45410's native DeepSeek V4/V4.1/V3.2 call sites. Long agent-shaped prompts
+  can use the tokenizers/Rayon pool instead of blocking one HTTP thread in a
+  single encode call; unsupported tokenizer pipelines and short prompts retain
+  the original path. Upstream measured identical token IDs and roughly 9x
+  faster tokenization on a 947K-token V4.1 prompt. This is source-qualified,
+  not yet measured end-to-end on this GB10 deployment.
 - Backport b12x `3f8b71d9` (Luke Alonso): when sequential prepared-kernel
   variants have equal 256-byte-aligned scratch totals, retain the variant with
   the larger raw requirement. This prevents an undersized arena for affected

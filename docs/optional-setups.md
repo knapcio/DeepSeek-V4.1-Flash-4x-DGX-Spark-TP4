@@ -22,6 +22,18 @@ docker build -f Dockerfile.canary -t dsv41-4x-spark:canary .   # on the head and
 
 The staged tree also carries the zero-default runtime backport of [SGLang #44001](https://github.com/sgl-project/sglang/pull/44001). An experimental multi-user profile can add `--prefill-decode-interval-min-bs 4` beside `--prefill-decode-interval 2`: queued prefills are admitted immediately while the running batch has fewer than four requests, and the two-round decode interval resumes from four onward. Leaving the new flag unset is byte-for-byte scheduler policy compatibility; no GB10 performance claim is made until the focused A/B is run.
 
+Long rendered chat prompts also carry the fail-closed parallel encoder from
+[SGLang #41259](https://github.com/sgl-project/sglang/pull/41259), wired into the
+native DeepSeek V4/V4.1/V3.2 paths as proposed in
+[#45410](https://github.com/sgl-project/sglang/pull/45410). The helper uses the
+tokenizers/Rayon pool only for an exact allow-listed fast-tokenizer pipeline;
+short prompts, incompatible tokenizers, disabled Rayon and unsafe runtime
+options fall back to the original single `tokenizer.encode`. Staging pins and
+hashes both the upstream helper and its 19-test/13-subtest identity suite, and
+both images run that suite. Upstream measured 1.92 s to 0.21 s on a 947K-token
+V4.1 agent prompt; no GB10 end-to-end result is claimed here. Roll back with
+`SGLANG_PARALLEL_PROMPT_ENCODE=0` in `EXTRA_CONTAINER_ENV` on every rank.
+
 `./start-tp4.sh build` compiles `BUILD_DOCKERFILE` (default `Dockerfile`, and it has to stay inside the repository so the rsync that stages the workers sees it) and tags the result `$IMAGE`; `BUILD_ARGS` carries anything else the recipe needs, e.g. `--build-arg PIP_INDEX=https://<mirror>/simple` on a network without pypi.org.
 
 ## RoCEnante for the tensor-parallel all-reduces

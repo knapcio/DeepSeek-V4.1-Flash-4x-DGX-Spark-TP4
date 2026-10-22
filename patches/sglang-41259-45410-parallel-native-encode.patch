@@ -1,0 +1,67 @@
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1404,6 +1404,11 @@
+     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
+     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
+     SGLANG_PATCH_TOKENIZER = EnvBool(True)
++    # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
++    SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
++    # Shorter prompts use the single-call encode; below this the gain is eaten
++    # by rayon dispatch and the id merge.
++    SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
+     SGLANG_DEFAULT_THINKING = EnvBool(False)
+ 
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -45,6 +45,9 @@
+     encoding_dsv32,
+     encoding_dsv41,
+ )
++from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
++    parallel_prompt_encode,
++)
+ from sglang.srt.entrypoints.openai.protocol import (
+     ChatCompletionMessageContentTextPart,
+     ChatCompletionMessageContentVideoPart,
+@@ -1517,7 +1520,9 @@
+                     reasoning_effort=v4_reasoning_effort,
+                     reasoning_effort_profile=reasoning_effort_profile,
+                 )
+-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
++                prompt_ids = parallel_prompt_encode(
++                    self.tokenizer_manager.tokenizer, real_input
++                )
+             elif is_dsv41:
+                 if request.task is not None:
+                     encoding_dsv41.attach_task_to_last_user_message(
+@@ -1542,12 +1547,16 @@
+                             self.tokenizer_manager.model_config.hf_config.image_token_id
+                         ),
+                     )
+-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
++                prompt_ids = parallel_prompt_encode(
++                    self.tokenizer_manager.tokenizer, real_input
++                )
+             else:
+                 real_input = encoding_dsv32.encode_messages(
+                     messages, thinking_mode=thinking_mode
+                 )
+-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
++                prompt_ids = parallel_prompt_encode(
++                    self.tokenizer_manager.tokenizer, real_input
++                )
+ 
+             # Append assistant prefix if continue_final_message is enabled
+             if assistant_prefix:
+@@ -1718,8 +1727,8 @@
+             return_dict=False,
+             **template_kwargs,
+         )
+-        prompt_ids = self.tokenizer_manager.tokenizer.encode(
+-            rendered_prompt, **encode_kwargs
++        prompt_ids = parallel_prompt_encode(
++            self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+         )
+         decoded_prompt = (
+             self.tokenizer_manager.tokenizer.decode(prompt_ids)
