@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Backport b12x `3f8b71d9` (Luke Alonso): when sequential prepared-kernel
+  variants have equal 256-byte-aligned scratch totals, retain the variant with
+  the larger raw requirement. This prevents an undersized arena for affected
+  exact-token-count MXFP8 MoE capacities; the regression test covers both
+  variant orderings. The b12x source pin remains `a7d7d29b`.
+
 Newest first. Each entry says what changed in the production stack and what was measured; the
 raw results live under `docs/results/`.
 
