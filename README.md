@@ -6,7 +6,7 @@
 > **Issue #16 safety status (2026-10-22):** the v2.4 profile below is quarantined after
 > repeated Xid 13/43 crashes on a second fleet, including two crashes with
 > `DSV41_PREFILL_BYPASS` disabled. Use the v2.1-compatible safe profile from
-> [`.env.tp4.example`](.env.tp4.example) while the candidate fix is soaked. New canary builds
+> [`.env.tp4.example`](.env.tp4.example) until the two-boot accelerated reproducer passes. New canary builds
 > include a credited, fail-closed backport of [SGLang #41303](https://github.com/sgl-project/sglang/pull/41303),
 > which fixes the matching SWA bounded-replay/prefix-cache correctness path, but it is not yet
 > evidence that the reported CUDA fault is fully resolved. See

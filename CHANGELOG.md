@@ -13,7 +13,8 @@ raw results live under `docs/results/`.
   radix-cache matches. It is credited in the patch and README, applies with zero fuzz, and is source-verified both
   after staging and during image build.
 - This is a candidate mitigation, not a closed incident: no GPU or fleet test was run in this change. The controlled
-  soak/bisect and acceptance criteria are in [`docs/issue-16-swa-crash.md`](docs/issue-16-swa-crash.md).
+  two-boot, 60-90 minute accelerated reproducer/bisect and acceptance criteria are in
+  [`docs/issue-16-swa-crash.md`](docs/issue-16-swa-crash.md).
 
 ## 2026-10-12 v2.4
 

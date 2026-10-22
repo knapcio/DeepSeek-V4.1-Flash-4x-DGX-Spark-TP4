@@ -49,13 +49,17 @@ Run only in an announced maintenance window; preserve kernel logs after every st
 2. Boot the v2.1-compatible profile with the #41303 backport and run the standard smoke,
    qeval, prefix scan, 1M needle, then the issue reproducer with alternating 200k-1M cached
    prefixes and short fresh suffixes.
-3. Soak for at least 24 hours or the reporter's previous failure volume, whichever takes
-   longer. Record request mix, cache-hit sizes, restarts, allocator errors and kernel Xids.
+3. Run an accelerated reproducer on two independent cold boots, 30-45 minutes per boot.
+   Alternate 200K, 400K, 800K and 950K cached prefixes with 512-4096 fresh tokens at c1/c4,
+   and require at least 1,000 successful warm-prefix requests per boot. This deliberately
+   exercises the suspect path more densely than a day of ordinary mixed traffic. Record
+   cache-hit sizes, restarts, allocator errors and per-rank kernel Xids.
 4. If clean, add v2.2-v2.4 deltas one at a time in this order: sync-free, eager glue, compact
    gather, L2 `wo_a` prefetch, certified head, prefix-tail reserve/cadence, 8192-token chunks,
    and bypass last. Return to the clean control between candidates.
 5. If a stage fails, reproduce once with that single delta removed before assigning blame.
 
-Acceptance requires zero CUDA errors, Xids, worker exits, empty replies or quality regressions;
-stable decode/prefill performance is secondary. Keep issue #16 open until the clean soak and
-one re-enable pass are attached as raw results.
+Acceptance requires zero CUDA errors, Xids, worker exits, empty replies or quality regressions
+across both boots; stable decode/prefill performance is secondary. A clean accelerated gate is
+enough to merge the mitigation. Keep issue #16 open only until those raw results and one focused
+re-enable pass are attached; a 24-hour wall-clock soak is not required.
