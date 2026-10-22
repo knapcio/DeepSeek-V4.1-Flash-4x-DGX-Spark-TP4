@@ -22,6 +22,9 @@ Third-party components and their licences:
   python/sglang/srt/function_call/deepseekv41_detector.py at commit 464fffbec8d0
   (SGLang #39665), unmodified, Apache License 2.0 (LICENSE.sglang). The default
   image installs it through runtime/patch_v41_tool_constraint.py.
+- patches/nccl-2393-aarch64-cts-fence.patch is Stanislav Bardyuk's change from
+  NVIDIA/nccl PR #2393 (commit b85c5d9c4aa5), backported to NCCL v2.30.7-1;
+  Apache License 2.0 (LICENSE.sglang contains the same Apache-2.0 text).
 - runtime/b12x/b12x/comm/roce_ring is the path-aware RoCEnante package of
   FujitsuPolycom/sparkring (commit f16b5f4), itself derived from local-inference-lab/b12x
   (RoCEnante, PR 295); Apache License 2.0 (runtime/b12x/LICENSE). Origin and local

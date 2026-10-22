@@ -122,7 +122,7 @@ deployment has to bring. The preflight refuses a library without the marker.
 | Marker | `grep -qa SWITCHLESS_RING_ONLY libnccl.so.2.30.7` succeeds |
 | GID | the RoCE v2 GID at `NCCL_IB_GID_INDEX` is populated and identical in index on every rank |
 
-**Route A: sparkring's published runtime.** Release
+**Route A: sparkring's published runtime (historical binary).** Release
 [`native-runtime-sm121-aa8fa11831af`](https://github.com/FujitsuPolycom/sparkring/releases/tag/native-runtime-sm121-aa8fa11831af),
 asset `native-runtime-files-20260908.tar` (sha256
 `aa8fa11831afaa4539e0b74442fd1ea25dd8cf49ad5edb6fd95e7f05fdf5ce86`), which carries
@@ -138,12 +138,30 @@ ln -sf libnccl.so.2.30.7 libnccl.so.2
 grep -qa SWITCHLESS_RING_ONLY libnccl.so.2.30.7 && echo 'marker ok'
 ```
 
-**Route B: build it.** NVIDIA/nccl `v2.30.7-1` (`73cf112295c33aee2b895f329f592f2a9b4b0f97`)
+This prebuilt binary predates the AArch64 CTS acquire-fence fix below. It is
+retained for exact reproduction of the measured ring, but Route B is recommended
+for unattended service on DGX Spark.
+
+**Route B: build it (recommended).** NVIDIA/nccl `v2.30.7-1` (`73cf112295c33aee2b895f329f592f2a9b4b0f97`)
 with sparkring's `nccl-2.30.7-dual-pci-domain.patch`
 ([DUAL_PCI_DOMAIN.md](https://github.com/FujitsuPolycom/sparkring/blob/main/spark_transport/nccl/DUAL_PCI_DOMAIN.md))
-applied **alone**: it already contains the switchless-cycle change, and the two must not
-be layered. Build the aarch64/SM121 target as that document describes and install the
-result as `libnccl.so.2.30.7` plus the `libnccl.so.2` symlink.
+applied **alone** for the switchless-cycle change; do not layer a second ring patch.
+Then apply [`patches/nccl-2393-aarch64-cts-fence.patch`](../patches/nccl-2393-aarch64-cts-fence.patch),
+a credited backport of [NVIDIA/nccl#2393](https://github.com/NVIDIA/nccl/pull/2393):
+
+```bash
+git checkout 73cf112295c33aee2b895f329f592f2a9b4b0f97
+git apply /path/to/this-repo/patches/nccl-2393-aarch64-cts-fence.patch
+```
+
+The sender polls `idx` and then `nreqs` from a CTS FIFO written by RDMA. On
+weakly ordered AArch64 CPUs, the second load can otherwise observe a reused
+slot's stale count and leave the proxy spinning forever. The acquire fence is
+on the successful CTS path and compiles to `dmb ishld` on AArch64. Build the
+aarch64/SM121 target as the sparkring document describes and install the result
+as `libnccl.so.2.30.7` plus the `libnccl.so.2` symlink. The existing launcher
+preflight proves the ring marker, but cannot prove this instruction is present;
+retain the source/build receipt with the installed library.
 
 **Checking it landed.** `doctor` runs the preflight on the head and on every worker before
 any container is replaced; see [Expected logs](#expected-logs) for the lines.

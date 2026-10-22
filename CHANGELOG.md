@@ -14,6 +14,10 @@ raw results live under `docs/results/`.
   default image now emits typed `tool_calls` for required and named tool choice instead of returning bare DSML
   in `message.content`. The installer is content-pinned and fails closed on base-image drift; all three image
   recipes run the real SGLang/xgrammar grammar-and-parser regression during build.
+- Added Stanislav Bardyuk's NVIDIA/nccl #2393 acquire-fence patch to the recommended AArch64
+  switchless-ring NCCL build. It orders the CTS `nreqs` load after `idx`, preventing a reused FIFO slot's
+  stale count from hanging or truncating the IB send path on weakly ordered CPUs. The previously measured
+  sparkring release binary remains documented as historical reproduction material because it predates the fix.
 - Marked the original v2.4 image as pre-fix after a second fleet reported repeated CUDA Xid 13/43 faults under large
   prefix-cache hits. Four reports now include two with `DSV41_PREFILL_BYPASS` disabled, so bypass is not treated as
   the root cause. The v2.1 feature set is the documented fallback while the candidate is soaked.
