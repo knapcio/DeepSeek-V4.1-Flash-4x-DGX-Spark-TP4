@@ -30,6 +30,7 @@ jobs:
             tests/test_required_sglang_args.py \
             tests/test_launcher_build.py \
             tests/test_sglang_bounded_replay_patch.py \
+            tests/test_sglang_layer20_tail_patch.py \
             tests/test_remote_dotenv.py \
             tests/test_upstream_launcher_ports.py
       - name: Syntax checks
@@ -38,6 +39,7 @@ jobs:
             boot.py \
             runtime/patch_v41_tool_constraint.py \
             runtime/sglang/deepseekv41_detector.py \
+            scripts/verify_sglang_layer20_tail.py \
             tests/test_sps_engram_guard.py \
             tests/test_v41_tool_constraint.py
           bash -n start.sh stop.sh

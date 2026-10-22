@@ -5,6 +5,12 @@ raw results live under `docs/results/`.
 
 ## 2026-10-22 issue #16 resolution
 
+- Added a credited, zero-fuzz adaptation of [SGLang #42901](https://github.com/sgl-project/sglang/pull/42901)
+  for the pinned pre-`HcState` engine. Under decoder bounded replay it writes layer 20's compressed KV for all
+  prompt rows, then limits that layer's otherwise discarded indexer/attention/MoE work to the final 128 rows.
+  The fetch path, image builds and CI fail closed on source-order invariants. Upstream measured 5-10% lower TTFT
+  for 16K-200K cold prompts on GB300; GB10 performance and model-level correctness remain unmeasured, so this is
+  a source-qualified canary change rather than a promoted serving result.
 - Added an Ubuntu/macOS offline CI gate for the launcher, SGLang backport verifier, Engram/SPS guard,
   per-host remote configuration, forced-tool detector installer, syntax checks and vendored-source identity.
 - Ported MiaAI-Lab's Engram/SPS safety guard (`6eb9a7a`, MiaAI-Lab and Claude Sonnet 5.5): an existing

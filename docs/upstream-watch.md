@@ -1,7 +1,24 @@
-# Upstream watch (2026-09-18)
+# Upstream watch (updated 2026-10-22)
 
 What the pieces we run on are pinned to, why, and what would let us move. Checked against
 sgl-project/sglang, DeepGEMM, b12x, HuggingFace and the other public Spark recipes on 2026-09-18.
+
+## 2026-10-22 delta
+
+- [SGLang #42901](https://github.com/sgl-project/sglang/pull/42901) is the strongest small backport
+  found for the active decoder-bounded-replay profile. It writes the last KV-source layer's compressed
+  KV for the full prompt, then runs layer 20's indexer, attention and MoE only on the final 128 rows.
+  Upstream reports 5-10% lower cold-prompt TTFT at 16K-200K on GB300 with no short-prompt change.
+  `patches/sglang-42901-layer20-tail.patch` adapts the change to the pinned pre-`HcState` code and is
+  zero-fuzz/source-order verified. It has not yet received a GB10 boot, speed or model-quality gate.
+- SGLang #45234/#45247/#45275 remove host synchronizations from encoder-SWA replay. The production
+  command enables decoder replay, not encoder replay, so they do not affect the served path and were not
+  copied merely to increase patch count.
+- SGLang #44632 and #45633 primarily improve larger verify/query row counts. The current C1 path already
+  falls inside the old fused limits; they are concurrency candidates, not a route from ~90 to 100 C1 tok/s.
+- MiaAI-Lab's latest public recipe head (`64b02de`, 2026-10-17) adds switchless TP4 packaging and safety
+  work but no newer decode lever missing from this repository. J-M's Round-2 SGLang sweep found a 1 GiB
+  indexer-logits budget useful for memory robustness, while its scheduling changes did not improve decode.
 
 ## Pinned, and why the pin stays
 

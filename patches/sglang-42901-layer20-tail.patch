@@ -1,0 +1,223 @@
+From 05ce0e980f00aa80864190d6f1cd5d9b685802f1 Mon Sep 17 00:00:00 2001
+From: Yi (Vincent) Zhong <207368749+vincentzed@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 21:12:00 +0000
+Subject: [PATCH] Backport SGLang #42901 to the pinned dsv4.1 tree
+
+Under decoder SWA bounded replay, write the last KV-source layer's compressed
+KV for the full prompt and run that layer's indexer, attention and MoE only on
+the final SWA window. Adapted to pinned SGLang commit
+f80c91a4b97e52e17fbcff088aa6b47b6270f6b9, whose mHC path predates HcState and
+the later stage-boundary refactor.
+
+Upstream: https://github.com/sgl-project/sglang/pull/42901
+Upstream merge commit: 05ce0e980f00aa80864190d6f1cd5d9b685802f1
+Original author: Yi (Vincent) Zhong (@vincentzed)
+Recipe adaptation: knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4
+---
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 8aa44ed4c9..4697962bc1 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -1230,6 +1230,10 @@ class DeepseekV4AttnBackend(
+         # Built with the regular prefill metadata; the model switches onto it
+         # after the last kv_source layer (enter_late_layer_tail).
+         self.tail_forward_metadata: Optional[DSV4Metadata] = None
++        # Set while the last KV-source layer runs inside the bounded-replay tail.
++        # Its compressed KV is written for every row before the metadata switch,
++        # so the layer's tail pass must not run the compressor a second time.
++        self.tail_source_kv_layer_id: Optional[int] = None
+         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
+         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
+         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+@@ -1772,40 +1776,39 @@ class DeepseekV4AttnBackend(
+             if tail.cp_metadata is not None
+             else tail.extend_seq_lens_cpu
+         )
+-        # TODO(candidate): goes away once the source publishes its tail rows straight
+-        # onto the tail metadata (publish_prefill); until then cut the full masks.
+-        full_masks = self.forward_metadata.candidate_metadata
+-        if isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
+-            tail_metadata.candidate_metadata = CandidateMasks(
+-                request_masks=[
+-                    mask[mask.shape[0] - t :]
+-                    for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
+-                ]
+-            )
+-        # The last index-source layer before the switch published its top-k into
+-        # the full metadata's buffers; the consumer layers after the switch read
+-        # the tail metadata's, so carry the tail rows over (padding stays -1).
+-        full_core = saved[0].core_attn_metadata
+         tail_core = tail_metadata.core_attn_metadata
+-        for ratio in tail_core.low_ratios:
+-            for full_buf, tail_buf in (
+-                (
+-                    full_core.sparse_page_indices(ratio),
+-                    tail_core.sparse_page_indices(ratio),
+-                ),
+-                (
+-                    full_core.sparse_topk_lengths(ratio),
+-                    tail_core.sparse_topk_lengths(ratio),
+-                ),
+-                (
+-                    full_core.sparse_raw_indices(ratio),
+-                    tail_core.sparse_raw_indices(ratio),
+-                ),
+-            ):
+-                if full_buf is None or tail_buf is None:
+-                    continue
+-                rows = tail.real_rows(full_buf)
+-                tail_buf[: rows.shape[0]].copy_(rows)
++        if self.tail_source_kv_layer_id is None:
++            # Legacy path: the source ran before the switch, so carry its tail rows
++            # into the tail metadata. When the source itself runs in the tail it
++            # publishes both candidates and top-k there directly.
++            full_masks = self.forward_metadata.candidate_metadata
++            if isinstance(full_masks, CandidateMasks) and full_masks.request_masks:
++                tail_metadata.candidate_metadata = CandidateMasks(
++                    request_masks=[
++                        mask[mask.shape[0] - t :]
++                        for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
++                    ]
++                )
++            full_core = saved[0].core_attn_metadata
++            for ratio in tail_core.low_ratios:
++                for full_buf, tail_buf in (
++                    (
++                        full_core.sparse_page_indices(ratio),
++                        tail_core.sparse_page_indices(ratio),
++                    ),
++                    (
++                        full_core.sparse_topk_lengths(ratio),
++                        tail_core.sparse_topk_lengths(ratio),
++                    ),
++                    (
++                        full_core.sparse_raw_indices(ratio),
++                        tail_core.sparse_raw_indices(ratio),
++                    ),
++                ):
++                    if full_buf is None or tail_buf is None:
++                        continue
++                    rows = tail.real_rows(full_buf)
++                    tail_buf[: rows.shape[0]].copy_(rows)
+         self.forward_metadata = tail_metadata
+         if self.token_to_kv_pool.request_window is not None:
+             self.token_to_kv_pool.request_window.activate(
+@@ -1823,6 +1826,21 @@ class DeepseekV4AttnBackend(
+             local_dp_buffer_len,
+         ) = saved
+         set_local_dp_buffer_len(local_dp_buffer_len)
++        self.tail_source_kv_layer_id = None
++
++    def write_tail_source_kv(
++        self, *, layer, x, positions, forward_batch: ForwardBatch
++    ) -> None:
++        """Write every source-layer compressed-KV row before entering the tail."""
++        self.forward_low_ratio_sources(
++            layer=layer,
++            x=x,
++            q_lora=None,
++            positions=positions,
++            forward_batch=forward_batch,
++            run_indexer=False,
++        )
++        self.tail_source_kv_layer_id = layer.layer_id
+ 
+     def init_forward_metadata_target_verify(
+         self,
+@@ -2828,6 +2846,8 @@ class DeepseekV4AttnBackend(
+             return
+         if forward_batch.encoder_swa_replay:
+             run_compressor = False
++        if layer.layer_id == self.tail_source_kv_layer_id:
++            run_compressor = False
+         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
+             self._forward_low_ratio_sources_cp(
+                 layer=layer,
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 98de40fa11..49e77c8bc8 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -3498,6 +3498,27 @@ class DeepseekV4DecoderLayer(nn.Module):
+             hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+         return hidden_states, ffn_pre
+ 
++    def write_tail_source_kv(
++        self,
++        *,
++        hidden_states: torch.Tensor,
++        prev_pre: Optional[torch.Tensor],
++        positions: torch.Tensor,
++        forward_batch: ForwardBatch,
++    ) -> None:
++        """Write full-prompt compressed KV without running attention or the MoE."""
++        x = self._hc_combine(
++            hidden_states,
++            apply_pre=prev_pre,
++            norm=self.input_layernorm,
++        )
++        get_attn_backend().write_tail_source_kv(
++            layer=self.self_attn,
++            x=x,
++            positions=positions,
++            forward_batch=forward_batch,
++        )
++
+     def _run_moe_ffn_dp_sync(
+         self,
+         hidden_states: torch.Tensor,
+@@ -4072,16 +4093,33 @@ class DeepseekV4Model(nn.Module):
+ 
+         self.dspark_layers_to_capture: Optional[List[int]] = None
+ 
+-        # Decoder SWA bounded replay: layers past the last kv_source layer run over
+-        # each request's last SWA_WINDOW extend tokens only.
++        # Decoder SWA bounded replay: layers from late_layer_start on run over each
++        # request's last SWA_WINDOW extend tokens only. On CUDA the last KV-source
++        # layer writes full-prompt compressed KV, then runs its remaining work in
++        # the tail; ROCm keeps the older whole-layer path.
+         self.late_layer_start: Optional[int] = None
++        self.tail_writes_source_kv = False
+         if get_exec().features.enable_decoder_swa_bounded_replay:
+             assert config.kv_source_layer_ids, (
+                 "decoder SWA bounded replay needs kv_source_layer_ids"
+             )
+-            self.late_layer_start = max(config.kv_source_layer_ids) + 1
++            last_source = max(config.kv_source_layer_ids)
++            self.tail_writes_source_kv = not _is_hip
++            self.late_layer_start = (
++                last_source if self.tail_writes_source_kv else last_source + 1
++            )
++            if self.tail_writes_source_kv:
++                assert self.layers[last_source].engram is None, (
++                    "the last kv_source layer must not carry an Engram"
++                )
++                assert (
++                    last_source in config.index_source_layer_ids
++                    and config.candidate_source_layer_id in (-1, last_source)
++                ), (
++                    "the last kv_source layer must also be the index and candidate source"
++                )
+             late_ratios = set(
+-                config.compress_ratios[self.late_layer_start : config.num_hidden_layers]
++                config.compress_ratios[last_source + 1 : config.num_hidden_layers]
+             )
+             assert late_ratios <= {
+                 0,
+@@ -4214,8 +4252,14 @@ class DeepseekV4Model(nn.Module):
+         precomputed_attn = None
+         for i in range(self.start_layer, self.end_layer):
+             if tail is not None and i == self.late_layer_start:
+-                # Past the last kv_source layer a layer only owes its window KV,
+-                # and decode reaches back at most SWA_WINDOW positions.
++                if self.tail_writes_source_kv:
++                    self.layers[i].write_tail_source_kv(
++                        hidden_states=hidden_states,
++                        prev_pre=prev_pre,
++                        positions=positions,
++                        forward_batch=forward_batch,
++                    )
++                # From this layer onward, decode reaches back at most SWA_WINDOW.
+                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                 hidden_states, prev_pre, input_ids, input_ids_global = (
+                     tail.rows(hidden_states),
+
