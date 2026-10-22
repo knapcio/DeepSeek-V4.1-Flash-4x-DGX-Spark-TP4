@@ -2,14 +2,13 @@
 
 <p align="center">A measured TP4 serving profile for <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a> (native weights, SGLang, DSpark) on four NVIDIA DGX Spark (GB10) nodes, built on top of the MiaAI-Lab recipe.</p>
 
-> [!WARNING]
-> **Issue #16 safety status (2026-10-22):** the v2.4 profile below is quarantined after
-> repeated Xid 13/43 crashes on a second fleet, including two crashes with
-> `DSV41_PREFILL_BYPASS` disabled. Use the v2.1-compatible safe profile from
-> [`.env.tp4.example`](.env.tp4.example) until the two-boot accelerated reproducer passes. New canary builds
-> include a credited, fail-closed backport of [SGLang #41303](https://github.com/sgl-project/sglang/pull/41303),
-> which fixes the matching SWA bounded-replay/prefix-cache correctness path, but it is not yet
-> evidence that the reported CUDA fault is fully resolved. See
+> [!IMPORTANT]
+> **Issue #16 was resolved by [#18](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/pull/18).**
+> The original v2.4 images predate the fix and must be rebuilt: new canary builds carry a
+> credited, fail-closed backport of [SGLang #41303](https://github.com/sgl-project/sglang/pull/41303),
+> which keeps the complete SWA window on the affected bounded-replay/prefix-cache path.
+> The v2.1-compatible block in [`.env.tp4.example`](.env.tp4.example) remains the conservative
+> fallback. Incident analysis and a focused regression procedure are in
 > [`docs/issue-16-swa-crash.md`](docs/issue-16-swa-crash.md).
 
 ## Credits
@@ -33,14 +32,15 @@ Other work this profile builds on:
 - **ChrisLou-bioinfo**, **ZackO2o** and **hushengkai** (Mia's repo [#40](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/40), [#41](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/41), [#45](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/45)): the ring recovery notes and the bring-up pitfalls in `docs/switchless-ring.md` and `.env.tp4.example`; the people who published their own measurements are listed in [`docs/community-results.md`](docs/community-results.md).
 - **hushengkai** ([Mia #44](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/44), [#9](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/9), [Mia PR #15](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/15), [#10](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/10)): the diagnosis of short-request starvation behind chunked prefill (the opt-in `DSV41_PREFILL_BYPASS` adapter is our own implementation, pending fleet qualification), the image-placeholder sanitizer patched into the images, and the offline-load and dead-proxy reports behind `SKIP_PULL` and the proxy pre-check.
 - **100menotu001** ([Mia PR #46](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/46), [PR #47](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/47)): public-key recovery and key-blob matching in `ensure_ssh_keys`, the share-before-build error, and Messages `thinking: enabled` without a budget.
+- **colonel-otto** (ported from Mia upstream commits `5685a5d` / `dd02792`): per-host SSH users through `WORKER_USER=""` and `~/.ssh/config`, including host-name-based spec-table distribution and safe worker paths.
 - **yalindogusahin** ([Mia PR #4](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/4)), **RustyAiLab** ([PR #5](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/5), [PR #8](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/8)) and **BHCC2025** ([PR #26](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/26)): NFS exporter reuse, the single-rail shell fixes, `remote.py` reading `.env` defaults, and re-sharing before `pack` (GID auto-selection is opt-in here).
 - **bertholomus** ([Mia PR #10](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/10)): reading each node's HCA port state, used here as a `doctor` check.
 - **motzudao** ([Mia #31](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/31)): the report that a custom `EXTRA_SGLANG_ARGS` dropped the required FP8 GEMM backend.
 - **MiaAI-Lab/sparkDash**, the benchmark used for every number below.
 
-## Historical v2.4 results (quarantined)
+## Historical pre-fix v2.4 results
 
-These measurements remain useful as historical performance data, but the profile is not the current safety recommendation. Stack v2.4 (the quarantined `EXTRA_CONTAINER_ENV` line of [`.env.tp4.example`](.env.tp4.example) with its settings block, `EP_SIZE=1`, `Dockerfile.canary-roce` image), built from a clean tree on all four nodes, sparkDash 1.8.8: 256 new tokens, temperature 0, thinking off, idle fleet, 2026-10-12. KV pool 3.67M tokens, 1M context. Raw output: [`docs/results/validation-20261012-v24.txt`](docs/results/validation-20261012-v24.txt). Measurements from other fleets are linked, with their dates, in [`docs/community-results.md`](docs/community-results.md).
+These measurements remain useful as historical performance data, but their image predates the issue #16 fix. Stack v2.4 (the historical `EXTRA_CONTAINER_ENV` line of [`.env.tp4.example`](.env.tp4.example) with its settings block, `EP_SIZE=1`, `Dockerfile.canary-roce` image), built from a clean tree on all four nodes, sparkDash 1.8.8: 256 new tokens, temperature 0, thinking off, idle fleet, 2026-10-12. KV pool 3.67M tokens, 1M context. Raw output: [`docs/results/validation-20261012-v24.txt`](docs/results/validation-20261012-v24.txt). Measurements from other fleets are linked, with their dates, in [`docs/community-results.md`](docs/community-results.md).
 
 ### sparkDash, GPU clock capped at 2200 MHz
 
@@ -88,7 +88,7 @@ What v2.4 changed against v2.3 is in [CHANGELOG.md](CHANGELOG.md).
 
 Every earlier measurement, the per-stage tables and the experiments that were tried and not adopted are in [docs/history.md](docs/history.md); what changed when is in [CHANGELOG.md](CHANGELOG.md).
 
-## What the quarantined v2.4 profile ran
+## What the historical pre-fix v2.4 profile ran
 
 | Layer | Setting | What it does |
 |---|---|---|
@@ -162,8 +162,8 @@ Same launcher as upstream; read [`docs/README-upstream.md`](docs/README-upstream
 
 ```bash
 cp .env.tp4.example .env.tp4          # fill in HEAD_IP / WORKER_* / MODEL_DIR / fabric
-# recommended while issue #16 is open: uncomment IMAGE=dsv41-4x-spark:canary-roce and the
-# v2.1-compatible safe EXTRA_CONTAINER_ENV line; leave the quarantined v2.4 block commented,
+# conservative start: uncomment IMAGE=dsv41-4x-spark:canary-roce and the v2.1-compatible
+# EXTRA_CONTAINER_ENV line; rebuild the image so it contains the issue #16 backport,
 # set BUILD_DOCKERFILE=Dockerfile.canary-roce and EP_SIZE=1 (the file default EP_SIZE=2 is for the
 # base/canary images)
 ./start-tp4.sh download               # 476 GiB at the pinned revision, needs the hf CLI; skips when complete

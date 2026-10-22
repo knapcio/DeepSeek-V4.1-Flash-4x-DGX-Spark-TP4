@@ -73,7 +73,12 @@ class BuildTargetTests(unittest.TestCase):
             shell(r"""
               BUILD_DOCKERFILE=Dockerfile.canary
               BUILD_ARGS="--build-arg PIP_INDEX=https://mirror.invalid/simple"
-              WORKER_HOSTS=()
+              # Bash 3.2 treats expansion of an empty array as an unbound variable
+              # under `set -u`. Keep one fake worker and stub the two remote effects;
+              # this test is about the selected local Dockerfile/build arguments.
+              WORKER_HOSTS=(worker)
+              remote_on() { return 0; }
+              rsync() { return 0; }
               docker() { printf '%s\n' "$*" >> "$LOG"
                          case "$1 $2" in "image inspect") echo arm64;; esac; }
               cmd_build

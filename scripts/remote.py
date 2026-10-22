@@ -9,6 +9,11 @@ import sys
 import pexpect
 
 
+def ssh_destination(host: str, user: str) -> str:
+    """Let an empty user delegate identity selection to ~/.ssh/config."""
+    return f"{user}@{host}" if user else host
+
+
 def load_dotenv(path: str) -> None:
     if not os.path.isfile(path):
         return
@@ -47,7 +52,7 @@ def ssh_cmd(
     timeout: int,
 ) -> int:
     identity = os.path.expandvars(os.path.expanduser(identity or ""))
-    dest = f"{user}@{host}"
+    dest = ssh_destination(host, user)
     base = [
         "ssh",
         "-o",

@@ -7,7 +7,10 @@ import unittest
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
-from test_launcher_build import ROOT, shell
+try:
+    from tests.test_launcher_build import ROOT, shell
+except ModuleNotFoundError:  # direct execution from /opt/dsv41/tests in the image
+    from test_launcher_build import ROOT, shell
 
 
 class NfsPortsTests(unittest.TestCase):
@@ -122,6 +125,14 @@ class NfsPortsTests(unittest.TestCase):
 
 
 class RemoteDefaultsTests(unittest.TestCase):
+    def test_empty_user_delegates_to_ssh_config(self):
+        spec = importlib.util.spec_from_file_location('remote_destination', ROOT / 'scripts/remote.py')
+        remote = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'pexpect': SimpleNamespace()}):
+            spec.loader.exec_module(remote)
+        self.assertEqual(remote.ssh_destination('worker-a', ''), 'worker-a')
+        self.assertEqual(remote.ssh_destination('worker-a', 'alice'), 'alice@worker-a')
+
     def test_env_loaded_before_argument_defaults(self):
         spec = importlib.util.spec_from_file_location('remote_defaults', Path(os.environ.get('DSV41_REMOTE_TEST_SOURCE', ROOT / 'scripts/remote.py')))
         remote = importlib.util.module_from_spec(spec)
@@ -138,6 +149,31 @@ class RemoteDefaultsTests(unittest.TestCase):
                     self.assertEqual(remote.main(), 0)
                     self.assertEqual(ssh.call_args.args, ('custom-host', 'custom-user', 'true', None,
                                                         tmp + '/custom-key', 17))
+
+
+class PerHostUserLauncherTests(unittest.TestCase):
+    def test_empty_user_keeps_aliases_for_remote_operations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = shell(r'''
+              echo "USER=<$WORKER_USER> DIR=<$WORKER_DIR>"
+              remote_on() { echo "REMOTE:$1"; }
+              push_spec_tables
+            ''', Path(tmp), {
+                'WORKER_USER': '',
+                'WORKER_DIR': '/srv/dsv41',
+                'WORKER_HOSTS': 'worker-a worker-b',
+                'WORKER_IPS': '10.0.0.2 10.0.0.3',
+            })
+            self.assertIn('USER=<> DIR=</srv/dsv41>', out)
+            self.assertEqual(out.count('REMOTE:worker-a'), 2)
+            self.assertEqual(out.count('REMOTE:worker-b'), 2)
+            self.assertNotIn('REMOTE:10.0.0.', out)
+
+    def test_pack_uses_worker_aliases_not_data_ips(self):
+        source = (ROOT / 'start.sh').read_text()
+        pack = source[source.index('cmd_pack()'):source.index('\ncase "$CMD" in')]
+        self.assertIn('for host in "${WORKER_HOSTS[@]}"', pack)
+        self.assertNotIn('for host in "${WORKER_IPS[@]}"', pack)
 
 if __name__ == '__main__':
     unittest.main()

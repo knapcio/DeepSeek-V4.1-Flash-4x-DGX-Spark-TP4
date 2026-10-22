@@ -65,7 +65,7 @@ else
 fi
 [[ ${#WORKER_HOSTS[@]} -eq ${#WORKER_IPS[@]} ]] || { echo "WORKER_HOSTS and WORKER_IPS differ in length" >&2; exit 1; }
 WORKER1_IP="${WORKER_IPS[0]}"; WORKER2_IP="${WORKER_IPS[1]:-}"   # legacy names, still read by files/nfs-share.sh
-WORKER_USER="${WORKER_USER:-zurih}"
+WORKER_USER="${WORKER_USER-zurih}"   # set to "" to let ~/.ssh/config choose per-host users
 SSH_IDENTITY="${SSH_IDENTITY:-$HOME/.ssh/id_ed25519_shared}"
 FABRIC_IFACE="${FABRIC_IFACE:-enp1s0f1np1}"
 GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-enP7s7}"
@@ -110,6 +110,10 @@ BUILD_ARGS="${BUILD_ARGS:-}"
 HEAD_CTN="${HEAD_CTN:-dsv41-head}"
 WORKER_CTN="${WORKER_CTN:-dsv41-worker}"
 WORKER_DIR="${WORKER_DIR:-/home/${WORKER_USER}/dsv41-3x-spark}"
+[[ -n "$WORKER_USER" || "$WORKER_DIR" != /home//* ]] || {
+  echo "WORKER_USER is empty: set WORKER_DIR to an absolute path" >&2
+  exit 1
+}
 
 NNODES="${NNODES:-$(( ${#WORKER_IPS[@]} + 1 ))}"
 [[ "$NNODES" -eq $(( ${#WORKER_IPS[@]} + 1 )) ]] || { echo "NNODES=$NNODES but ${#WORKER_IPS[@]} workers are configured" >&2; exit 1; }
@@ -386,7 +390,7 @@ push_spec_tables() {
   local name local_path host
   for name in dspark_sps.json dspark_sts.json; do
     local_path="$STATE_DIR/$name"
-    for host in "${WORKER_IPS[@]}"; do
+    for host in "${WORKER_HOSTS[@]}"; do
       if [[ -f "$local_path" ]]; then
         local payload
         payload=$(base64 -w0 <"$local_path")
@@ -475,7 +479,7 @@ EOF
 cmd_doctor() {
   echo "=== doctor (DeepSeek-V4.1-Flash · ${NNODES}× Spark · TP${TP_SIZE} · SGLang) ==="
   echo "head:     $(hostname) / $(whoami) @ $HEAD_IP"
-  echo "workers:  ${WORKER_USER}@${WORKER_HOSTS[*]}  (${WORKER_IPS[*]})"
+  echo "workers:  ${WORKER_USER:+${WORKER_USER}@}${WORKER_HOSTS[*]}  (${WORKER_IPS[*]})"
   echo "image:    $IMAGE  (base $BASE_IMAGE)"
   echo "model:    $MODEL_DIR"
   echo "parallel: nnodes=$NNODES TP=$TP_SIZE EP=$EP_SIZE  ctx=$CONTEXT_LENGTH  util=$MEM_FRACTION_STATIC (head $HEAD_MEM_FRACTION_STATIC)"
@@ -663,7 +667,7 @@ cmd_build() {
       --exclude '/logs' --exclude '/logs-tp4' --exclude '/models' \
       --exclude '/engram' \
       -e "$(ssh_rsync_e)" \
-      "$ROOT/" "${WORKER_USER}@${h}:${WORKER_DIR}/"
+      "$ROOT/" "${WORKER_USER:+${WORKER_USER}@}${h}:${WORKER_DIR}/"
     info "docker build on $h ..."
     remote_on "$h" --timeout "${BUILD_TIMEOUT:-0}" \
       "$(base_image_worker_command "$base")
@@ -1036,7 +1040,7 @@ cmd_pack() {
     /opt/dsv41/scripts/pack_engram.py --rank 0 --tp "$TP_SIZE" --out /engram \
     || die "pack failed on head"
   local idx=1 host
-  for host in "${WORKER_IPS[@]}"; do
+  for host in "${WORKER_HOSTS[@]}"; do
     info "packing rank $idx on $host..."
     remote_on "$host" "mkdir -p $WORKER_ENGRAM_DIR && docker run --rm --network host \
       -v $NFS_VOLUME:/models/DeepSeek-V4.1-Flash:ro \

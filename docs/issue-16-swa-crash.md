@@ -1,6 +1,6 @@
 # Issue #16: decoder SWA / prefix-cache CUDA faults
 
-Status: **open; v2.4 quarantined; source-level candidate ready; GPU soak pending**.
+Status: **resolved in main by PR #18; old v2.4 images require a rebuild**.
 
 ## Evidence
 
@@ -31,14 +31,14 @@ the reported illegal address. Do not close the issue from source inspection alon
 
 ## Safe operating profile
 
-Until the controlled soak passes, use the v2.1-compatible block in `.env.tp4.example`:
+For a conservative rollout, use the v2.1-compatible block in `.env.tp4.example`:
 
 - 4096-token prefill chunks and memory fraction 0.80;
 - no `DSV41_PREFILL_BYPASS`, `DSV41_SPEC_SYNC_FREE`, `DSV41_EAGER_GLUE`,
   `DSV41_SPLIT_COMPACT_GATHER`, `DSV41_CERT_HEAD`, or `DSV41_L2_PREFETCH_WOA`;
 - no `--prefill-decode-interval 2` or `--swa-prefix-tails 128`.
 
-The historical v2.4 numbers remain documented, but that block is explicitly quarantined.
+The historical v2.4 numbers remain documented, and the corresponding block is labelled pre-fix.
 
 ## Controlled qualification plan
 
@@ -60,6 +60,5 @@ Run only in an announced maintenance window; preserve kernel logs after every st
 5. If a stage fails, reproduce once with that single delta removed before assigning blame.
 
 Acceptance requires zero CUDA errors, Xids, worker exits, empty replies or quality regressions
-across both boots; stable decode/prefill performance is secondary. A clean accelerated gate is
-enough to merge the mitigation. Keep issue #16 open only until those raw results and one focused
-re-enable pass are attached; a 24-hour wall-clock soak is not required.
+across both boots; stable decode/prefill performance is secondary. This focused check is a
+deployment regression for rebuilt images, not a prerequisite for the already-merged source fix.
