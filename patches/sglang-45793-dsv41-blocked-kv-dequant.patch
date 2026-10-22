@@ -1,0 +1,170 @@
+diff --git a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
+--- a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
+@@ -21,6 +21,7 @@
+ NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
+ NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
+ PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
++_V41_BLOCK_TOKENS = 8
+ 
+ 
+ def dequantize_k_cache_paged(
+@@ -144,11 +145,12 @@
+         if layout is KVLayout.V41
+         else _dequantize_k_cache_paged_v41_fp4_kernel
+     )
+-    kernel[(num_tokens,)](
++    kernel[(triton.cdiv(num_tokens, _V41_BLOCK_TOKENS),)](
+         out,
+         buf_fp8,
+         buf_uint8,
+         page_table_1_flattened,
++        num_tokens,
+         out.stride(0),
+         BYTES_PER_PAGE=bytes_per_page,
+         PAGE_SIZE=page_size,
+@@ -156,6 +158,8 @@
+         SCALE_BYTES=layout.scale_bytes,
+         TILE_SIZE=layout.tile_size,
+         S_OFFSET_BYTES=layout.scale_offset(page_size),
++        BLOCK_TOKENS=_V41_BLOCK_TOKENS,
++        num_warps=4,
+     )
+     return out
+ 
+@@ -372,11 +376,35 @@
+ 
+ 
+ @triton.jit
++def _v41_token_bases(
++    page_table_ptr,
++    num_tokens,
++    BYTES_PER_PAGE: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    DATA_BYTES: tl.constexpr,
++    SCALE_BYTES: tl.constexpr,
++    S_OFFSET_BYTES: tl.constexpr,
++    BLOCK_TOKENS: tl.constexpr,
++):
++    token_ids = tl.program_id(0).to(tl.int64) * BLOCK_TOKENS + tl.arange(
++        0, BLOCK_TOKENS
++    )
++    mask = token_ids < num_tokens
++    loc = tl.load(page_table_ptr + token_ids, mask=mask, other=0).to(tl.int64)
++    page_byte_base = (loc // PAGE_SIZE) * BYTES_PER_PAGE
++    in_page = loc % PAGE_SIZE
++    data_base = page_byte_base + in_page * DATA_BYTES
++    scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
++    return token_ids, mask[:, None], data_base[:, None], scale_base[:, None]
++
++
++@triton.jit
+ def _dequantize_k_cache_paged_v41_fp8_kernel(
+     output_ptr,
+     buf_fp8_ptr,
+     buf_uint8_ptr,
+     page_table_ptr,
++    num_tokens,
+     output_stride_0,
+     BYTES_PER_PAGE: tl.constexpr,
+     PAGE_SIZE: tl.constexpr,
+@@ -384,24 +412,29 @@
+     SCALE_BYTES: tl.constexpr,
+     TILE_SIZE: tl.constexpr,
+     S_OFFSET_BYTES: tl.constexpr,
++    BLOCK_TOKENS: tl.constexpr,
+ ):
+     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
+     tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
+-    token_id = tl.program_id(0).to(tl.int64)
+-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+-    page_idx = loc // PAGE_SIZE
+-    in_page = loc % PAGE_SIZE
+-    page_byte_base = page_idx * BYTES_PER_PAGE
+-    token_data_base = page_byte_base + in_page * DATA_BYTES
+-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
++    token_ids, mask, data_base, scale_base = _v41_token_bases(
++        page_table_ptr,
++        num_tokens,
++        BYTES_PER_PAGE,
++        PAGE_SIZE,
++        DATA_BYTES,
++        SCALE_BYTES,
++        S_OFFSET_BYTES,
++        BLOCK_TOKENS,
++    )
+ 
+-    offs = tl.arange(0, DATA_BYTES)
+-    vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
+-    scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + offs // TILE_SIZE)
++    offs = tl.arange(0, DATA_BYTES)[None, :]
++    vals = tl.load(buf_fp8_ptr + data_base + offs, mask=mask).to(tl.float32)
++    scale_u8 = tl.load(buf_uint8_ptr + scale_base + offs // TILE_SIZE, mask=mask)
+     out = vals * _ue8m0_to_fp32(scale_u8)
+     tl.store(
+-        output_ptr + token_id * output_stride_0 + offs,
++        output_ptr + token_ids[:, None] * output_stride_0 + offs,
+         out.to(output_ptr.dtype.element_ty),
++        mask=mask,
+     )
+ 
+ 
+@@ -411,6 +444,7 @@
+     buf_fp8_ptr,
+     buf_uint8_ptr,
+     page_table_ptr,
++    num_tokens,
+     output_stride_0,
+     BYTES_PER_PAGE: tl.constexpr,
+     PAGE_SIZE: tl.constexpr,
+@@ -418,29 +452,37 @@
+     SCALE_BYTES: tl.constexpr,
+     TILE_SIZE: tl.constexpr,
+     S_OFFSET_BYTES: tl.constexpr,
++    BLOCK_TOKENS: tl.constexpr,
+ ):
+     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
+     # then 32 e4m3 scales (one per 16 values).
+     tl.static_assert(DATA_BYTES == 256 and SCALE_BYTES == 32 and TILE_SIZE == 16)
+-    token_id = tl.program_id(0).to(tl.int64)
+-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+-    page_idx = loc // PAGE_SIZE
+-    in_page = loc % PAGE_SIZE
+-    page_byte_base = page_idx * BYTES_PER_PAGE
+-    token_data_base = page_byte_base + in_page * DATA_BYTES
+-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
++    token_ids, mask, data_base, scale_base = _v41_token_bases(
++        page_table_ptr,
++        num_tokens,
++        BYTES_PER_PAGE,
++        PAGE_SIZE,
++        DATA_BYTES,
++        SCALE_BYTES,
++        S_OFFSET_BYTES,
++        BLOCK_TOKENS,
++    )
+ 
+-    boffs = tl.arange(0, DATA_BYTES)
+-    packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
++    boffs = tl.arange(0, DATA_BYTES)[None, :]
++    packed = tl.load(buf_uint8_ptr + data_base + boffs, mask=mask)
+     # Byte j holds elements 2j (low nibble) and 2j + 1, both in tile (2j) // 16.
+-    scale = tl.load(buf_fp8_ptr + token_scale_base + (2 * boffs) // TILE_SIZE).to(
++    scale = tl.load(buf_fp8_ptr + scale_base + (2 * boffs) // TILE_SIZE, mask=mask).to(
+         tl.float32
+     )
+     lo = _e2m1_code_to_fp32(packed & 0xF) * scale
+     hi = _e2m1_code_to_fp32(packed >> 4) * scale
+-    out_base = output_ptr + token_id * output_stride_0
+-    tl.store(out_base + 2 * boffs, lo.to(output_ptr.dtype.element_ty))
+-    tl.store(out_base + 2 * boffs + 1, hi.to(output_ptr.dtype.element_ty))
++    out = tl.reshape(tl.join(lo, hi), (BLOCK_TOKENS, 2 * DATA_BYTES))
++    ooffs = tl.arange(0, 2 * DATA_BYTES)[None, :]
++    tl.store(
++        output_ptr + token_ids[:, None] * output_stride_0 + ooffs,
++        out.to(output_ptr.dtype.element_ty),
++        mask=mask,
++    )
+ 
+ 
+ @triton.jit

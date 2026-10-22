@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Adapt Shuwen Wang's SGLang #45793 for the pinned V4.1 KV layout: sparse
+  prefill now dequantizes eight cache tokens per Triton program instead of
+  launching one program per token. FP8 and FP4 share a masked page/address
+  mapping, and the FP4 low/high nibbles remain interleaved per output row.
+  The upstream GB300 kernel result (1.5-2.34x) is context only; this canary
+  carries no GB10 or end-to-end claim before a GPU parity/timing gate.
 - Backport 05yuki and Claude Opus 5.5's SGLang #45745: the SM12x-compatible
   Torch V4.1 prefill indexer now applies ReLU and head weights in place on the
   fresh einsum result before the unchanged head reduction. This preserves the
