@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Adapt SGLang #45457 (Chen Cheng / ischencheng) onto the pinned V4.1 tree.
+  Added-token spellings supplied in user/tool data now encode as plain text,
+  while template-written turn, reasoning and DSML tokens keep their control
+  IDs. The exact upstream helper and test suite are SHA-256-pinned; clean
+  prompts retain #41259's parallel tokenizer rather than regressing to serial
+  encode. `SGLANG_ENABLE_DSV41_PLAIN_TEXT_ENCODE=false` is the rollback.
 - Backport SGLang #43549 (nankingjing) onto the pinned Anthropic frontend:
   native `dsv41` conversations retain mid-conversation system messages in
   place, so a new turn does not rewrite the leading prompt and destroy radix

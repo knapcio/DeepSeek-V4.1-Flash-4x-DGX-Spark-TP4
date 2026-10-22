@@ -4,7 +4,8 @@
 # branch pins (sglang-kernel 0.4.7, sgl-deep-gemm 0.2.0; aarch64 wheels from PyPI), plus
 # the credited SGLang #41303 safety and #42901 layer-20 bounded-replay backports.
 # The credited backport set also includes SGLang #44001's opt-in scheduler gate
-# and #41259/#45410's fail-closed parallel tokenizer for long native prompts.
+# #41259/#45410's fail-closed parallel tokenizer for long native prompts, and
+# #45457's request-text/control-token separation.
 # The tree comes from a GitHub tarball (runtime/sglang-canary/python) because the image's
 # git cannot fetch unauthenticated. Mia's SM120 page-split override is re-applied on top of
 # the branch's kernel file. Everything else is the production Dockerfile.
@@ -41,8 +42,11 @@ RUN python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py /sgl-workspace/sgla
 RUN python3 /opt/dsv41/scripts/verify_sglang_prefill_interval_min_bs.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_parallel_prompt_encode.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_inline_system.py /sgl-workspace/sglang/python
+RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_plain_text.py /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
+COPY runtime/sglang-canary/upstream-tests/test_plain_text_encode.py /opt/dsv41/upstream-tests/test_plain_text_encode.py
 RUN PYTHONPATH=/sgl-workspace/sglang/python python3 -m pytest -q /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
+RUN PYTHONPATH=/sgl-workspace/sglang/python python3 -m pytest -q /opt/dsv41/upstream-tests/test_plain_text_encode.py
 COPY tests /opt/dsv41/tests
 COPY benchmarks /opt/dsv41/benchmarks
 RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinking.py \
@@ -52,6 +56,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && python3 /opt/dsv41/tests/test_sglang_prefill_interval_min_bs_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_parallel_prompt_encode_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_inline_system_patch.py \
+ && python3 /opt/dsv41/tests/test_sglang_dsv41_plain_text_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \

@@ -14,6 +14,9 @@ PATCH_INLINE_SYSTEM="$ROOT/patches/sglang-43549-dsv41-inline-system.patch"
 PARALLEL_ENCODE_REF="fba3ad4b1f4563143f3352beb148c4c28d4be9ed"
 PARALLEL_ENCODE_SHA256="722cc41b1096977af3bda6c505e7c629b9b8f7308174cda1c7d2c44f9b54c097"
 PARALLEL_ENCODE_TEST_SHA256="fa1adf5c9b51fdf25cb7998e963a7de905c58cb5aa35395cf16d6c75422ecf9e"
+PLAIN_TEXT_REF="a0206772e54778229648af1187949b1eb0619234"
+PLAIN_TEXT_SHA256="8e675e59b756678309bc2076c3c71b3525cb02030acdec94e83c0e20d285aa62"
+PLAIN_TEXT_TEST_SHA256="5702531ee250205f8c1aff916f05c89090cfdec220bf06d467efe1ba8b344020"
 mkdir -p "$DST"
 cd "$DST"
 rm -rf python upstream-tests src.tgz
@@ -54,6 +57,19 @@ echo "applying SGLang #43549 dsv41 inline-system prefix-cache fix ..."
 patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_INLINE_SYSTEM"
 patch --silent --fuzz=0 -p1 < "$PATCH_INLINE_SYSTEM"
 python3 "$ROOT/scripts/verify_sglang_dsv41_inline_system.py" "$DST/python"
+echo "installing exact SGLang #45457 plain-text helper and pinned-tree integration ..."
+PLAIN_TEXT_PATH="$DST/python/sglang/srt/entrypoints/openai/plain_text_encode.py"
+curl -fsSL -m 120 \
+  "https://raw.githubusercontent.com/sgl-project/sglang/${PLAIN_TEXT_REF}/python/sglang/srt/entrypoints/openai/plain_text_encode.py" \
+  -o "$PLAIN_TEXT_PATH"
+printf '%s  %s\n' "$PLAIN_TEXT_SHA256" "$PLAIN_TEXT_PATH" | shasum -a 256 -c -
+PLAIN_TEXT_TEST="$DST/upstream-tests/test_plain_text_encode.py"
+curl -fsSL -m 120 \
+  "https://raw.githubusercontent.com/sgl-project/sglang/${PLAIN_TEXT_REF}/test/registered/unit/entrypoints/openai/test_plain_text_encode.py" \
+  -o "$PLAIN_TEXT_TEST"
+printf '%s  %s\n' "$PLAIN_TEXT_TEST_SHA256" "$PLAIN_TEXT_TEST" | shasum -a 256 -c -
+python3 "$ROOT/runtime/patch_dsv41_plain_text_encode.py" "$DST/python"
+python3 "$ROOT/scripts/verify_sglang_dsv41_plain_text.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
@@ -61,6 +77,7 @@ printf '%s\n' \
   "44001 9569a3656155a34dc763826b1608f247d3f66832" \
   "41259 fba3ad4b1f4563143f3352beb148c4c28d4be9ed helper-sha256=$PARALLEL_ENCODE_SHA256 test-sha256=$PARALLEL_ENCODE_TEST_SHA256" \
   "45410 aeeb943fe71626a7cea183b716b8bb236a285f2e" \
-  "43549 9e0ce2f3fab3b2a456ac97aea04bc880ae2fe7b1" > PATCHES
+  "43549 9e0ce2f3fab3b2a456ac97aea04bc880ae2fe7b1" \
+  "45457 $PLAIN_TEXT_REF helper-sha256=$PLAIN_TEXT_SHA256 test-sha256=$PLAIN_TEXT_TEST_SHA256" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

@@ -34,6 +34,17 @@ both images run that suite. Upstream measured 1.92 s to 0.21 s on a 947K-token
 V4.1 agent prompt; no GB10 end-to-end result is claimed here. Roll back with
 `SGLANG_PARALLEL_PROMPT_ENCODE=0` in `EXTRA_CONTAINER_ENV` on every rank.
 
+The same staged tree adapts [SGLang #45457](https://github.com/sgl-project/sglang/pull/45457):
+V4.1 control-token spellings arriving in user content, tool results, tool-call
+arguments or tool schemas are encoded as ordinary text, so request data cannot
+close a turn and forge a new user/assistant boundary. Template-written control
+tokens and grounding tokens in assistant output retain their IDs. The helper
+and its upstream CPU suite are fetched from exact commit `a0206772e547` and
+SHA-256-verified during staging; both canary images rerun the suite. Prompts
+without such spellings remain on the parallel path above. Emergency rollback:
+`SGLANG_ENABLE_DSV41_PLAIN_TEXT_ENCODE=false` in `EXTRA_CONTAINER_ENV` on every
+rank. This is a correctness/security backport, not a decode-TPS claim.
+
 `./start-tp4.sh build` compiles `BUILD_DOCKERFILE` (default `Dockerfile`, and it has to stay inside the repository so the rsync that stages the workers sees it) and tags the result `$IMAGE`; `BUILD_ARGS` carries anything else the recipe needs, e.g. `--build-arg PIP_INDEX=https://<mirror>/simple` on a network without pypi.org.
 
 ## RoCEnante for the tensor-parallel all-reduces
