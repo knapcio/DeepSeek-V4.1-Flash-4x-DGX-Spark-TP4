@@ -16,6 +16,7 @@ PATCH_DSPARK_RESTAGE="$ROOT/patches/sglang-45450-dspark-param-restage.patch"
 PATCH_DSV41_INDEXER_INPLACE="$ROOT/patches/sglang-45745-dsv41-indexer-inplace.patch"
 PATCH_DSV41_BLOCKED_DEQUANT="$ROOT/patches/sglang-45793-dsv41-blocked-kv-dequant.patch"
 PATCH_DSV41_ALIGN_WIDTH="$ROOT/patches/sglang-45794-dsv41-align-indexer-width.patch"
+PATCH_DSV41_DEFAULT_THINKING="$ROOT/patches/sglang-45762-dsv41-default-thinking-parser.patch"
 PARALLEL_ENCODE_REF="fba3ad4b1f4563143f3352beb148c4c28d4be9ed"
 PARALLEL_ENCODE_SHA256="722cc41b1096977af3bda6c505e7c629b9b8f7308174cda1c7d2c44f9b54c097"
 PARALLEL_ENCODE_TEST_SHA256="fa1adf5c9b51fdf25cb7998e963a7de905c58cb5aa35395cf16d6c75422ecf9e"
@@ -34,6 +35,8 @@ DSV41_BLOCKED_DEQUANT_REF="0de6dd957f4da0b0655ef6d41bfd4b0593a08d12"
 DSV41_BLOCKED_DEQUANT_PATCH_SHA256="a47f2968fe87d98832910907deea20a2c1334ac18d4bfda11a68ee7ae2513638"
 DSV41_ALIGN_WIDTH_REF="b7344253b3136384c522aded59015f79c9bb7a08"
 DSV41_ALIGN_WIDTH_PATCH_SHA256="457ad92a20e7ddec054ca9775881213fdfbb26b3f20c24d0ea1e4e980ec4e6a0"
+DSV41_DEFAULT_THINKING_REF="f2aad50c4163d047d740fd61defea2d122ac5d30"
+DSV41_DEFAULT_THINKING_PATCH_SHA256="97d324a27255233defa8ee343a0df2b2c63785e919ce69b60696289277e5df66"
 mkdir -p "$DST"
 cd "$DST"
 rm -rf python upstream-tests src.tgz
@@ -130,6 +133,12 @@ patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_DSV41_ALIGN_WIDTH"
 patch --silent --fuzz=0 -p1 < "$PATCH_DSV41_ALIGN_WIDTH"
 python3 "$ROOT/scripts/verify_sglang_dsv41_align_indexer_width.py" "$DST/python"
 python3 "$ROOT/scripts/test_sglang_dsv41_align_indexer_width.py"
+echo "applying SGLang #45762 default-thinking parser parity ..."
+printf '%s  %s\n' "$DSV41_DEFAULT_THINKING_PATCH_SHA256" "$PATCH_DSV41_DEFAULT_THINKING" | shasum -a 256 -c -
+patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_DSV41_DEFAULT_THINKING"
+patch --silent --fuzz=0 -p1 < "$PATCH_DSV41_DEFAULT_THINKING"
+python3 "$ROOT/scripts/verify_sglang_dsv41_default_thinking.py" "$DST/python"
+python3 "$ROOT/scripts/test_sglang_dsv41_default_thinking.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
@@ -144,6 +153,7 @@ printf '%s\n' \
   "45450 $DSPARK_PARAM_RESTAGE_REF patch-sha256=$DSPARK_PARAM_RESTAGE_PATCH_SHA256" \
   "45745 $DSV41_INDEXER_INPLACE_REF patch-sha256=$DSV41_INDEXER_INPLACE_PATCH_SHA256" \
   "45793 $DSV41_BLOCKED_DEQUANT_REF patch-sha256=$DSV41_BLOCKED_DEQUANT_PATCH_SHA256" \
-  "45794 $DSV41_ALIGN_WIDTH_REF patch-sha256=$DSV41_ALIGN_WIDTH_PATCH_SHA256" > PATCHES
+  "45794 $DSV41_ALIGN_WIDTH_REF patch-sha256=$DSV41_ALIGN_WIDTH_PATCH_SHA256" \
+  "45762 $DSV41_DEFAULT_THINKING_REF patch-sha256=$DSV41_DEFAULT_THINKING_PATCH_SHA256" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458/#45663/#45450/#45745/#45793/#45794 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458/#45663/#45450/#45745/#45793/#45794/#45762 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

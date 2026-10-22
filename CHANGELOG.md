@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Adapt hantenglong's SGLang #45762 so DeepSeek V4/V4.1 response parsing
+  follows `SGLANG_DEFAULT_THINKING` when a request omits the `thinking`
+  kwarg. This matches the native encoder, keeps an explicit `thinking: false`
+  authoritative, and prevents a default-on reasoning block from leaking into
+  ordinary `content`. Other `enable_thinking` model families remain opt-in.
 - Adapt the width-alignment commit from BJ Wang's SGLang #45794 to the pinned
   Torch V4.1 prefill indexer. CUDA BF16 score widths of at least 1,024 rows are
   padded once per request to a multiple of 64, the chunk budget uses that real

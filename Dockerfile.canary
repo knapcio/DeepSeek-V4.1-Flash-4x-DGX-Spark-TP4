@@ -3,7 +3,7 @@
 # dsv4.1 branch at the commit staged by scripts/fetch-sglang-canary.sh (f80c91a4b,
 # 2026-09-16), plus the credited SGLang #41303 safety, #42901 layer-20,
 # #44001 scheduler, #41259/#45410 long-prompt tokenizer and #45457 request-text
-# control-token backports, and
+# control-token backports, #45762 default-thinking parser parity, and
 # the kernel packages that branch pins (sglang-kernel 0.4.7,
 # sgl-deep-gemm 0.2.0; aarch64 wheels from PyPI). The SM120 page-split fix from
 # runtime/flash_mla_sm120.py is re-applied on top of the branch's kernel file
@@ -48,6 +48,8 @@ RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_blocked_kv_dequant.py /sgl-wo
 RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_blocked_kv_dequant.py
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_align_indexer_width.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_align_indexer_width.py
+RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_default_thinking.py /sgl-workspace/sglang/python
+RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_default_thinking.py /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_plain_text_encode.py /opt/dsv41/upstream-tests/test_plain_text_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_reasoning_parser.py /opt/dsv41/upstream-tests/test_reasoning_parser.py
@@ -71,6 +73,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && python3 /opt/dsv41/tests/test_sglang_dsv41_indexer_inplace_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_blocked_kv_dequant_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_align_indexer_width_patch.py \
+ && python3 /opt/dsv41/tests/test_sglang_dsv41_default_thinking_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \

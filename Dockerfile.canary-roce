@@ -5,7 +5,8 @@
 # the credited SGLang #41303 safety and #42901 layer-20 bounded-replay backports.
 # The credited backport set also includes SGLang #44001's opt-in scheduler gate
 # #41259/#45410's fail-closed parallel tokenizer for long native prompts, and
-# #45457's request-text/control-token separation.
+# #45457's request-text/control-token separation and #45762's default-thinking
+# parser parity.
 # The tree comes from a GitHub tarball (runtime/sglang-canary/python) because the image's
 # git cannot fetch unauthenticated. Mia's SM120 page-split override is re-applied on top of
 # the branch's kernel file. Everything else is the production Dockerfile.
@@ -53,6 +54,8 @@ RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_blocked_kv_dequant.py /sgl-wo
 RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_blocked_kv_dequant.py
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_align_indexer_width.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_align_indexer_width.py
+RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_default_thinking.py /sgl-workspace/sglang/python
+RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_default_thinking.py /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_plain_text_encode.py /opt/dsv41/upstream-tests/test_plain_text_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_reasoning_parser.py /opt/dsv41/upstream-tests/test_reasoning_parser.py
@@ -76,6 +79,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && python3 /opt/dsv41/tests/test_sglang_dsv41_indexer_inplace_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_blocked_kv_dequant_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_align_indexer_width_patch.py \
+ && python3 /opt/dsv41/tests/test_sglang_dsv41_default_thinking_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \

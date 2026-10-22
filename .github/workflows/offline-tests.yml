@@ -42,6 +42,7 @@ jobs:
             tests/test_sglang_dsv41_indexer_inplace_patch.py \
             tests/test_sglang_dsv41_blocked_kv_dequant_patch.py \
             tests/test_sglang_dsv41_align_indexer_width_patch.py \
+            tests/test_sglang_dsv41_default_thinking_patch.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_remote_dotenv.py \
             tests/test_upstream_launcher_ports.py
@@ -70,6 +71,8 @@ jobs:
             scripts/test_sglang_dsv41_blocked_kv_dequant.py \
             scripts/verify_sglang_dsv41_align_indexer_width.py \
             scripts/test_sglang_dsv41_align_indexer_width.py \
+            scripts/verify_sglang_dsv41_default_thinking.py \
+            scripts/test_sglang_dsv41_default_thinking.py \
             tests/test_sps_engram_guard.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_v41_tool_constraint.py
