@@ -1,0 +1,17 @@
+diff --git a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+--- a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
++++ b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+@@ -400,11 +400,12 @@ def softmax_temp_flashinfer(
+     assert bs * rows_per_request == num_rows, (
+         f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+     )
+     temp_per_row = torch.repeat_interleave(
+         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
+     ).contiguous()
+     logits_2d = logits.to(torch.float32).contiguous()
+-    return _flashinfer_softmax(logits=logits_2d, temperature=temp_per_row)
++    probs = _flashinfer_softmax(logits=logits_2d, temperature=temp_per_row)
++    return probs.clamp_(max=1.0)
+ 
+ 
+ class MixedAcceptSelectResult(msgspec.Struct):

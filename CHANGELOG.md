@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Backport liweizheng's SGLang #45518: clamp FlashInfer's fresh DSpark
+  softmax output in place to the valid `1.0` probability ceiling. FlashInfer
+  can overshoot by roughly 7e-6 on near-one-hot rows; the accept kernel treats
+  such values as invalid and rejects the draft. The zero-fuzz patch preserves
+  the existing allocation path and has source, production-function and image
+  packaging checks. Upstream measured acceptance recovery from 1.75 to 6.08
+  at temperature 0.3; no local GB10 performance claim is made yet.
 - Adapt hantenglong's SGLang #45762 so DeepSeek V4/V4.1 response parsing
   follows `SGLANG_DEFAULT_THINKING` when a request omits the `thinking`
   kwarg. This matches the native encoder, keeps an explicit `thinking: false`
