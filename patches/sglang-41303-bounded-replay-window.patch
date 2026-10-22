@@ -1,0 +1,189 @@
+From ed8c3139f1f643544b68102cf8c44504e5e55e3d Mon Sep 17 00:00:00 2001
+From: Vineel Bhat <vineel.bhat@modal.com>
+Date: Thu, 15 Oct 2026 20:32:50 -0400
+Subject: [PATCH] Backport SGLang #41303 to the pinned dsv4.1 tree
+
+Keep a full SWA window for short decoder bounded-replay extends and hold one
+window back from ordinary radix-cache matches. Adapted to pinned SGLang commit
+f80c91a4b97e52e17fbcff088aa6b47b6270f6b9, whose request matching still lives
+in schedule_policy.py and schedule_batch.py.
+
+Upstream: https://github.com/sgl-project/sglang/pull/41303
+Upstream commit: ed8c3139f1f643544b68102cf8c44504e5e55e3d
+Original authors: Vineel Bhat; Claude Fable 5.1; hnyls2002
+Recipe adaptation: knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4
+---
+ .../attention/dsv4_attn_metadata_kernels.py   | 7 ++++---
+ .../sglang/srt/managers/schedule_batch.py     | 4 ++--
+ .../sglang/srt/managers/schedule_policy.py    | 2 +-
+ .../sglang/srt/mem_cache/base_prefix_cache.py | 2 +-
+ .../sglang/srt/mem_cache/cache_init_params.py | 1 +
+ .../sglang/srt/mem_cache/kv_cache_builder.py  | 1 +
+ .../sglang/srt/mem_cache/swa_radix_cache.py   | 2 +-
+ .../sglang/srt/mem_cache/unified_radix_cache.py | 5 ++++-
+ .../sglang/srt/session/streaming_session.py   | 7 +++++++
+ 9 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/attention/dsv4_attn_metadata_kernels.py b/python/sglang/kernels/ops/attention/dsv4_attn_metadata_kernels.py
+index b1cba2a1d5..2342b7e5aa 100644
+--- a/python/sglang/kernels/ops/attention/dsv4_attn_metadata_kernels.py
++++ b/python/sglang/kernels/ops/attention/dsv4_attn_metadata_kernels.py
+@@ -444,11 +444,12 @@ def late_layer_tail_layout(
+     """Rows of a prefill extend that the late layers run over under decoder SWA
+     bounded replay: the last min(tail_len, extend_len) tokens of each request.
+     Returns (token indices into the extend, per-request tail lengths, and one
+-    absolute window floor per tail row: the tail's first position)."""
++    absolute window floor per tail row). The floor is seq_len - tail_len, so a
++    tail shorter than tail_len reads rows the request wrote before this extend."""
+     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+     if len(extend_lens_cpu) == 1:
+         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
+-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
++        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
+         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
+     # One H2D copy for the three length vectors; launch count does not grow with bs.
+     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
+@@ -462,7 +463,7 @@ def late_layer_tail_layout(
+         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
+     )
+     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
+-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
++    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
+     return token_indices, tail_lens_cpu, floor
+ 
+ 
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index babd9850d2..d1a9652d61 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1546,7 +1546,7 @@ class Req(ReqDllmMixin):
+         # match by the trailing sliding window so it gets re-prefilled, rewriting
+         # this request's SWA ring. No-op for other layouts.
+         if tree_cache is not None:
+-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
++            reprefill_tail = tree_cache.swa_reprefill_tail_tokens(self)
+             if reprefill_tail:
+                 capped = max(0, input_len - reprefill_tail)
+                 key_limit = capped if key_limit is None else min(key_limit, capped)
+@@ -1564,7 +1564,7 @@ class Req(ReqDllmMixin):
+             # and never cached in the radix tree, so a reused prefix carries stale
+             # SWA. Cap the match by the trailing sliding window so it is re-prefilled
+             # into this request's ring. No-op for other layouts (returns 0).
+-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
++            reprefill_tail = tree_cache.swa_reprefill_tail_tokens(self)
+             if reprefill_tail:
+                 capped = max(0, input_len - reprefill_tail)
+                 key_limit = capped if key_limit is None else min(key_limit, capped)
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index 8b4bf64485..2661cae889 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -168,7 +168,7 @@ def match_prefix_for_req(
+     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
+     # the match by the trailing sliding window so it gets re-prefilled, rewriting
+     # this request's SWA ring. No-op for other layouts.
+-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
++    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
+     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+ 
+     match_result = tree_cache.match_prefix(
+diff --git a/python/sglang/srt/mem_cache/base_prefix_cache.py b/python/sglang/srt/mem_cache/base_prefix_cache.py
+index 661bdf5c9b..1f7641f218 100644
+--- a/python/sglang/srt/mem_cache/base_prefix_cache.py
++++ b/python/sglang/srt/mem_cache/base_prefix_cache.py
+@@ -563,7 +563,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
+         # nothing deeper than the tail to protect.
+         return None
+ 
+-    def swa_reprefill_tail_tokens(self) -> int:
++    def swa_reprefill_tail_tokens(self, req=None) -> int:
+         # Only the unified_kv compress-only HiCache layout needs to hold back a
+         # trailing sliding window for re-prefill; every other cache keeps SWA
+         # content-stable and overrides this where relevant.
+diff --git a/python/sglang/srt/mem_cache/cache_init_params.py b/python/sglang/srt/mem_cache/cache_init_params.py
+index 75c54a0748..3a001ce28a 100644
+--- a/python/sglang/srt/mem_cache/cache_init_params.py
++++ b/python/sglang/srt/mem_cache/cache_init_params.py
+@@ -48,6 +48,7 @@ class CacheInitParams:
+     chunked_prefill_size: Optional[int] = None
+ 
+     sliding_window_size: Optional[int] = None
++    decoder_swa_bounded_replay: bool = False
+ 
+     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
+     cache_ttl_seconds: Optional[float] = None
+diff --git a/python/sglang/srt/mem_cache/kv_cache_builder.py b/python/sglang/srt/mem_cache/kv_cache_builder.py
+index d13240aba2..dff6db78f9 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_builder.py
++++ b/python/sglang/srt/mem_cache/kv_cache_builder.py
+@@ -331,6 +331,7 @@ def build_kv_cache(
+         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
++        decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
+         pp_rank=ps.pp_rank,
+         pp_size=ps.pp_size,
+         attn_cp_rank=ps.attn_cp_rank,
+diff --git a/python/sglang/srt/mem_cache/swa_radix_cache.py b/python/sglang/srt/mem_cache/swa_radix_cache.py
+index dbc6d8b91a..f473d313b6 100644
+--- a/python/sglang/srt/mem_cache/swa_radix_cache.py
++++ b/python/sglang/srt/mem_cache/swa_radix_cache.py
+@@ -373,7 +373,7 @@ class SWARadixCache(BasePrefixCache):
+         )
+         return True
+ 
+-    def swa_reprefill_tail_tokens(self) -> int:
++    def swa_reprefill_tail_tokens(self, req=None) -> int:
+         """Tokens at the tail of a matched prefix that must NOT be reused.
+ 
+         The DeepSeek-V4 unified_kv layout keeps SWA in a per-request ring
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index e2d4b5e8b5..859d0ca001 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -201,6 +201,7 @@ class UnifiedRadixCache(BasePrefixCache):
+         self._sliding_window_size = (
+             params.sliding_window_size if self.is_swa_enabled else None
+         )
++        self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
+         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
+         # evictable leaves) and drives the components' tree-level hooks.
+         self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+@@ -3383,7 +3384,7 @@ class UnifiedRadixCache(BasePrefixCache):
+     def sliding_window_size(self):
+         return self._sliding_window_size
+ 
+-    def swa_reprefill_tail_tokens(self) -> int:
++    def swa_reprefill_tail_tokens(self, req=None) -> int:
+         """
+         Only unified_kv needs this: SWA lives in a per-request ring
+         (state_slot/pos), not content-stable and never stored in the tree, so a
+@@ -3402,6 +3403,8 @@ class UnifiedRadixCache(BasePrefixCache):
+         swa = self.components.get(ComponentType.SWA)
+         if swa is None or not swa.sliding_window_size:
+             return 0
++        if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
++            return swa.sliding_window_size
+         if not is_unified_kv_triton():
+             return 0
+         if self.tree_core.has_swa_host_pool:
+diff --git a/python/sglang/srt/session/streaming_session.py b/python/sglang/srt/session/streaming_session.py
+index 96ec95f764..1a7df90cff 100644
+--- a/python/sglang/srt/session/streaming_session.py
++++ b/python/sglang/srt/session/streaming_session.py
+@@ -103,6 +103,13 @@ class StreamingSession(BasePrefixCache):
+         self.inner = inner
+         self.slots: Dict[str, SessionSlot] = {}
+ 
++    def will_lend_record(self, req: Optional[Req]) -> bool:
++        """Whether req has a slot record to borrow without mutating session state."""
++        if not _is_streaming(req) or req.to_finish is not None:
++            return False
++        slot = self.slots.get(req.session.session_id)
++        return slot is not None and slot.kv.holds_kv
++
+     # -- Forward PrefixCacheTrait properties to inner cache --
+ 
+     @property
+-- 
+2.51.0

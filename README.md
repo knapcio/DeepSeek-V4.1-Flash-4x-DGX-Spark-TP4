@@ -2,6 +2,16 @@
 
 <p align="center">A measured TP4 serving profile for <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a> (native weights, SGLang, DSpark) on four NVIDIA DGX Spark (GB10) nodes, built on top of the MiaAI-Lab recipe.</p>
 
+> [!WARNING]
+> **Issue #16 safety status (2026-10-22):** the v2.4 profile below is quarantined after
+> repeated Xid 13/43 crashes on a second fleet, including two crashes with
+> `DSV41_PREFILL_BYPASS` disabled. Use the v2.1-compatible safe profile from
+> [`.env.tp4.example`](.env.tp4.example) while the candidate fix is soaked. New canary builds
+> include a credited, fail-closed backport of [SGLang #41303](https://github.com/sgl-project/sglang/pull/41303),
+> which fixes the matching SWA bounded-replay/prefix-cache correctness path, but it is not yet
+> evidence that the reported CUDA fault is fully resolved. See
+> [`docs/issue-16-swa-crash.md`](docs/issue-16-swa-crash.md).
+
 ## Credits
 
 This repository is a downstream profile of **[MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks)** by Mia (MiaAI-Lab). The launcher (`start.sh`, `start-tp4.sh`, `boot.py`), the Engram NVMe row store, the MXFP8 b12x routing, the memory model in `docs/chunked-prefill-memory.md`, the thinking alias, the output cap, the loop abort and the overall deployment design are her work, kept here with full git history and under the same licence. The original README is preserved as [`docs/README-upstream.md`](docs/README-upstream.md); read it first for the fleet setup (NFS share, Engram packing, fabric, 3-node profile).
@@ -10,6 +20,7 @@ Other work this profile builds on:
 
 - **kpham-sgl**, [sgl-project/sglang#39187](https://github.com/sgl-project/sglang/pull/39187): the bounded dense-indexer prefill transient, backported here as `adapter/indexer_chunked*.py`.
 - **BBuf** and the SGLang `dsv4.1` branch contributors ([#39370](https://github.com/sgl-project/sglang/pull/39370), [#39646](https://github.com/sgl-project/sglang/pull/39646), [#39648](https://github.com/sgl-project/sglang/pull/39648), [#39653](https://github.com/sgl-project/sglang/pull/39653)): the decode kernel work in the optional `Dockerfile.canary` image.
+- **Vineel Bhat, Claude Fable 5.1 and hnyls2002**, [SGLang #41303](https://github.com/sgl-project/sglang/pull/41303): keeping a full SWA window for short decoder bounded-replay extends and holding the window back from ordinary prefix-cache matches; backported to the pinned tree in `patches/sglang-41303-bounded-replay-window.patch`.
 - **hushengkai**, for independently reproducing the EP2 / Engram cache / shared-expert padding changes on a second 4x GB10 fleet.
 - **rhys101**, [DeepSeek-V4.1-Flash-vLLM-DGX-Spark-8](https://github.com/rhys101/DeepSeek-V4.1-Flash-vLLM-DGX-Spark-8): the SG17 SGLang overlay that routes small tensor-parallel all-reduces to RoCEnante (reused with a TP4 adaptation in `Dockerfile.canary-roce`) and the SG18 native prefill TP split (`adapter/spark_prefill_dense.py`, combined with the indexer backport in `adapter/indexer_chunked_v3.py`).
 - **local-inference-lab / Luke Alonso and Jason (original-el8)**, [b12x](https://github.com/local-inference-lab/b12x): RoCEnante, the one-shot RDMA all-reduce (`runtime/b12x`, Apache-2.0, frozen at the SG17 revision), and the fused MoE kernels that run the routed experts (`runtime/b12x_next`: b12x main at `a7d7d29b`, renamed so both revisions live in one image, with a two-line patch that admits 64-row tiles for 576-wide experts at prefill sizes).
@@ -27,9 +38,9 @@ Other work this profile builds on:
 - **motzudao** ([Mia #31](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/31)): the report that a custom `EXTRA_SGLANG_ARGS` dropped the required FP8 GEMM backend.
 - **MiaAI-Lab/sparkDash**, the benchmark used for every number below.
 
-## Current results
+## Historical v2.4 results (quarantined)
 
-Production stack v2.4 (the last `EXTRA_CONTAINER_ENV` line of [`.env.tp4.example`](.env.tp4.example) with the v2.4 production block below it, `EP_SIZE=1`, `Dockerfile.canary-roce` image), built from a clean tree on all four nodes, sparkDash 1.8.8: 256 new tokens, temperature 0, thinking off, idle fleet, 2026-10-12. KV pool 3.67M tokens, 1M context. Raw output: [`docs/results/validation-20261012-v24.txt`](docs/results/validation-20261012-v24.txt). Measurements from other fleets are linked, with their dates, in [`docs/community-results.md`](docs/community-results.md).
+These measurements remain useful as historical performance data, but the profile is not the current safety recommendation. Stack v2.4 (the quarantined `EXTRA_CONTAINER_ENV` line of [`.env.tp4.example`](.env.tp4.example) with its settings block, `EP_SIZE=1`, `Dockerfile.canary-roce` image), built from a clean tree on all four nodes, sparkDash 1.8.8: 256 new tokens, temperature 0, thinking off, idle fleet, 2026-10-12. KV pool 3.67M tokens, 1M context. Raw output: [`docs/results/validation-20261012-v24.txt`](docs/results/validation-20261012-v24.txt). Measurements from other fleets are linked, with their dates, in [`docs/community-results.md`](docs/community-results.md).
 
 ### sparkDash, GPU clock capped at 2200 MHz
 
@@ -77,7 +88,7 @@ What v2.4 changed against v2.3 is in [CHANGELOG.md](CHANGELOG.md).
 
 Every earlier measurement, the per-stage tables and the experiments that were tried and not adopted are in [docs/history.md](docs/history.md); what changed when is in [CHANGELOG.md](CHANGELOG.md).
 
-## What runs in production
+## What the quarantined v2.4 profile ran
 
 | Layer | Setting | What it does |
 |---|---|---|
@@ -151,9 +162,10 @@ Same launcher as upstream; read [`docs/README-upstream.md`](docs/README-upstream
 
 ```bash
 cp .env.tp4.example .env.tp4          # fill in HEAD_IP / WORKER_* / MODEL_DIR / fabric
-# production: uncomment IMAGE=dsv41-4x-spark:canary-roce, the last EXTRA_CONTAINER_ENV line and the v2.4 block below it,
+# recommended while issue #16 is open: uncomment IMAGE=dsv41-4x-spark:canary-roce and the
+# v2.1-compatible safe EXTRA_CONTAINER_ENV line; leave the quarantined v2.4 block commented,
 # set BUILD_DOCKERFILE=Dockerfile.canary-roce and EP_SIZE=1 (the file default EP_SIZE=2 is for the
-# base/canary images; the production line was measured at EP_SIZE=1)
+# base/canary images)
 ./start-tp4.sh download               # 476 GiB at the pinned revision, needs the hf CLI; skips when complete
 scripts/fetch-sglang-canary.sh        # stages the pinned dsv4.1 branch tree
 ./start-tp4.sh doctor

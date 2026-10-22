@@ -1,7 +1,8 @@
 # CANARY 2026-09-16: same base image, but the SGLang python tree replaced by the upstream
 # dsv4.1 branch at f80c91a4b (2026-09-16 19:45 UTC; carries #39370 mHC/metadata fusion,
 # #39653 communication kernels, #39648 top-k, #39646 kernels) with the kernel packages the
-# branch pins (sglang-kernel 0.4.7, sgl-deep-gemm 0.2.0; aarch64 wheels from PyPI).
+# branch pins (sglang-kernel 0.4.7, sgl-deep-gemm 0.2.0; aarch64 wheels from PyPI), plus
+# the credited SGLang #41303 bounded-replay safety backport.
 # The tree comes from a GitHub tarball (runtime/sglang-canary/python) because the image's
 # git cannot fetch unauthenticated. Mia's SM120 page-split override is re-applied on top of
 # the branch's kernel file. Everything else is the production Dockerfile.
@@ -33,9 +34,11 @@ COPY runtime/patch_encoding_dsv41.py /opt/dsv41/runtime/patch_encoding_dsv41.py
 RUN python3 /opt/dsv41/runtime/patch_encoding_dsv41.py
 COPY boot.py /opt/dsv41/boot.py
 COPY scripts /opt/dsv41/scripts
+RUN python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py /sgl-workspace/sglang/python
 COPY tests /opt/dsv41/tests
 COPY benchmarks /opt/dsv41/benchmarks
 RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinking.py \
+ && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_bounded_replay_backport.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \

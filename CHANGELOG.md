@@ -3,6 +3,18 @@
 Newest first. Each entry says what changed in the production stack and what was measured; the
 raw results live under `docs/results/`.
 
+## 2026-10-22 issue #16 safety candidate
+
+- Quarantined the v2.4 launch profile after a second fleet reported repeated CUDA Xid 13/43 faults under large
+  prefix-cache hits. Four reports now include two with `DSV41_PREFILL_BYPASS` disabled, so bypass is not treated as
+  the root cause. The v2.1 feature set is the documented fallback while the candidate is soaked.
+- Backported [SGLang #41303](https://github.com/sgl-project/sglang/pull/41303) to the pinned `f80c91a4b` tree. The
+  patch keeps the full SWA window for short decoder bounded-replay extends and holds one window back from ordinary
+  radix-cache matches. It is credited in the patch and README, applies with zero fuzz, and is source-verified both
+  after staging and during image build.
+- This is a candidate mitigation, not a closed incident: no GPU or fleet test was run in this change. The controlled
+  soak/bisect and acceptance criteria are in [`docs/issue-16-swa-crash.md`](docs/issue-16-swa-crash.md).
+
 ## 2026-10-12 v2.4
 
 Long context and multi-user behaviour; decode unchanged (same-session A/B within noise). Release gate on the final
