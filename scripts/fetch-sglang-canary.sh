@@ -10,6 +10,7 @@ PATCH_SAFETY="$ROOT/patches/sglang-41303-bounded-replay-window.patch"
 PATCH_LAYER20="$ROOT/patches/sglang-42901-layer20-tail.patch"
 PATCH_INTERVAL="$ROOT/patches/sglang-44001-prefill-interval-min-bs.patch"
 PATCH_PARALLEL_ENCODE="$ROOT/patches/sglang-41259-45410-parallel-native-encode.patch"
+PATCH_INLINE_SYSTEM="$ROOT/patches/sglang-43549-dsv41-inline-system.patch"
 PARALLEL_ENCODE_REF="fba3ad4b1f4563143f3352beb148c4c28d4be9ed"
 PARALLEL_ENCODE_SHA256="722cc41b1096977af3bda6c505e7c629b9b8f7308174cda1c7d2c44f9b54c097"
 PARALLEL_ENCODE_TEST_SHA256="fa1adf5c9b51fdf25cb7998e963a7de905c58cb5aa35395cf16d6c75422ecf9e"
@@ -49,12 +50,17 @@ printf '%s  %s\n' "$PARALLEL_ENCODE_TEST_SHA256" "$PARALLEL_ENCODE_TEST" | shasu
 patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_PARALLEL_ENCODE"
 patch --silent --fuzz=0 -p1 < "$PATCH_PARALLEL_ENCODE"
 python3 "$ROOT/scripts/verify_sglang_parallel_prompt_encode.py" "$DST/python"
+echo "applying SGLang #43549 dsv41 inline-system prefix-cache fix ..."
+patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_INLINE_SYSTEM"
+patch --silent --fuzz=0 -p1 < "$PATCH_INLINE_SYSTEM"
+python3 "$ROOT/scripts/verify_sglang_dsv41_inline_system.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
   "42901 05ce0e980f00aa80864190d6f1cd5d9b685802f1" \
   "44001 9569a3656155a34dc763826b1608f247d3f66832" \
   "41259 fba3ad4b1f4563143f3352beb148c4c28d4be9ed helper-sha256=$PARALLEL_ENCODE_SHA256 test-sha256=$PARALLEL_ENCODE_TEST_SHA256" \
-  "45410 aeeb943fe71626a7cea183b716b8bb236a285f2e" > PATCHES
+  "45410 aeeb943fe71626a7cea183b716b8bb236a285f2e" \
+  "43549 9e0ce2f3fab3b2a456ac97aea04bc880ae2fe7b1" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

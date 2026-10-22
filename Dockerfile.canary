@@ -35,6 +35,7 @@ RUN python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py /sgl-workspace/sg
 RUN python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_prefill_interval_min_bs.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_parallel_prompt_encode.py /sgl-workspace/sglang/python
+RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_inline_system.py /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
 RUN PYTHONPATH=/sgl-workspace/sglang/python python3 -m pytest -q /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
 COPY tests /opt/dsv41/tests
@@ -45,6 +46,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && python3 /opt/dsv41/tests/test_sglang_layer20_tail_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_prefill_interval_min_bs_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_parallel_prompt_encode_patch.py \
+ && python3 /opt/dsv41/tests/test_sglang_dsv41_inline_system_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Backport SGLang #43549 (nankingjing) onto the pinned Anthropic frontend:
+  native `dsv41` conversations retain mid-conversation system messages in
+  place, so a new turn does not rewrite the leading prompt and destroy radix
+  prefix-cache reuse. Other encoding specs retain the old Jinja-probe policy.
 - Backport SGLang #41259's exact, content-verified parallel prompt encoder and
   #45410's native DeepSeek V4/V4.1/V3.2 call sites. Long agent-shaped prompts
   can use the tokenizers/Rayon pool instead of blocking one HTTP thread in a

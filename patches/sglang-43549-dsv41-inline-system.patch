@@ -1,0 +1,14 @@
+--- a/python/sglang/srt/entrypoints/anthropic/serving.py
++++ b/python/sglang/srt/entrypoints/anthropic/serving.py
+@@ -190,8 +190,9 @@ class AnthropicServing:
+ 
+     def __init__(self, openai_serving_chat: OpenAIServingChat):
+         self.openai_serving_chat = openai_serving_chat
+-        self._merge_inline_system = not detect_inline_system_support(
+-            self._chat_template()
++        self._merge_inline_system = (
++            getattr(openai_serving_chat, "chat_encoding_spec", None) != "dsv41"
++            and not detect_inline_system_support(self._chat_template())
+         )
+ 
+     def _chat_template(self) -> Optional[str]:

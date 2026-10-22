@@ -33,6 +33,7 @@ jobs:
             tests/test_sglang_layer20_tail_patch.py \
             tests/test_sglang_prefill_interval_min_bs_patch.py \
             tests/test_sglang_parallel_prompt_encode_patch.py \
+            tests/test_sglang_dsv41_inline_system_patch.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_remote_dotenv.py \
             tests/test_upstream_launcher_ports.py
@@ -45,6 +46,7 @@ jobs:
             scripts/verify_sglang_layer20_tail.py \
             scripts/verify_sglang_prefill_interval_min_bs.py \
             scripts/verify_sglang_parallel_prompt_encode.py \
+            scripts/verify_sglang_dsv41_inline_system.py \
             tests/test_sps_engram_guard.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_v41_tool_constraint.py
