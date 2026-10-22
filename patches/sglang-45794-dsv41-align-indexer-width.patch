@@ -1,0 +1,42 @@
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -298,7 +298,7 @@ def expand_index_page_table(
+     return expanded.reshape(bs, n * blocks_per_page).to(torch.int32)
+ 
+ 
+-# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
++# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; scores() works in place.
+ _TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
+ 
+ 
+@@ -3687,18 +3687,27 @@ class DeepseekV4AttentionBackend:
+             # Dequantize only this request's visible K rows; the full table is
+             # pool-sized.
+             index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
++            # Keep the BF16 GEMM width aligned. Padded positions are sliced
++            # before masking or selection and can never enter the result.
++            if index_k.is_cuda and index_k.dtype == torch.bfloat16 and lc >= 1024:
++                score_width = (lc + 63) // 64 * 64
++                if score_width != lc:
++                    index_k = torch.nn.functional.pad(
++                        index_k, (0, 0, 0, score_width - lc)
++                    )
+             k = min(topk, lc)
+             # Every step below is per query row; chunk rows so the [rows, heads, lc]
+             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
+             rows_per_chunk = max(
+                 1,
+-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
++                _TORCH_INDEXER_SCORE_BUDGET_BYTES
++                // (q.shape[1] * index_k.shape[0] * 2),
+             )
+             masks = [] if publish is not None else None
+             for start in range(0, tok.numel(), rows_per_chunk):
+                 rows = slice(start, start + rows_per_chunk)
+                 tok_c, lens_c = tok[rows], lens[rows]
+-                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
++                s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
+                 s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+                 if masks is not None:
+                     masks.append(

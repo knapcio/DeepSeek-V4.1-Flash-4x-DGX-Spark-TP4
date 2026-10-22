@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Adapt the width-alignment commit from BJ Wang's SGLang #45794 to the pinned
+  Torch V4.1 prefill indexer. CUDA BF16 score widths of at least 1,024 rows are
+  padded once per request to a multiple of 64, the chunk budget uses that real
+  width, and scores are sliced back to the logical context before any mask or
+  top-k selection. Upstream H200 gains motivate a GB10 canary only; local GPU
+  parity and end-to-end timing remain required.
 - Adapt Shuwen Wang's SGLang #45793 for the pinned V4.1 KV layout: sparse
   prefill now dequantizes eight cache tokens per Triton program instead of
   launching one program per token. FP8 and FP4 share a masked page/address

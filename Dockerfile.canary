@@ -46,6 +46,8 @@ RUN python3 /opt/dsv41/scripts/test_sglang_dspark_param_restage.py /sgl-workspac
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_indexer_inplace.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_blocked_kv_dequant.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_blocked_kv_dequant.py
+RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_align_indexer_width.py /sgl-workspace/sglang/python
+RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_align_indexer_width.py
 COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_plain_text_encode.py /opt/dsv41/upstream-tests/test_plain_text_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_reasoning_parser.py /opt/dsv41/upstream-tests/test_reasoning_parser.py
@@ -68,6 +70,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && python3 /opt/dsv41/tests/test_sglang_dspark_param_restage_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_indexer_inplace_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_blocked_kv_dequant_patch.py \
+ && python3 /opt/dsv41/tests/test_sglang_dsv41_align_indexer_width_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \
