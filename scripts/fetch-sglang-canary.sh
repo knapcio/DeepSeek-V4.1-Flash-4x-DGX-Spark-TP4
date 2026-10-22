@@ -19,6 +19,8 @@ PLAIN_TEXT_SHA256="8e675e59b756678309bc2076c3c71b3525cb02030acdec94e83c0e20d285a
 PLAIN_TEXT_TEST_SHA256="5702531ee250205f8c1aff916f05c89090cfdec220bf06d467efe1ba8b344020"
 REASONING_END_REF="2592a6d211b56f503707760b158a635510baaf9b"
 REASONING_END_TEST_SHA256="e1d3bb204617a08abea100c3b5be6de49d8c68483d29de90298c12f10ea204c9"
+DSPARK_DRAFT_PARAMS_REF="833e51899fb160b20645a868bf000a98fd3181a4"
+DSPARK_DRAFT_PARAMS_SHA256="993dc3d686f4673b774278110fdbf44a8b1d190af1841c597f9fd7e50d12fbce"
 mkdir -p "$DST"
 cd "$DST"
 rm -rf python upstream-tests src.tgz
@@ -80,6 +82,14 @@ curl -fsSL -m 120 \
 printf '%s  %s\n' "$REASONING_END_TEST_SHA256" "$REASONING_END_TEST" | shasum -a 256 -c -
 python3 "$ROOT/runtime/patch_dsv41_reasoning_end_token.py" "$DST/python"
 python3 "$ROOT/scripts/verify_sglang_dsv41_reasoning_end.py" "$DST/python"
+echo "installing exact SGLang #45663 fused draft-parameter kernel and pinned-tree integration ..."
+DSPARK_DRAFT_PARAMS_PATH="$DST/python/sglang/kernels/ops/speculative/dspark/draft_params.py"
+curl -fsSL -m 120 \
+  "https://raw.githubusercontent.com/sgl-project/sglang/${DSPARK_DRAFT_PARAMS_REF}/python/sglang/kernels/ops/speculative/dspark/draft_params.py" \
+  -o "$DSPARK_DRAFT_PARAMS_PATH"
+printf '%s  %s\n' "$DSPARK_DRAFT_PARAMS_SHA256" "$DSPARK_DRAFT_PARAMS_PATH" | shasum -a 256 -c -
+python3 "$ROOT/runtime/patch_dspark_draft_params.py" "$DST/python"
+python3 "$ROOT/scripts/verify_sglang_dspark_draft_params.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
@@ -89,6 +99,7 @@ printf '%s\n' \
   "45410 aeeb943fe71626a7cea183b716b8bb236a285f2e" \
   "43549 9e0ce2f3fab3b2a456ac97aea04bc880ae2fe7b1" \
   "45457 $PLAIN_TEXT_REF helper-sha256=$PLAIN_TEXT_SHA256 test-sha256=$PLAIN_TEXT_TEST_SHA256" \
-  "45458 $REASONING_END_REF test-sha256=$REASONING_END_TEST_SHA256" > PATCHES
+  "45458 $REASONING_END_REF test-sha256=$REASONING_END_TEST_SHA256" \
+  "45663 $DSPARK_DRAFT_PARAMS_REF helper-sha256=$DSPARK_DRAFT_PARAMS_SHA256" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458/#45663 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

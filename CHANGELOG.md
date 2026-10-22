@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Adapt the portable part of SGLang #45663 (Kevin Mi / kevin-mii and Claude
+  Opus 5.5): DSpark sampling parameters now use the exact upstream fused
+  Triton helper instead of separate temperature-clamp and greedy-mask GPU
+  launches. The older sampler supplies the helper's otherwise-unused
+  step-temperature output from a static scratch buffer. The helper is
+  SHA-256-pinned and the integration fails closed on source drift; expected
+  GB10 TPS impact remains unmeasured.
 - Adapt SGLang #45458 (Chen Cheng / ischencheng): DeepSeek V4/V4.1
   reasoning now ends only on the tokenizer's single `</think>` token when
   output IDs are available. Literal `</think>` text spelled with ordinary

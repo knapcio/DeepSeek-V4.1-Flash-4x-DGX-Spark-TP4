@@ -44,6 +44,7 @@ RUN python3 /opt/dsv41/scripts/verify_sglang_parallel_prompt_encode.py /sgl-work
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_inline_system.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_plain_text.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_reasoning_end.py /sgl-workspace/sglang/python
+RUN python3 /opt/dsv41/scripts/verify_sglang_dspark_draft_params.py /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_plain_text_encode.py /opt/dsv41/upstream-tests/test_plain_text_encode.py
 COPY runtime/sglang-canary/upstream-tests/test_reasoning_parser.py /opt/dsv41/upstream-tests/test_reasoning_parser.py
@@ -61,6 +62,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && python3 /opt/dsv41/tests/test_sglang_dsv41_inline_system_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_plain_text_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_dsv41_reasoning_end_patch.py \
+ && python3 /opt/dsv41/tests/test_sglang_dspark_draft_params_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \
