@@ -11,6 +11,7 @@ PATCH_LAYER20="$ROOT/patches/sglang-42901-layer20-tail.patch"
 PATCH_INTERVAL="$ROOT/patches/sglang-44001-prefill-interval-min-bs.patch"
 PATCH_PARALLEL_ENCODE="$ROOT/patches/sglang-41259-45410-parallel-native-encode.patch"
 PATCH_INLINE_SYSTEM="$ROOT/patches/sglang-43549-dsv41-inline-system.patch"
+PATCH_DSPARK_ACCEPT="$ROOT/patches/sglang-45663-dspark-accept-outputs.patch"
 PARALLEL_ENCODE_REF="fba3ad4b1f4563143f3352beb148c4c28d4be9ed"
 PARALLEL_ENCODE_SHA256="722cc41b1096977af3bda6c505e7c629b9b8f7308174cda1c7d2c44f9b54c097"
 PARALLEL_ENCODE_TEST_SHA256="fa1adf5c9b51fdf25cb7998e963a7de905c58cb5aa35395cf16d6c75422ecf9e"
@@ -90,6 +91,10 @@ curl -fsSL -m 120 \
 printf '%s  %s\n' "$DSPARK_DRAFT_PARAMS_SHA256" "$DSPARK_DRAFT_PARAMS_PATH" | shasum -a 256 -c -
 python3 "$ROOT/runtime/patch_dspark_draft_params.py" "$DST/python"
 python3 "$ROOT/scripts/verify_sglang_dspark_draft_params.py" "$DST/python"
+echo "applying SGLang #45663 DSpark accept-output fusion ..."
+patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_DSPARK_ACCEPT"
+patch --silent --fuzz=0 -p1 < "$PATCH_DSPARK_ACCEPT"
+python3 "$ROOT/scripts/verify_sglang_dspark_accept_outputs.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
@@ -100,6 +105,6 @@ printf '%s\n' \
   "43549 9e0ce2f3fab3b2a456ac97aea04bc880ae2fe7b1" \
   "45457 $PLAIN_TEXT_REF helper-sha256=$PLAIN_TEXT_SHA256 test-sha256=$PLAIN_TEXT_TEST_SHA256" \
   "45458 $REASONING_END_REF test-sha256=$REASONING_END_TEST_SHA256" \
-  "45663 $DSPARK_DRAFT_PARAMS_REF helper-sha256=$DSPARK_DRAFT_PARAMS_SHA256" > PATCHES
+  "45663 $DSPARK_DRAFT_PARAMS_REF helper-sha256=$DSPARK_DRAFT_PARAMS_SHA256 accept-patch-sha256=b44e8522f386acf02050254307ad71a8f1584af3b5943207faa7c0f0c6ee5fe9" > PATCHES
 du -sh python
 echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458/#45663 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

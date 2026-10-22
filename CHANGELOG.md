@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Continue the bounded SGLang #45663 port: DSpark's folded accept path now
+  writes `correct_len`, bonus, finalized lengths and output tokens directly
+  into its graph-static buffers. This removes six post-kernel `copy_` launches
+  without changing eager behavior. The two kernel hunks are upstream-exact,
+  the older epilogue adaptation applies with zero fuzz, and source checks fail
+  closed if a copy path returns. GB10 correctness/timing remain a separate
+  promotion gate.
 - Adapt the portable part of SGLang #45663 (Kevin Mi / kevin-mii and Claude
   Opus 5.5): DSpark sampling parameters now use the exact upstream fused
   Triton helper instead of separate temperature-clamp and greedy-mask GPU
