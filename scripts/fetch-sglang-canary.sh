@@ -12,6 +12,7 @@ PATCH_INTERVAL="$ROOT/patches/sglang-44001-prefill-interval-min-bs.patch"
 PATCH_PARALLEL_ENCODE="$ROOT/patches/sglang-41259-45410-parallel-native-encode.patch"
 PATCH_INLINE_SYSTEM="$ROOT/patches/sglang-43549-dsv41-inline-system.patch"
 PATCH_DSPARK_ACCEPT="$ROOT/patches/sglang-45663-dspark-accept-outputs.patch"
+PATCH_DSPARK_RESTAGE="$ROOT/patches/sglang-45450-dspark-param-restage.patch"
 PARALLEL_ENCODE_REF="fba3ad4b1f4563143f3352beb148c4c28d4be9ed"
 PARALLEL_ENCODE_SHA256="722cc41b1096977af3bda6c505e7c629b9b8f7308174cda1c7d2c44f9b54c097"
 PARALLEL_ENCODE_TEST_SHA256="fa1adf5c9b51fdf25cb7998e963a7de905c58cb5aa35395cf16d6c75422ecf9e"
@@ -22,6 +23,8 @@ REASONING_END_REF="2592a6d211b56f503707760b158a635510baaf9b"
 REASONING_END_TEST_SHA256="e1d3bb204617a08abea100c3b5be6de49d8c68483d29de90298c12f10ea204c9"
 DSPARK_DRAFT_PARAMS_REF="833e51899fb160b20645a868bf000a98fd3181a4"
 DSPARK_DRAFT_PARAMS_SHA256="993dc3d686f4673b774278110fdbf44a8b1d190af1841c597f9fd7e50d12fbce"
+DSPARK_PARAM_RESTAGE_REF="20189751de186f394abe850b1ad48087df32eb77"
+DSPARK_PARAM_RESTAGE_PATCH_SHA256="30a3d02028d1db1974456bda9383cdebf7bbaa0c6e1b9e3cc010d3b0d2b9acd9"
 mkdir -p "$DST"
 cd "$DST"
 rm -rf python upstream-tests src.tgz
@@ -95,6 +98,12 @@ echo "applying SGLang #45663 DSpark accept-output fusion ..."
 patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_DSPARK_ACCEPT"
 patch --silent --fuzz=0 -p1 < "$PATCH_DSPARK_ACCEPT"
 python3 "$ROOT/scripts/verify_sglang_dspark_accept_outputs.py" "$DST/python"
+echo "applying SGLang #45450 sampling-parameter restage skip ..."
+printf '%s  %s\n' "$DSPARK_PARAM_RESTAGE_PATCH_SHA256" "$PATCH_DSPARK_RESTAGE" | shasum -a 256 -c -
+patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_DSPARK_RESTAGE"
+patch --silent --fuzz=0 -p1 < "$PATCH_DSPARK_RESTAGE"
+python3 "$ROOT/scripts/verify_sglang_dspark_param_restage.py" "$DST/python"
+python3 "$ROOT/scripts/test_sglang_dspark_param_restage.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
@@ -105,6 +114,7 @@ printf '%s\n' \
   "43549 9e0ce2f3fab3b2a456ac97aea04bc880ae2fe7b1" \
   "45457 $PLAIN_TEXT_REF helper-sha256=$PLAIN_TEXT_SHA256 test-sha256=$PLAIN_TEXT_TEST_SHA256" \
   "45458 $REASONING_END_REF test-sha256=$REASONING_END_TEST_SHA256" \
-  "45663 $DSPARK_DRAFT_PARAMS_REF helper-sha256=$DSPARK_DRAFT_PARAMS_SHA256 accept-patch-sha256=b44e8522f386acf02050254307ad71a8f1584af3b5943207faa7c0f0c6ee5fe9" > PATCHES
+  "45663 $DSPARK_DRAFT_PARAMS_REF helper-sha256=$DSPARK_DRAFT_PARAMS_SHA256 accept-patch-sha256=b44e8522f386acf02050254307ad71a8f1584af3b5943207faa7c0f0c6ee5fe9" \
+  "45450 $DSPARK_PARAM_RESTAGE_REF patch-sha256=$DSPARK_PARAM_RESTAGE_PATCH_SHA256" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458/#45663 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458/#45663/#45450 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

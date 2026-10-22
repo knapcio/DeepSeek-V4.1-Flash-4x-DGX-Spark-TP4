@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Backport Yangmin Li's first SGLang #45450 commit (`20189751`): the draft
+  graph now restages temperature/top-k buffers only when its sampler, batch
+  size or source tensor identities change. `SamplingBatchInfo` rebinds those
+  tensors on filter/merge and does not mutate them in place, so steady decode
+  skips the #45663 staging kernel without stale values. A focused harness
+  extracts and executes the staged production method without importing the
+  accelerator stack.
 - Continue the bounded SGLang #45663 port: DSpark's folded accept path now
   writes `correct_len`, bonus, finalized lengths and output tokens directly
   into its graph-static buffers. This removes six post-kernel `copy_` launches
