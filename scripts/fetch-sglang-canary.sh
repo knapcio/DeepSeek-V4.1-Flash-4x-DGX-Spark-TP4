@@ -17,6 +17,8 @@ PARALLEL_ENCODE_TEST_SHA256="fa1adf5c9b51fdf25cb7998e963a7de905c58cb5aa35395cf16
 PLAIN_TEXT_REF="a0206772e54778229648af1187949b1eb0619234"
 PLAIN_TEXT_SHA256="8e675e59b756678309bc2076c3c71b3525cb02030acdec94e83c0e20d285aa62"
 PLAIN_TEXT_TEST_SHA256="5702531ee250205f8c1aff916f05c89090cfdec220bf06d467efe1ba8b344020"
+REASONING_END_REF="2592a6d211b56f503707760b158a635510baaf9b"
+REASONING_END_TEST_SHA256="e1d3bb204617a08abea100c3b5be6de49d8c68483d29de90298c12f10ea204c9"
 mkdir -p "$DST"
 cd "$DST"
 rm -rf python upstream-tests src.tgz
@@ -70,6 +72,14 @@ curl -fsSL -m 120 \
 printf '%s  %s\n' "$PLAIN_TEXT_TEST_SHA256" "$PLAIN_TEXT_TEST" | shasum -a 256 -c -
 python3 "$ROOT/runtime/patch_dsv41_plain_text_encode.py" "$DST/python"
 python3 "$ROOT/scripts/verify_sglang_dsv41_plain_text.py" "$DST/python"
+echo "applying SGLang #45458 token-id-aware reasoning-end integration ..."
+REASONING_END_TEST="$DST/upstream-tests/test_reasoning_parser.py"
+curl -fsSL -m 120 \
+  "https://raw.githubusercontent.com/sgl-project/sglang/${REASONING_END_REF}/test/registered/unit/parser/test_reasoning_parser.py" \
+  -o "$REASONING_END_TEST"
+printf '%s  %s\n' "$REASONING_END_TEST_SHA256" "$REASONING_END_TEST" | shasum -a 256 -c -
+python3 "$ROOT/runtime/patch_dsv41_reasoning_end_token.py" "$DST/python"
+python3 "$ROOT/scripts/verify_sglang_dsv41_reasoning_end.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
@@ -78,6 +88,7 @@ printf '%s\n' \
   "41259 fba3ad4b1f4563143f3352beb148c4c28d4be9ed helper-sha256=$PARALLEL_ENCODE_SHA256 test-sha256=$PARALLEL_ENCODE_TEST_SHA256" \
   "45410 aeeb943fe71626a7cea183b716b8bb236a285f2e" \
   "43549 9e0ce2f3fab3b2a456ac97aea04bc880ae2fe7b1" \
-  "45457 $PLAIN_TEXT_REF helper-sha256=$PLAIN_TEXT_SHA256 test-sha256=$PLAIN_TEXT_TEST_SHA256" > PATCHES
+  "45457 $PLAIN_TEXT_REF helper-sha256=$PLAIN_TEXT_SHA256 test-sha256=$PLAIN_TEXT_TEST_SHA256" \
+  "45458 $REASONING_END_REF test-sha256=$REASONING_END_TEST_SHA256" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#45457/#45458 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

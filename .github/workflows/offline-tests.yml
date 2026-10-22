@@ -35,6 +35,7 @@ jobs:
             tests/test_sglang_parallel_prompt_encode_patch.py \
             tests/test_sglang_dsv41_inline_system_patch.py \
             tests/test_sglang_dsv41_plain_text_patch.py \
+            tests/test_sglang_dsv41_reasoning_end_patch.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_remote_dotenv.py \
             tests/test_upstream_launcher_ports.py
@@ -50,6 +51,9 @@ jobs:
             scripts/verify_sglang_dsv41_inline_system.py \
             scripts/verify_sglang_dsv41_plain_text.py \
             runtime/patch_dsv41_plain_text_encode.py \
+            scripts/verify_sglang_dsv41_reasoning_end.py \
+            scripts/run_sglang_45458_upstream_test.py \
+            runtime/patch_dsv41_reasoning_end_token.py \
             tests/test_sps_engram_guard.py \
             tests/test_b12x_memory_requirements.py \
             tests/test_v41_tool_constraint.py

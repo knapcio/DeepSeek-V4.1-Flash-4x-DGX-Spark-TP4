@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Adapt SGLang #45458 (Chen Cheng / ischencheng): DeepSeek V4/V4.1
+  reasoning now ends only on the tokenizer's single `</think>` token when
+  output IDs are available. Literal `</think>` text spelled with ordinary
+  tokens stays inside reasoning; Chat and Responses cover incremental,
+  cumulative and non-streaming output, with text-only fallback preserved.
 - Adapt SGLang #45457 (Chen Cheng / ischencheng) onto the pinned V4.1 tree.
   Added-token spellings supplied in user/tool data now encode as plain text,
   while template-written turn, reasoning and DSML tokens keep their control

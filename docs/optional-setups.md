@@ -45,6 +45,15 @@ without such spellings remain on the parallel path above. Emergency rollback:
 `SGLANG_ENABLE_DSV41_PLAIN_TEXT_ENCODE=false` in `EXTRA_CONTAINER_ENV` on every
 rank. This is a correctness/security backport, not a decode-TPS claim.
 
+SGLang [#45458](https://github.com/sgl-project/sglang/pull/45458) is adapted
+beside it for output parsing. With generated token IDs available, only the
+tokenizer's actual `</think>` token closes DeepSeek V4/V4.1 reasoning; the same
+visible text spelled from ordinary tokens remains reasoning content. Both Chat
+and Responses pass IDs for streaming and non-streaming output, while missing
+IDs or a tokenizer without a single-token terminator retain the prior
+text-based fallback. The exact upstream parser suite is content-pinned and run
+in both canary image builds. This is also a correctness fix, not a TPS claim.
+
 `./start-tp4.sh build` compiles `BUILD_DOCKERFILE` (default `Dockerfile`, and it has to stay inside the repository so the rsync that stages the workers sees it) and tags the result `$IMAGE`; `BUILD_ARGS` carries anything else the recipe needs, e.g. `--build-arg PIP_INDEX=https://<mirror>/simple` on a network without pypi.org.
 
 ## RoCEnante for the tensor-parallel all-reduces
