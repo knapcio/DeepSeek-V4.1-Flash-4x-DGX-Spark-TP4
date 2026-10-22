@@ -1,0 +1,12 @@
+diff --git a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+--- a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
++++ b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+@@ -283,5 +283,6 @@ class DeepseekV41Indexer(nn.Module):
+         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads;
+         bf16 up to the reduction, as the reference does."""
+         s = torch.einsum("bhd,nd->bhn", q, k)
+-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
+-        return s.float()
++        # In place: the [t, H, n] product is the largest prefill transient.
++        s.relu_().mul_(weights.unsqueeze(-1))
++        return s.sum(dim=1).float()

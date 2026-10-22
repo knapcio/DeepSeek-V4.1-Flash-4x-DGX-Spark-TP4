@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Backport 05yuki and Claude Opus 5.5's SGLang #45745: the SM12x-compatible
+  Torch V4.1 prefill indexer now applies ReLU and head weights in place on the
+  fresh einsum result before the unchanged head reduction. This preserves the
+  arithmetic order while removing two score-sized temporary tensors (about
+  2 GiB at the upstream 1-GiB score-chunk cap). The pinned adaptation has a
+  zero-fuzz patch and a fail-closed AST verifier.
 - Backport Yangmin Li's first SGLang #45450 commit (`20189751`): the draft
   graph now restages temperature/top-k buffers only when its sampler, batch
   size or source tensor identities change. `SamplingBatchInfo` rebinds those
