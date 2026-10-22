@@ -1,0 +1,88 @@
+From 9569a3656155a34dc763826b1608f247d3f66832 Mon Sep 17 00:00:00 2001
+From: Shangming Cai <csmthu@gmail.com>
+Date: Thu, 22 Oct 2026 06:30:13 +0000
+Subject: [PATCH] scheduler: gate prefill/decode interval on running batch size
+
+Backport the runtime portion of sgl-project/sglang#44001 to pinned SGLang
+f80c91a4b97e52e17fbcff088aa6b47b6270f6b9.  The new option defaults to
+zero, which preserves the existing scheduler.  When explicitly set, a small
+running batch admits queued prefills immediately and the configured decode
+interval starts protecting ITL only at the selected batch size.
+
+Original author: Shangming Cai.  Upstream merge commit:
+9569a3656155a34dc763826b1608f247d3f66832.
+---
+ .../sglang/srt/arg_groups/fields/schedule.py       |  4 ++++
+ python/sglang/srt/arg_groups/validation_hook.py    |  2 ++
+ python/sglang/srt/managers/scheduler.py            | 11 +++++++++--
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/arg_groups/fields/schedule.py b/python/sglang/srt/arg_groups/fields/schedule.py
+index 6b1017f..e2810d1 100644
+--- a/python/sglang/srt/arg_groups/fields/schedule.py
++++ b/python/sglang/srt/arg_groups/fields/schedule.py
+@@ -68,6 +68,10 @@ class Schedule(msgspec.Struct):
+             resolvable=True,
+         ),
+     ] = None
++    prefill_decode_interval_min_bs: A[
++        int,
++        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. Set to 0 to always apply the interval.",
++    ] = 0
+     enable_dynamic_chunking: A[
+         bool,
+         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+diff --git a/python/sglang/srt/arg_groups/validation_hook.py b/python/sglang/srt/arg_groups/validation_hook.py
+index a9b5a85..d170b32 100644
+--- a/python/sglang/srt/arg_groups/validation_hook.py
++++ b/python/sglang/srt/arg_groups/validation_hook.py
+@@ -447,6 +447,8 @@ def validate_prefill_decode_interval(server_args: Any):
+     cfg = resolving_view(server_args)
+     if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
+         raise ValueError("--prefill-decode-interval must be non-negative.")
++    if cfg.prefill_decode_interval_min_bs < 0:
++        raise ValueError("--prefill-decode-interval-min-bs must be non-negative.")
+ 
+ 
+ def default_unset_prefill_decode_interval(server_args: Any):
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d4c743b..b509d1f 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1295,6 +1295,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
+         self.chunked_prefill_size = get_schedule().chunked_prefill_size
+         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
+         self._prefill_decode_interval_remaining = 0
++        self.prefill_decode_interval_min_bs = get_schedule().prefill_decode_interval_min_bs
+         uses_transformers_backend = (
+             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
+         )
+@@ -1340,10 +1341,16 @@ class Scheduler(SchedulerOutputProcessorMixin):
+         if sizer.profile_and_fit():
+             self.dynamic_chunk_sizer = sizer
+ 
+-    def _should_defer_prefill(self) -> bool:
++    def _should_defer_prefill(self, running_batch: ScheduleBatch) -> bool:
+         if self._prefill_decode_interval_remaining == 0:
+             return False
+ 
++        # Admit queued prefills eagerly while the live batch is still small.
++        # Once the threshold is reached, the existing interval protects ITL.
++        if running_batch.batch_size() < self.prefill_decode_interval_min_bs:
++            self._prefill_decode_interval_remaining = 0
++            return False
++
+         self._prefill_decode_interval_remaining -= 1
+         return True
+ 
+@@ -3676,7 +3683,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
+ 
+         if self.dllm_config is not None:
+             new_batch = self.get_new_batch_dllm(running_batch)
+-        elif self._should_defer_prefill():
++        elif self._should_defer_prefill(running_batch):
+             new_batch = None
+         else:
+             prefill_plan = self.get_new_batch_prefill(running_batch)
+-- 
+2.51.0

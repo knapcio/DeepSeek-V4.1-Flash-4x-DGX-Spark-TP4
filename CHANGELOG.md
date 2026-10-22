@@ -5,6 +5,12 @@ raw results live under `docs/results/`.
 
 ## 2026-10-22 issue #16 resolution
 
+- Backported the runtime part of [SGLang #44001](https://github.com/sgl-project/sglang/pull/44001)
+  (Shangming Cai): `--prefill-decode-interval-min-bs N` admits queued prefills without the configured
+  decode-only delay while fewer than `N` requests are running, then restores the interval at/above `N`.
+  Its default is zero, so rebuilt images preserve the existing scheduler. The patch applies with zero fuzz,
+  has source-order and behavior regressions in both canary builds and CI, and remains opt-in pending a GB10
+  multi-user TTFT/prefill-throughput A/B.
 - Added a credited, zero-fuzz adaptation of [SGLang #42901](https://github.com/sgl-project/sglang/pull/42901)
   for the pinned pre-`HcState` engine. Under decoder bounded replay it writes layer 20's compressed KV for all
   prompt rows, then limits that layer's otherwise discarded indexer/attention/MoE work to the final 128 rows.

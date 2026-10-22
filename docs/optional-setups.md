@@ -20,6 +20,8 @@ docker build -f Dockerfile.canary -t dsv41-4x-spark:canary .   # on the head and
 
 `SGLANG_DSPARK_FOLDED_SAMPLING=2` matters: the branch folds only the greedy draft proposal into the CUDA graph by default, and sampled requests (temperature > 0, i.e. normal chat) would take the eager path. With it forced, sampled decode runs ~5 % slower than greedy on this image (it was equal on the base image); without it, ~9 % slower.
 
+The staged tree also carries the zero-default runtime backport of [SGLang #44001](https://github.com/sgl-project/sglang/pull/44001). An experimental multi-user profile can add `--prefill-decode-interval-min-bs 4` beside `--prefill-decode-interval 2`: queued prefills are admitted immediately while the running batch has fewer than four requests, and the two-round decode interval resumes from four onward. Leaving the new flag unset is byte-for-byte scheduler policy compatibility; no GB10 performance claim is made until the focused A/B is run.
+
 `./start-tp4.sh build` compiles `BUILD_DOCKERFILE` (default `Dockerfile`, and it has to stay inside the repository so the rsync that stages the workers sees it) and tags the result `$IMAGE`; `BUILD_ARGS` carries anything else the recipe needs, e.g. `--build-arg PIP_INDEX=https://<mirror>/simple` on a network without pypi.org.
 
 ## RoCEnante for the tensor-parallel all-reduces

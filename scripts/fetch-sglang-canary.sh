@@ -8,6 +8,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DST="$ROOT/runtime/sglang-canary"
 PATCH_SAFETY="$ROOT/patches/sglang-41303-bounded-replay-window.patch"
 PATCH_LAYER20="$ROOT/patches/sglang-42901-layer20-tail.patch"
+PATCH_INTERVAL="$ROOT/patches/sglang-44001-prefill-interval-min-bs.patch"
 mkdir -p "$DST"
 cd "$DST"
 rm -rf python src.tgz
@@ -25,9 +26,14 @@ echo "applying SGLang #42901 layer-20 bounded-replay backport ..."
 patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_LAYER20"
 patch --silent --fuzz=0 -p1 < "$PATCH_LAYER20"
 python3 "$ROOT/scripts/verify_sglang_layer20_tail.py" "$DST/python"
+echo "applying SGLang #44001 prefill-interval batch-size gate ..."
+patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_INTERVAL"
+patch --silent --fuzz=0 -p1 < "$PATCH_INTERVAL"
+python3 "$ROOT/scripts/verify_sglang_prefill_interval_min_bs.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
-  "42901 05ce0e980f00aa80864190d6f1cd5d9b685802f1" > PATCHES
+  "42901 05ce0e980f00aa80864190d6f1cd5d9b685802f1" \
+  "44001 9569a3656155a34dc763826b1608f247d3f66832" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."

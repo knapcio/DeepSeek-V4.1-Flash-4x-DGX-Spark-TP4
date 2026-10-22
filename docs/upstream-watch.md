@@ -11,6 +11,15 @@ sgl-project/sglang, DeepGEMM, b12x, HuggingFace and the other public Spark recip
   Upstream reports 5-10% lower cold-prompt TTFT at 16K-200K on GB300 with no short-prompt change.
   `patches/sglang-42901-layer20-tail.patch` adapts the change to the pinned pre-`HcState` code and is
   zero-fuzz/source-order verified. It has not yet received a GB10 boot, speed or model-quality gate.
+- [SGLang #44001](https://github.com/sgl-project/sglang/pull/44001) is a small scheduler-only addition:
+  the prefill/decode interval can be delayed until the running batch reaches a chosen size. Its runtime
+  change is backported with a zero default and offline behavior tests; `min-bs=4` is a candidate for a
+  focused multi-user A/B, not a production default and not a C1 decode-throughput claim.
+- The 2026-10-22 SM12x review found that #45745's in-place torch-indexer scoring does not touch this
+  recipe: our #39187/SG18 path calls the fused FP4 scorer and already bounds its output. #45264 explicitly
+  excludes SM121 because it was measured only on SM120, while #45391 and #43008 duplicate the b12x MXFP8
+  routing and exact FP8 `wo_a` copy already shipped here. They stay on the watch list instead of being
+  stacked blindly.
 - SGLang #45234/#45247/#45275 remove host synchronizations from encoder-SWA replay. The production
   command enables decoder replay, not encoder replay, so they do not affect the served path and were not
   copied merely to increase patch count.

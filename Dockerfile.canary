@@ -1,8 +1,8 @@
 # Upstream dsv4.1 branch image (optional, measured in docs/window-20260916.md).
 # Same base image as Dockerfile, but the SGLang python tree is replaced by the upstream
 # dsv4.1 branch at the commit staged by scripts/fetch-sglang-canary.sh (f80c91a4b,
-# 2026-09-16), plus the credited SGLang #41303 safety and #42901 layer-20
-# bounded-replay backports and
+# 2026-09-16), plus the credited SGLang #41303 safety, #42901 layer-20
+# bounded-replay and #44001 opt-in scheduler backports and
 # the kernel packages that branch pins (sglang-kernel 0.4.7,
 # sgl-deep-gemm 0.2.0; aarch64 wheels from PyPI). The SM120 page-split fix from
 # runtime/flash_mla_sm120.py is re-applied on top of the branch's kernel file
@@ -33,12 +33,14 @@ COPY boot.py /opt/dsv41/boot.py
 COPY scripts /opt/dsv41/scripts
 RUN python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py /sgl-workspace/sglang/python
+RUN python3 /opt/dsv41/scripts/verify_sglang_prefill_interval_min_bs.py /sgl-workspace/sglang/python
 COPY tests /opt/dsv41/tests
 COPY benchmarks /opt/dsv41/benchmarks
 RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinking.py \
  && CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 python3 -B /opt/dsv41/tests/test_v41_tool_constraint.py \
  && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_bounded_replay_backport.py \
  && python3 /opt/dsv41/tests/test_sglang_layer20_tail_patch.py \
+ && python3 /opt/dsv41/tests/test_sglang_prefill_interval_min_bs_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \

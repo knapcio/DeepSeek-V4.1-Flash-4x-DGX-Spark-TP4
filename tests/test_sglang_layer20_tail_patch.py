@@ -24,8 +24,8 @@ class Layer20BackportPackagingTests(unittest.TestCase):
         fetch = (ROOT / "scripts" / "fetch-sglang-canary.sh").read_text()
         self.assertIn("sglang-42901-layer20-tail.patch", fetch)
         self.assertIn("verify_sglang_layer20_tail.py", fetch)
-        self.assertEqual(fetch.count("patch --dry-run --silent --fuzz=0 -p1"), 2)
-        self.assertEqual(fetch.count("patch --silent --fuzz=0 -p1"), 2)
+        self.assertGreaterEqual(fetch.count("patch --dry-run --silent --fuzz=0 -p1"), 2)
+        self.assertGreaterEqual(fetch.count("patch --silent --fuzz=0 -p1"), 2)
         self.assertIn("42901 05ce0e980f00aa80864190d6f1cd5d9b685802f1", fetch)
 
     def test_both_canary_images_verify_the_staged_source(self):
