@@ -18,6 +18,10 @@ Third-party components and their licences:
 - runtime/flash_mla_sm120.py is derived from SGLang and remains under the Apache
   License 2.0 (LICENSE.sglang); the page-split changes are distributed under the
   same terms.
+- runtime/sglang/deepseekv41_detector.py is sgl-project/sglang
+  python/sglang/srt/function_call/deepseekv41_detector.py at commit 464fffbec8d0
+  (SGLang #39665), unmodified, Apache License 2.0 (LICENSE.sglang). The default
+  image installs it through runtime/patch_v41_tool_constraint.py.
 - runtime/b12x/b12x/comm/roce_ring is the path-aware RoCEnante package of
   FujitsuPolycom/sparkring (commit f16b5f4), itself derived from local-inference-lab/b12x
   (RoCEnante, PR 295); Apache License 2.0 (runtime/b12x/LICENSE). Origin and local

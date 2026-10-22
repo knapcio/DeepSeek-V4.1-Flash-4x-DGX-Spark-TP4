@@ -10,11 +10,17 @@ COPY runtime/flash_mla_sm120.py /sgl-workspace/sglang/python/sglang/kernels/ops/
 # Fail the build if either pinned textual-placeholder anchor has drifted.
 COPY runtime/patch_encoding_dsv41.py /opt/dsv41/runtime/patch_encoding_dsv41.py
 RUN python3 /opt/dsv41/runtime/patch_encoding_dsv41.py
+# The stock detector compiles the wrong grammar for required/named tool choice.
+# Install SGLang #39665's V4.1 structural tag, refusing unknown base sources.
+COPY runtime/patch_v41_tool_constraint.py /opt/dsv41/runtime/patch_v41_tool_constraint.py
+COPY runtime/sglang/deepseekv41_detector.py /opt/dsv41/runtime/sglang/deepseekv41_detector.py
+RUN python3 -B /opt/dsv41/runtime/patch_v41_tool_constraint.py
 COPY boot.py /opt/dsv41/boot.py
 COPY scripts /opt/dsv41/scripts
 COPY tests /opt/dsv41/tests
 COPY benchmarks /opt/dsv41/benchmarks
 RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinking.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 python3 -B /opt/dsv41/tests/test_v41_tool_constraint.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=unsupported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \

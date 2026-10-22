@@ -10,6 +10,10 @@ raw results live under `docs/results/`.
   `DSPARK_SPS_ALLOW_ENGRAM=1` is the explicit future-engine-fix override. Documented SGLang's opt-in metrics
   flags so operators know why `/metrics` otherwise returns 404 and how to expose all schedulers' `sglang:*`
   series (MiaAI-Lab `786859e`, original verification by Zbigniew).
+- Ported Scott Woolsey Biggart and Claude Opus 5.5's Mia PR #58 backport of SGLang #39665: the
+  default image now emits typed `tool_calls` for required and named tool choice instead of returning bare DSML
+  in `message.content`. The installer is content-pinned and fails closed on base-image drift; all three image
+  recipes run the real SGLang/xgrammar grammar-and-parser regression during build.
 - Marked the original v2.4 image as pre-fix after a second fleet reported repeated CUDA Xid 13/43 faults under large
   prefix-cache hits. Four reports now include two with `DSV41_PREFILL_BYPASS` disabled, so bypass is not treated as
   the root cause. The v2.1 feature set is the documented fallback while the candidate is soaked.
