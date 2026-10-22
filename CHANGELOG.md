@@ -5,6 +5,11 @@ raw results live under `docs/results/`.
 
 ## 2026-10-22 issue #16 resolution
 
+- Ported MiaAI-Lab's Engram/SPS safety guard (`6eb9a7a`, MiaAI-Lab and Claude Sonnet 5.5): an existing
+  `DSPARK_SPS_TABLE` can no longer silently arm compact ragged verification and crash CUDA-graph capture.
+  `DSPARK_SPS_ALLOW_ENGRAM=1` is the explicit future-engine-fix override. Documented SGLang's opt-in metrics
+  flags so operators know why `/metrics` otherwise returns 404 and how to expose all schedulers' `sglang:*`
+  series (MiaAI-Lab `786859e`, original verification by Zbigniew).
 - Marked the original v2.4 image as pre-fix after a second fleet reported repeated CUDA Xid 13/43 faults under large
   prefix-cache hits. Four reports now include two with `DSV41_PREFILL_BYPASS` disabled, so bypass is not treated as
   the root cause. The v2.1 feature set is the documented fallback while the candidate is soaked.

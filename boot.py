@@ -287,6 +287,35 @@ def required_sglang_args(args, backend):
     return result + [flag, 'flashinfer_cutlass']
 
 
+def sps_table_args(table, env=None):
+    """Return SPS flags only when the Engram incompatibility is overridden.
+
+    A profiled SPS table enables compact ragged verification. DeepSeek V4.1
+    Flash has Engram layers whose target-verify path requires one equally sized
+    block per request, so enabling the table currently crashes during CUDA graph
+    capture. Keep the safe verify-all scheduler unless a future engine fix is
+    explicitly acknowledged by the operator.
+    """
+    env = os.environ if env is None else env
+    if not table:
+        return []
+    if not Path(table).is_file():
+        print(f'DSPARK_SPS_TABLE={table} not found; '
+              'staying on the verify-all schedule', flush=True)
+        return []
+    if env.get('DSPARK_SPS_ALLOW_ENGRAM', '0') != '1':
+        print(f'DSPARK_SPS_TABLE={table} ignored: compact ragged verify is '
+              'incompatible with this model\'s Engram layers and crashes at '
+              'CUDA-graph capture. Staying on the verify-all schedule. Set '
+              'DSPARK_SPS_ALLOW_ENGRAM=1 only after the engine path is fixed.',
+              flush=True)
+        return []
+    return [
+        '--speculative-dspark-sps-table-path', table,
+        '--speculative-dspark-align-verify-tokens-to-graph-tier',
+    ]
+
+
 def serve():
     mode = os.environ.get('OFFLOAD_MODE', 'nvme')
     assert mode in ('nvme', 'ram'), 'OFFLOAD_MODE must be nvme or ram'
@@ -338,20 +367,10 @@ def serve():
             '--speculative-algorithm', spec,
             '--speculative-dspark-block-size', os.environ.get('DSPARK_BLOCK_SIZE', '5'),
         ]
-        # The ragged-verify scheduler is where DSpark's throughput actually comes
-        # from, and it needs a profiled SPS cost table: without one the planner
-        # falls back to verify-all and the whole thing is a no-op. Build one with
-        #   python -m sglang.benchmark.dspark_sps_profiler
-        # against a running server, then point DSPARK_SPS_TABLE at it.
-        table = os.environ.get('DSPARK_SPS_TABLE', '').strip()
-        if table and Path(table).is_file():
-            args += ['--speculative-dspark-sps-table-path', table]
-            # Fills each step's verify window up to the cuda-graph tier the
-            # forward is padded to anyway: free verification at the same cost.
-            args += ['--speculative-dspark-align-verify-tokens-to-graph-tier']
-        elif table:
-            print(f'DSPARK_SPS_TABLE={table} not found; '
-                  'staying on the verify-all schedule', flush=True)
+        # A profiled table would enable compact ragged verify, but the Engram
+        # target-verify path currently requires equal blocks. Keep verify-all
+        # unless a later engine fix is explicitly acknowledged.
+        args += sps_table_args(os.environ.get('DSPARK_SPS_TABLE', '').strip())
         sts = os.environ.get('DSPARK_STS_TABLE', '').strip()
         if sts and Path(sts).is_file():
             args += ['--speculative-dspark-confidence-sts-path', sts]
