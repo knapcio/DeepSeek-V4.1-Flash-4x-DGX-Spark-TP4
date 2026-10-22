@@ -1,0 +1,47 @@
+name: Offline regressions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Host-side patch and launcher regressions
+        run: |
+          python3 tests/test_patch_v41_tool_constraint.py
+          python3 -m unittest \
+            tests/test_sps_engram_guard.py \
+            tests/test_required_sglang_args.py \
+            tests/test_launcher_build.py \
+            tests/test_sglang_bounded_replay_patch.py \
+            tests/test_remote_dotenv.py \
+            tests/test_upstream_launcher_ports.py
+      - name: Syntax checks
+        run: |
+          python3 -m py_compile \
+            boot.py \
+            runtime/patch_v41_tool_constraint.py \
+            runtime/sglang/deepseekv41_detector.py \
+            tests/test_sps_engram_guard.py \
+            tests/test_v41_tool_constraint.py
+          bash -n start.sh stop.sh
+      - name: Vendored detector identity
+        run: |
+          test "$(shasum -a 256 runtime/sglang/deepseekv41_detector.py | awk '{print $1}')" = \
+            1db7eb88dfed0530a4c85231e525da83a5fd009e4feb85610bffd94d4c8c3672

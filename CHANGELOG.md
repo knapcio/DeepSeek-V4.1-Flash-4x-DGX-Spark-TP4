@@ -5,6 +5,8 @@ raw results live under `docs/results/`.
 
 ## 2026-10-22 issue #16 resolution
 
+- Added an Ubuntu/macOS offline CI gate for the launcher, SGLang backport verifier, Engram/SPS guard,
+  per-host remote configuration, forced-tool detector installer, syntax checks and vendored-source identity.
 - Ported MiaAI-Lab's Engram/SPS safety guard (`6eb9a7a`, MiaAI-Lab and Claude Sonnet 5.5): an existing
   `DSPARK_SPS_TABLE` can no longer silently arm compact ragged verification and crash CUDA-graph capture.
   `DSPARK_SPS_ALLOW_ENGRAM=1` is the explicit future-engine-fix override. Documented SGLang's opt-in metrics
