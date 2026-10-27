@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- `DSV41_PREFILL_BYPASS_SOLO=1` (opt-in, with `DSV41_PREFILL_BYPASS`; not in the production profile): a solo short
+  pass. While a long prompt is being chunked, short requests admitted by the bypass scan run in a prefill pass of
+  their own; the long prompt is parked for that pass (the engine's parked-chunk state: empty extend range, nothing
+  stashed, no in-flight chunk counted, the batch built without it) and resumes alone in the next pass with the same
+  chunk. The long prompt's chunks, boundaries and numerics are those of an idle run, and a short request runs as an
+  ordinary extend. Solo and chunk passes alternate, so the long prompt is never starved; a final chunk is parked like
+  any other; the interval cadence is unchanged. Every decision reads replicated scheduler state only (the parked
+  flag lives on the request), so all ranks build the same batch. The same pinned `_get_new_batch_prefill_raw` /
+  `PrefillAdder` sources and sha pins as the bypass; off (unset or 0) is the v2.6.1 patched function byte for byte.
+  `tests/test_prefill_bypass_solo.py` (in the canary image builds): a pass simulator over the lifted pinned scheduler
+  (long prompt + short arrivals, final chunk, continuous arrivals, rank invariance), off identity against a v2.6.1
+  fixture, anchor-drift refusal. Design: `diagnostics/jm-comparison-20261027/ANALYSIS.md` §3 (idea credits: our
+  bypass; Christopher Owen's late-admission / prefill-interleaving work; James Meadlock's `mixed_probe`).
+
 ## 2026-10-27 v2.6.1
 
 - Fixed: building `Dockerfile.canary-roce` failed in the image test battery at
