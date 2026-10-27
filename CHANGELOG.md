@@ -2,16 +2,20 @@
 
 ## Unreleased
 
-- Fixed (pending the fleet gate): a CTA shared-memory race in b12x_next's routed-MoE dynamic kernel
+- Fixed (pending the fleet gate), backported from b12x: a CTA shared-memory race in b12x_next's routed-MoE dynamic kernel
   (`moe/_shared/kernels/dynamic.py`, the producer loop). The CTA leader stores each batch claim in one shared
   word (`ctrl[7]`); a barrier orders that store before every thread's read, but nothing ordered the reads before
   the NEXT iteration's store, and the loop's back edge has no barrier. A warp that is late to its read can
   therefore see the next batch's claim: tokens skipped or routed twice, or an early stop. The new patch
-  `scripts/b12x_next-claim-barrier.patch` adds one CTA barrier right after the claim read (every thread, once
-  per producer iteration). Registers, spills and the FC1 / FC2 kernels are unchanged at sm_121a; the dynamic
+  `scripts/b12x_next-claim-barrier.patch` is **Martin Vit**'s fix from b12x commit `d7937d7f` (2026-10-06, after
+  our pinned `a7d7d29b`; b12x now lives in flashinfer-ai/flashinfer, `flashinfer/experimental/b12x`), verbatim:
+  one CTA barrier right after the claim read (every thread, once per producer iteration). The same commit's
+  deterministic shared-activation gather fix serves the monolithic in-kernel FC1 path, which our
+  specializations do not compile (their external phase-1 kernel already divides by top-k), so it is not
+  carried. Registers, spills and the FC1 / FC2 kernels are unchanged at sm_121a; the dynamic
   kernel gains one `BAR.SYNC` per iteration. `tests/test_b12x_next_claim_barrier.py`: an exhaustive interleaving
   model (the stock loop has a counterexample, the barrier closes it) and the source pin. `SOURCE_PATCH`
-  da662ccc7e2372b5 -> 5f8b0e88455d7612. Found in an offline racecheck / SASS analysis.
+  da662ccc7e2372b5 -> 5555496ebd40f308. Found independently in an offline racecheck / SASS analysis.
 
 ## 2026-10-27 v2.6.1
 

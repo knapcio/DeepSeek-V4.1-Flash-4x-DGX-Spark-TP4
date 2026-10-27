@@ -7,7 +7,7 @@ dynamic.py's producer loop (runtime/b12x_next/b12x_next/moe/_shared/kernels/dyna
         if leader: batch_base = atomicAdd(pair_head, claim); st.shared ctrl[7] = batch_base
         bar.sync 0                                   # publication: the store before every read
         batch_base = ld.volatile.shared ctrl[7]
-        [ds41 claim-barrier: bar.sync 0]             # reuse: every read before the next store
+        [bar.sync 0, b12x d7937d7f backport]        # reuse: every read before the next store
         if batch_base >= limit: produce_active = 0
         else: per-warp work on tokens batch_base + warp
 
@@ -157,13 +157,17 @@ class ClaimBarrierSourceTests(unittest.TestCase):
     def test_exactly_one_claim_store_and_read(self):
         self.assertEqual(self.src.count("_st_shared_i32(ctrl_base_addr + Int32(28), batch_base)"), 1)
         self.assertEqual(self.src.count("_ld_shared_i32(ctrl_base_addr + Int32(28))"), 1)
-        self.assertEqual(self.src.count("ds41 claim-barrier"), 1)
+        # the backport of b12x d7937d7f keeps upstream's comment verbatim
+        self.assertEqual(self.src.count("All warps retain the claim before the leader can reuse its slot."), 1)
 
     def test_patch_recorded(self):
         def read(*parts, mode="r"):
             with open(os.path.join(ROOT, *parts), mode) as f:
                 return f.read()
-        self.assertIn("+            cute.arch.sync_threads()", read("scripts", "b12x_next-claim-barrier.patch"))
+        patch = read("scripts", "b12x_next-claim-barrier.patch")
+        self.assertIn("+            cute.arch.sync_threads()", patch)
+        self.assertIn("d7937d7fc2e5511a0b61eb3572cd149f563f9b4f", patch)
+        self.assertIn("Martin Vit", patch)
         self.assertIn("b12x_next-claim-barrier.patch", read("scripts", "build_b12x_next.sh"))
         import hashlib
         names = ["compact-n64-m64", "prequant-input", "barrier-zero", "det-triton-planner", "claim-barrier"]

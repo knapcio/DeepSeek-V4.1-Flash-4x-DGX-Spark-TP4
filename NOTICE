@@ -37,9 +37,12 @@ Third-party components and their licences:
   (runtime/b12x_next/LICENSE). Local changes are the patches that script applies, in
   order (scripts/b12x_next-*.patch; their combined sha256 prefix is
   runtime/b12x_next/b12x_next/SOURCE_PATCH): compact-n64-m64, prequant-input,
-  barrier-zero, det-triton-planner and claim-barrier (a CTA barrier after the
-  dynamic kernel's producer-loop batch-claim read, closing a shared-memory reuse
-  race on ctrl[7]). The changes are distributed under the same licence.
+  barrier-zero, det-triton-planner and claim-barrier. claim-barrier is a backport
+  of b12x commit d7937d7fc2e5511a0b61eb3572cd149f563f9b4f by Martin Vit (a CTA
+  barrier after the dynamic kernel's producer-loop batch-claim read, closing a
+  shared-memory reuse race on ctrl[7]); b12x development continues in
+  flashinfer-ai/flashinfer (flashinfer/experimental/b12x, Apache License 2.0).
+  The changes are distributed under the same licence.
 - runtime/b12x/b12x/comm/roce_twoshot is a copy of runtime/b12x/b12x/comm/roce with the
   pipelined two-shot all-reduce of flashinfer-ai/flashinfer PR 6915 by Luke Alonso (head
   effeb496, flashinfer/experimental/b12x/comm/roce, itself local-inference-lab/b12x's

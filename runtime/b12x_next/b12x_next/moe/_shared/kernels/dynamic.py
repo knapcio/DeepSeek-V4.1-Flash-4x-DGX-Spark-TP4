@@ -3584,13 +3584,8 @@ class MoEDynamicKernelBackend:
                 _st_shared_i32(ctrl_base_addr + Int32(28), batch_base)
             cute.arch.sync_threads()
             batch_base = _ld_shared_i32(ctrl_base_addr + Int32(28))
-            # ds41 claim-barrier: every thread has read this iteration's claim
-            # before the leader may overwrite ctrl[7] with the next one. The
-            # publication barrier above orders the store before the reads, not
-            # the reads before the next store; without this barrier a lagging
-            # warp can read the NEXT batch_base (skipped / duplicated tokens).
-            # All CTA threads reach it: it is outside every token / leader
-            # predicate, once per iteration including the terminal claim.
+            # All warps retain the claim before the leader can reuse its slot.
+            # Inactive tail warps may advance ahead of token-packing warps.
             cute.arch.sync_threads()
             producer_limit = total_pairs
             if cutlass.const_expr(self.share_input_across_experts):
