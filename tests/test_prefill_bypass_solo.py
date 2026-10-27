@@ -171,12 +171,18 @@ class SoloShortPassTests(unittest.TestCase):
         out, _, _ = simulate(20, arrivals={1: ['big']}, solo=True, short_tokens=12)
         self.assertTrue(all(names in (('long',),) for names, _, _, _ in out[:5]))
 
-    def test_two_short_arrivals_share_one_solo_pass(self):
-        out, _, _ = simulate(20, arrivals={2: ['s1', 's2']}, solo=True, keep_scanning=True)
-        self.assertIn(('s1', 's2'), [names for names, _, _, _ in out])
-        # with the engine's own budget_state the second waits for the next solo pass, never beside the long prompt
-        out, _, _ = simulate(20, arrivals={2: ['s1', 's2']}, solo=True)
-        self.assertTrue(all(names == ('long',) or 'long' not in names for names, _, _, _ in out))
+    def test_two_short_arrivals_take_one_solo_pass_each(self):
+        # a solo pass carries one short request (bs-1, as on an idle server), even with the candidate loop held open
+        idle, _, _ = simulate(20, solo=True)
+        for keep in (True, False):
+            out, _, sched = simulate(20, arrivals={2: ['s1', 's2']}, solo=True, keep_scanning=keep)
+            passes = [names for names, _, _, _ in out]
+            self.assertIn(('s1',), passes, keep)
+            self.assertIn(('s2',), passes, keep)
+            self.assertNotIn(('s1', 's2'), passes, keep)
+            self.assertTrue(all(names == ('long',) or 'long' not in names for names in passes), keep)
+            self.assertEqual(long_ranges(out), long_ranges(idle), keep)
+            self.assertEqual(sched.waiting_queue, [])
 
     def test_rank_invariant(self):
         arrivals = {1: ['a'], 3: ['b', 'c'], 4: ['d']}
@@ -192,6 +198,113 @@ class SoloShortPassTests(unittest.TestCase):
             batch, _ = scheduler._get_new_batch_prefill_raw(None, running)
             return [r.rid for r in batch.reqs], [r.rid for r in scheduler.waiting_queue], memory.reservations
         self.assertEqual(run(True), run(False))
+
+
+def page_engine(long_prefix, long_fresh, shorts, limit, partial_cap=None):
+    """The serving geometry: page 256, chunk = max prefill = 8192, the engine's own budget_state."""
+    module, scheduler, running, memory = base.mocked_engine(capacity=10 ** 7, partial_cap=partial_cap)
+    scheduler.page_size = 256
+    scheduler.chunked_prefill_size = scheduler.max_prefill_tokens = 8192
+    scheduler.chunked_req = base.Request('long', long_fresh, prefix=long_prefix)
+    scheduler.waiting_queue = [base.Request(name, n) for name, n in shorts]
+    assert arm(module, '1', limit=str(limit))
+    return module, scheduler, running, memory
+
+
+def run_passes(scheduler, running, n=6):
+    long, out = scheduler.chunked_req, []
+    for _ in range(n):
+        if scheduler.chunked_req is None and not scheduler.waiting_queue:
+            break
+        batch, running = scheduler._get_new_batch_prefill_raw(None, running)
+        if batch is None:
+            out.append(())
+            continue
+        out.append(tuple((r.rid, r.extend_range.start, r.extend_range.end) for r in batch.reqs))
+        for r in batch.reqs:
+            r.prefix_indices = [0] * r.extend_range.end                   # the stash
+    return out, long
+
+
+@unittest.skipUnless(SUPPORTED, 'needs the staged pinned scheduler source (DSV41_PREFILL_BYPASS_SOURCE_ROOT)')
+class SoloFinalChunkContractTests(unittest.TestCase):
+    """REVIEW_sol P2-1: beside a FINAL chunk the solo admission must keep the bypass contract."""
+
+    def test_page256_final_chunk_two_shorts_one_per_pass_and_debited(self):
+        # long prefix 8192 + 100 remaining (final chunk), two 256-token shorts, BYPASS=256
+        module, scheduler, running, _ = page_engine(8192, 100, [('s1', 256), ('s2', 256)], 256)
+        batch, running = scheduler._get_new_batch_prefill_raw(None, running)
+        self.assertEqual([r.rid for r in batch.reqs], ['s1'])                  # was ['s1', 's2'] = 512 fresh
+        adder = module.PrefillAdder.latest
+        self.assertEqual(adder._dsv41_bypass_remaining, 0)                     # the cumulative debit ran
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertIs(scheduler.chunked_req.rid, 'long')
+        self.assertEqual(scheduler.chunked_req.extend_range.length, 0)         # parked
+        for r in batch.reqs:
+            r.prefix_indices = [0] * r.extend_range.end
+        out, long = run_passes(scheduler, running)
+        self.assertEqual(out[0], (('long', 8192, 8292),))                      # resumes alone, same final chunk
+        self.assertEqual(out[1], (('s2', 0, 256),))
+        self.assertIsNone(scheduler.chunked_req)
+
+    def test_page256_bypass512_short_never_split_beside_a_final_chunk(self):
+        # long remainder 7936 leaves a 256-token residual; one 512-token short, BYPASS=512. The stock admission
+        # chunked the short into the residual and the solo restore then hit `assert self.chunked_req is None`.
+        module, scheduler, running, _ = page_engine(8192, 7936, [('s1', 512)], 512)
+        out, long = run_passes(scheduler, running)
+        self.assertEqual(out[0], (('s1', 0, 512),))                            # whole, alone
+        self.assertEqual(out[1], (('long', 8192, 16128),))
+        self.assertEqual(long.prefix_indices.__len__(), 16128)
+
+    def test_page256_memory_forced_split_is_skipped_not_chunked(self):
+        # the engine's budget would only fit part of the short: the candidate is skipped (no second chunked
+        # request), the long prompt runs its final chunk normally and the short follows whole
+        module, scheduler, running, _ = page_engine(8192, 7936, [('s1', 512)], 512, partial_cap=256)
+        batch, running = scheduler._get_new_batch_prefill_raw(None, running)
+        self.assertEqual([(r.rid, r.extend_range.start, r.extend_range.end) for r in batch.reqs],
+                         [('long', 8192, 16128)])
+        self.assertIsNone(module.PrefillAdder.latest.new_chunked_req)
+        self.assertEqual([r.rid for r in scheduler.waiting_queue], ['s1'])
+
+    def test_page256_non_final_chunk_unchanged_contract(self):
+        # mid-prompt: shorts waiting beside a non-final chunk -> one solo pass each, alternating with the
+        # unchanged 8192-token chunks
+        module, scheduler, running, _ = page_engine(0, 20000, [('s1', 256), ('s2', 256)], 256)
+        out, long = run_passes(scheduler, running, n=8)
+        self.assertEqual(out, [(('s1', 0, 256),), (('long', 0, 8192),), (('s2', 0, 256),),
+                               (('long', 8192, 16384),), (('long', 16384, 20000),)])
+
+
+@unittest.skipUnless(SUPPORTED, 'needs the staged pinned scheduler source (DSV41_PREFILL_BYPASS_SOURCE_ROOT)')
+class SoloReceiptTests(unittest.TestCase):
+    """REVIEW_sol P2-6: one DSV41_SOLO_RECEIPT per solo pass and per resume, the same on every rank."""
+
+    def receipts(self, rank_noise=0):
+        adapter = importlib.import_module('prefill_bypass')
+        with self.assertLogs(adapter.logger, level='WARNING') as cm:
+            out, _, _ = simulate(20, arrivals={1: ['a'], 3: ['b']}, solo=True, rank_noise=rank_noise)
+        return [l.split('DSV41_SOLO_RECEIPT ', 1)[1] for l in cm.output if 'DSV41_SOLO_RECEIPT ' in l], out
+
+    def test_pass_and_resume_receipts(self):
+        import json
+        lines, out = self.receipts()
+        ev = [json.loads(l) for l in lines]
+        self.assertEqual([e['event'] for e in ev], ['pass', 'resume', 'pass', 'resume'])
+        self.assertEqual(ev[0]['long'], 'long')
+        self.assertEqual(ev[0]['batch'], [['a', 0, 2]])
+        self.assertLess(ev[0]['prefix'], ev[0]['total'])                       # the long prompt was mid-prefill
+        self.assertEqual(ev[1]['batch'], [['long', ev[0]['prefix'], ev[0]['prefix'] + 4]])
+        self.assertEqual(ev[2]['batch'], [['b', 0, 2]])
+
+    def test_receipts_are_rank_invariant(self):
+        runs = [self.receipts(rank_noise=r * 10 ** 6)[0] for r in range(4)]
+        self.assertTrue(runs[0] and all(r == runs[0] for r in runs))
+
+    def test_off_logs_no_receipt(self):
+        adapter = importlib.import_module('prefill_bypass')
+        with self.assertLogs(adapter.logger, level='WARNING') as cm:
+            simulate(20, arrivals={1: ['a']}, solo=False)
+        self.assertFalse([l for l in cm.output if 'DSV41_SOLO_RECEIPT' in l])
 
 
 @unittest.skipUnless(SUPPORTED, 'needs the staged pinned scheduler source (DSV41_PREFILL_BYPASS_SOURCE_ROOT)')
