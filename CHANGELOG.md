@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Fixed (pending the fleet gate): a CTA shared-memory race in b12x_next's routed-MoE dynamic kernel
+  (`moe/_shared/kernels/dynamic.py`, the producer loop). The CTA leader stores each batch claim in one shared
+  word (`ctrl[7]`); a barrier orders that store before every thread's read, but nothing ordered the reads before
+  the NEXT iteration's store, and the loop's back edge has no barrier. A warp that is late to its read can
+  therefore see the next batch's claim: tokens skipped or routed twice, or an early stop. The new patch
+  `scripts/b12x_next-claim-barrier.patch` adds one CTA barrier right after the claim read (every thread, once
+  per producer iteration). Registers, spills and the FC1 / FC2 kernels are unchanged at sm_121a; the dynamic
+  kernel gains one `BAR.SYNC` per iteration. `tests/test_b12x_next_claim_barrier.py`: an exhaustive interleaving
+  model (the stock loop has a counterexample, the barrier closes it) and the source pin. `SOURCE_PATCH`
+  da662ccc7e2372b5 -> 5f8b0e88455d7612. Found in an offline racecheck / SASS analysis.
+
 ## 2026-10-27 v2.6.1
 
 - Fixed: building `Dockerfile.canary-roce` failed in the image test battery at
