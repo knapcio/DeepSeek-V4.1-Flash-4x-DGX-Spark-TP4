@@ -2,7 +2,7 @@
  "component": "FlashInfer sparse_mla_sm120 prefill (NVIDIA, BSD-3-Clause headers retained), native extra page sizes",
  "gate": "DSV41_PREFILL_NATIVE_EXTRA (default off)",
  "base": {
-  "source": "flashinfer 0.6.18, git 69ff11fc, from the DS v2.6 image rel-20261027-1e11113 (/opt/sglang/lib/python3.12/site-packages/flashinfer, extracted 2026-10-27: csrc/sparse_mla_sm120*.cu, include/flashinfer/layout.cuh, include/flashinfer/attention/sparse_mla_sm120/). csrc/tvm_ffi_utils.h is the GLM image's copy (0.6.18.dev20260819, 61a6c651), used only for the offline compile; it is RECORDED_ONLY in the closure (hashed into the manifest and tag, not approved)",
+  "source": "flashinfer 0.6.18, git 69ff11fc, from the DS v2.6 image rel-20261027-1e11113 (/opt/sglang/lib/python3.12/site-packages/flashinfer, extracted 2026-10-27: csrc/sparse_mla_sm120*.cu, csrc/tvm_ffi_utils.h, include/flashinfer/layout.cuh, include/flashinfer/attention/sparse_mla_sm120/)",
   "use": "offline tests, the sm_121a compile check and APPROVED_CLOSURE.json (the reviewed closure: both .cu inputs, csrc/tvm_ffi_utils.h, include/flashinfer/layout.cuh, every include/flashinfer/attention/sparse_mla_sm120 file). The image build refuses any other closure (REVIEW_sol K8 P2-1)",
   "pristine_copy": "base/{csrc,include} (FlashInfer data layout subset, SHA256SUMS)",
   "rebased": "2026-10-27: from the GLM image copy (61a6c651); the DS image differs in arch/barrier.cuh (bar_arrive_alt / bar_sync_alt) and prefill_kernel.cuh (5 handshakes alternate barrier ids 1 / 5, upstream #3700); every other closure file and the generator's anchor inputs are byte-identical"

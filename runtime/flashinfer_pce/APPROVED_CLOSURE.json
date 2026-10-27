@@ -2,6 +2,7 @@
  "files": {
   "csrc/sparse_mla_sm120.cu": "3c135ec47cace678ca4141e46076cac17e3f9a1787198c1b91bfc62d184e42be",
   "csrc/sparse_mla_sm120_prefill.cu": "f7cb21078f1f6d997a3f96f1513eaa8b923ca57b4d17156952ec476e56d60cad",
+  "csrc/tvm_ffi_utils.h": "4fe41227dc3bd833b492f6b04bb94eb497b78be85847598eb19bd08c016de787",
   "include/flashinfer/attention/sparse_mla_sm120/arch/barrier.cuh": "015f9507382fd2a6ad244078574c0f56f692c827619c879b44cfcb1833787615",
   "include/flashinfer/attention/sparse_mla_sm120/arch/common.cuh": "bdd9f13c1d6a89cf4f6291f8f9b337f209d1f3fee622f56f3a3a5e053334b681",
   "include/flashinfer/attention/sparse_mla_sm120/arch/cp_async.cuh": "ec2e59216add7516db4eadcfc6d9246d4f82468d2382acae10d3580f753305c7",
@@ -23,5 +24,5 @@
   "include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh": "5f005980cff1606fc1a239faeb93d1d697710c92014d549e4425e9db04f675e0",
   "include/flashinfer/layout.cuh": "f000e64b9c718b0659fff1acf3c3fa0c2cdf5c75862cede645b16014bfa7aa2b"
  },
- "flashinfer": "0.6.18, git 69ff11fc: the DS v2.6 image rel-20261027-1e11113 (/opt/sglang/lib/python3.12/site-packages/flashinfer, extracted 2026-10-27; differs from the GLM copy 0.6.18.dev20260819 61a6c651 in arch/barrier.cuh and prefill_kernel.cuh only: the #3700 alternating named-barrier fix). Reviewed for K8 native-page addressing (REVIEW_sol.md); csrc/tvm_ffi_utils.h is recorded, not approved (RECORDED_ONLY)"
+ "flashinfer": "0.6.18, git 69ff11fc: the DS v2.6 image rel-20261027-1e11113 (/opt/sglang/lib/python3.12/site-packages/flashinfer, extracted 2026-10-27; differs from the GLM copy 0.6.18.dev20260819 61a6c651 in arch/barrier.cuh and prefill_kernel.cuh only: the #3700 alternating named-barrier fix). Reviewed for K8 native-page addressing (REVIEW_sol.md). All 23 files pinned, csrc/tvm_ffi_utils.h included (byte-identical in both images)"
 }
