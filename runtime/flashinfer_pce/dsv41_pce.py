@@ -86,7 +86,7 @@ def check_sources(src: Path, csrc: Path, include: Path) -> dict:
     gen = _generator(src)
     try:
         got = gen.closure(Path(csrc), Path(include))
-        gen.check_closure(got, manifest.get("closure") or {})
+        gen.check_closure(got, manifest.get("closure") or {}, ignore=())   # all of it, glue included
     except gen.ClosureError as e:
         raise RuntimeError(f"{ENV}: installed FlashInfer is not the source the module was generated and approved "
                            f"from ({e}); rebuild the image") from None

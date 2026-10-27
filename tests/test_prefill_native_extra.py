@@ -175,7 +175,9 @@ class Generator(unittest.TestCase):
     def test_closure_drift_refuses(self):
         """REVIEW_sol K8 P2-1: drift the anchors cannot see (an unanchored statement, a kernel header, the glue, the
         file set) refuses against the approved closure; the committed approval is the vendored base."""
-        self.assertEqual(json.loads(APPROVED.read_text())["files"], gen.closure(B_CSRC, B_INC))
+        full = gen.closure(B_CSRC, B_INC)
+        self.assertEqual(json.loads(APPROVED.read_text())["files"],
+                         {k: h for k, h in full.items() if k not in gen.RECORDED_ONLY})
         cases = [
             ("csrc/sparse_mla_sm120_prefill.cu", "  dim3 grid(num_tokens * REPLICATE_H);",
              "  dim3 grid(num_tokens * REPLICATE_H + 1);"),
@@ -184,7 +186,6 @@ class Generator(unittest.TestCase):
             ("include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh",
              "USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA == 2)",
              "USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA >= 2)"),
-            ("csrc/tvm_ffi_utils.h", "#include <tvm/ffi/dtype.h>", "#include <tvm/ffi/dtype.h>\n#define X 1"),
             ("include/flashinfer/layout.cuh", "#include <tuple>", "#include <tuple>\n#define Y 1"),
         ]
         for fname, old, new in cases:
@@ -201,6 +202,31 @@ class Generator(unittest.TestCase):
         (d / "include/flashinfer/attention/sparse_mla_sm120/arch/barrier.cuh").unlink()
         with self.assertRaisesRegex(gen.ClosureError, "missing"):
             gen.generate(d / "csrc", d / "include", self.tmp / "o", ap)
+
+    def test_recorded_only_glue(self):
+        """csrc/tvm_ffi_utils.h (host glue, not extracted from the DS image) is not approved but recorded: a change
+        generates, the manifest carries the new hash and the module tag changes; the loader compares it in full."""
+        self.assertEqual(gen.RECORDED_ONLY, frozenset({"csrc/tvm_ffi_utils.h"}))
+        d, ap = self._mutated("csrc/tvm_ffi_utils.h", "#include <tvm/ffi/dtype.h>",
+                              "#include <tvm/ffi/dtype.h>\n#define X 1", approve=False)
+        m2 = gen.generate(d / "csrc", d / "include", self.tmp / "o3", ap)
+        self.assertNotEqual(m2["module_tag"], self.m["module_tag"])
+        self.assertNotEqual(m2["closure"]["csrc/tvm_ffi_utils.h"], self.m["closure"]["csrc/tvm_ffi_utils.h"])
+        with self.assertRaisesRegex(RuntimeError, "is not the source the module was generated"):
+            pce.check_sources(self.out, d / "csrc", d / "include")
+
+    def test_ds_image_extract_is_the_approved_closure(self):
+        """The DS v2.6 image's FlashInfer (extracted 2026-10-27) generates without refusal."""
+        x = ROOT.parent.parent.parent / "diagnostics/ds-prefill-native-extra-20261027/ds-image-flashinfer/x/data"
+        if not x.is_dir():
+            self.skipTest("DS image extract not present")
+        csrc = self.tmp / "ds-csrc"
+        shutil.copytree(x / "csrc", csrc)
+        if not (csrc / "tvm_ffi_utils.h").exists():   # not extracted: the glue is recorded-only
+            shutil.copy(B_CSRC / "tvm_ffi_utils.h", csrc / "tvm_ffi_utils.h")
+        m = gen.generate(csrc, x / "include", self.tmp / "ds-gen")
+        self.assertEqual(m["outputs"], self.m["outputs"])
+        self.assertEqual(m["closure"], self.m["closure"])
 
     def test_tag_covers_the_closure(self):
         """An approved but different kernel header gives the same generated .cu text and a DIFFERENT module tag."""

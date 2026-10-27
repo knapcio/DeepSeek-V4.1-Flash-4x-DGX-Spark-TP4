@@ -51,7 +51,8 @@ Third-party components and their licences:
   Origin and local changes: runtime/b12x/twoshot-provenance.json. It is opt-in
   (DSV41_ROCE_TWOSHOT=1); runtime/b12x/b12x/comm/roce is unchanged.
 - runtime/flashinfer_pce/base is an unmodified copy of FlashInfer's SM120 sparse-MLA sources
-  (flashinfer 0.6.18.dev20260819, git 61a6c651; NVIDIA, BSD-3-Clause, headers retained), kept for
+  (flashinfer 0.6.18, git 69ff11fc, as installed in the DS v2.6 image; NVIDIA, BSD-3-Clause,
+  headers retained), kept for
   the offline tests and the approved source closure of runtime/flashinfer_pce/gen_pce_sources.py
   (csrc/tvm_ffi_utils.h and include/flashinfer/layout.cuh are FlashInfer's, Apache License 2.0).
   That generator derives the opt-in DSV41_PREFILL_NATIVE_EXTRA module from the image's own
