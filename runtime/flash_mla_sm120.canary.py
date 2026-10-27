@@ -247,6 +247,22 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    # DSV41_PREFILL_NATIVE_EXTRA=1: the extra source's native 128/256-token
+    # pages go straight to a module instantiated for them (no extra split
+    # buffer). Default OFF: the stock path below, unchanged.
+    from .dsv41_pce import routes as _pce_routes
+
+    if _pce_routes(extra_kv_u8):
+        from .dsv41_pce import paged_attention as _pce_paged_attention
+
+        output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
+        out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
+        _pce_paged_attention(
+            q2, kv_64, idx, output, out_lse, softmax_scale,
+            topk_length=topk_length, attn_sink=attn_sink, extra_kv=extra_kv_u8,
+            extra_indices=extra_idx, extra_topk_length=extra_topk_length,
+        )
+        return (output.unsqueeze(1), None)
     # V4.1 ratio-1/2 sources use 256/128-token pages. The prefill
     # specialization needs 64-token pages for both sources, with independent
     # scratch buffers so converting the extra source cannot overwrite SWA.

@@ -50,6 +50,12 @@ Third-party components and their licences:
   2025-2026 NVIDIA; Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/).
   Origin and local changes: runtime/b12x/twoshot-provenance.json. It is opt-in
   (DSV41_ROCE_TWOSHOT=1); runtime/b12x/b12x/comm/roce is unchanged.
+- runtime/flashinfer_pce/base is an unmodified copy of FlashInfer's SM120 sparse-MLA sources
+  (flashinfer 0.6.18.dev20260819, git 61a6c651; NVIDIA, BSD-3-Clause, headers retained), kept for
+  the offline tests of runtime/flashinfer_pce/gen_pce_sources.py. That generator derives the
+  opt-in DSV41_PREFILL_NATIVE_EXTRA module from the image's own FlashInfer sources at build time
+  (dual-cache prefill dispatch opened to 128/256-token extra pages, symbols renamed); origin and
+  changes: runtime/flashinfer_pce/PROVENANCE.json.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

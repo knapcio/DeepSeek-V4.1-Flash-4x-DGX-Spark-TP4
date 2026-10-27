@@ -29,6 +29,13 @@ COPY adapter /opt/dsv41/adapter
 RUN g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread \
     adapter/row_store.cpp -o adapter/librow_store.so
 COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+# DSV41_PREFILL_NATIVE_EXTRA (opt-in, default off): prefill reads the extra cache's native 128/256-token pages through
+# a separate FlashInfer module generated from THIS image's sparse_mla_sm120 sources; anchor drift fails the build.
+COPY runtime/flashinfer_pce/dsv41_pce.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_pce.py
+COPY runtime/flashinfer_pce/gen_pce_sources.py /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py
+RUN FI_CSRC="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_CSRC_DIR)')" \
+ && python3 /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py "$FI_CSRC" /opt/dsv41/runtime/flashinfer_pce/gen \
+ && python3 -c "from pathlib import Path; from flashinfer.jit import env; from sglang.kernels.ops.attention import dsv41_pce as p; print('pce sources ok', p.check_sources(Path(p.DEFAULT_SRC), Path(env.FLASHINFER_CSRC_DIR))['module_tag'])"
 # Fail the build if either pinned textual-placeholder anchor has drifted.
 COPY runtime/patch_encoding_dsv41.py /opt/dsv41/runtime/patch_encoding_dsv41.py
 RUN python3 /opt/dsv41/runtime/patch_encoding_dsv41.py

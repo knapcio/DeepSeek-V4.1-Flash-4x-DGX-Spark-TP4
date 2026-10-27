@@ -1,0 +1,26 @@
+{
+ "component": "FlashInfer sparse_mla_sm120 prefill (NVIDIA, BSD-3-Clause headers retained), native extra page sizes",
+ "gate": "DSV41_PREFILL_NATIVE_EXTRA (default off)",
+ "base": {
+  "source": "flashinfer 0.6.18.dev20260819, git 61a6c651872a7d3f2f6dcc1ced61633d8f8ba3dd (copy from the GLM serving image, diagnostics/glm53-full-20261008-survey-followup/indexer/image-flashinfer)",
+  "use": "offline tests and the sm_121a compile check only; the image build generates the module from the IMAGE's own FlashInfer csrc (anchors fail the build if they drift), and dsv41_pce.check_sources refuses a module whose inputs differ from the installed FlashInfer",
+  "pristine_copy": "base/ (SHA256SUMS)"
+ },
+ "generator": "gen_pce_sources.py (GENERATOR_VERSION 1)",
+ "changes": [
+  {
+   "file": "sparse_mla_sm120_prefill.cu -> gen/pce_prefill.cu",
+   "change": "dispatch_dsv4_dual: full-tile and general paths dispatch extra page sizes 128 / 256 (instead of 64 / 2); dispatch_v32 and dispatch_dsv4_single removed; sparse_mla_prefill_dispatch renamed pce_sparse_mla_prefill_dispatch and limited to the dual cache"
+  },
+  {
+   "file": "sparse_mla_sm120.cu -> gen/pce_paged_attention.cu",
+   "change": "SparseMlaSm120PagedAttention renamed PceSparseMlaSm120PagedAttention; refuses anything but main pages of 64 and extra pages of 128 / 256 before the launch"
+  },
+  {
+   "file": "gen/pce_binding.cu (new)",
+   "change": "exports dsv41_pce_paged_attention"
+  }
+ ],
+ "kernels": "unchanged: prefill_kernel.cuh is generic in PAGE_BLOCK_SIZE_EXTRA (block = idx / PBS, local = idx % PBS, data at block * stride + local * 576, scales at PBS * 576 + local * 8; the only PBSX-specific branch is the PBSX == 2 row XOR)",
+ "module": "JIT module dsv41_pce_sparse_mla_sm120_<module_tag>, built with FlashInfer's own nvcc flags into FLASHINFER_JIT_DIR (the serving container's /root/.cache, mounted from the host)"
+}
