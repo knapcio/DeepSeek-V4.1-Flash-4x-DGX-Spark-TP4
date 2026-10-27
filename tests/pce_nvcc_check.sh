@@ -8,14 +8,13 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; OUT="${1:?usage: pce_nvcc_check.sh OUT_DIR}"; mkdir -p "$OUT"
 F="$ROOT/runtime/flashinfer_pce"
-T=$(mktemp -d); mkdir -p "$T/inc/flashinfer/attention" "$T/gen"
-cp -R "$F/base/include_sparse_mla_sm120" "$T/inc/flashinfer/attention/sparse_mla_sm120"
-python3 "$F/gen_pce_sources.py" "$F/base" "$T/gen" > "$OUT/gen.txt" 2>&1 || { cat "$OUT/gen.txt"; rm -rf "$T"; exit 1; }
+T=$(mktemp -d); mkdir -p "$T/gen"
+python3 "$F/gen_pce_sources.py" "$F/base/csrc" "$F/base/include" "$T/gen" > "$OUT/gen.txt" 2>&1 || { cat "$OUT/gen.txt"; rm -rf "$T"; exit 1; }
 cp "$T/gen/manifest.json" "$OUT/manifest.json"
 FLAGS=(-std=c++17 -O3 -DNDEBUG -gencode arch=compute_121a,code=sm_121a --expt-relaxed-constexpr -Xptxas -v -c)
 FLAGS_C=(-std=c++17 -O3 -DNDEBUG -gencode arch=compute_121a,code=sm_121a --expt-relaxed-constexpr -c)
-INC=(-I "$T/inc" -I "$ROOT/tests/pce_stub")
-nvcc "${FLAGS[@]}" "${INC[@]}" "$F/base/sparse_mla_sm120_prefill.cu" -o "$T/stock.o" > "$OUT/ptxas-stock.txt" 2>&1; s=$?
+INC=(-I "$F/base/include" -I "$ROOT/tests/pce_stub")
+nvcc "${FLAGS[@]}" "${INC[@]}" "$F/base/csrc/sparse_mla_sm120_prefill.cu" -o "$T/stock.o" > "$OUT/ptxas-stock.txt" 2>&1; s=$?
 nvcc "${FLAGS[@]}" "${INC[@]}" "$T/gen/pce_prefill.cu" -o "$T/pce.o" > "$OUT/ptxas-pce.txt" 2>&1; p=$?
 nvcc "${FLAGS_C[@]}" "${INC[@]}" "$T/gen/pce_paged_attention.cu" -o "$T/orc.o" > "$OUT/orchestrator.txt" 2>&1; o=$?
 nvcc "${FLAGS_C[@]}" "${INC[@]}" "$T/gen/pce_binding.cu" -o "$T/bind.o" > "$OUT/binding.txt" 2>&1; b=$?

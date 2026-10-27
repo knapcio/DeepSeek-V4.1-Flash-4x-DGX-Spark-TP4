@@ -3,10 +3,10 @@
  "gate": "DSV41_PREFILL_NATIVE_EXTRA (default off)",
  "base": {
   "source": "flashinfer 0.6.18.dev20260819, git 61a6c651872a7d3f2f6dcc1ced61633d8f8ba3dd (copy from the GLM serving image, diagnostics/glm53-full-20261008-survey-followup/indexer/image-flashinfer)",
-  "use": "offline tests and the sm_121a compile check only; the image build generates the module from the IMAGE's own FlashInfer csrc (anchors fail the build if they drift), and dsv41_pce.check_sources refuses a module whose inputs differ from the installed FlashInfer",
-  "pristine_copy": "base/ (SHA256SUMS)"
+  "use": "offline tests, the sm_121a compile check and APPROVED_CLOSURE.json (the reviewed closure: both .cu inputs, csrc/tvm_ffi_utils.h, include/flashinfer/layout.cuh, every include/flashinfer/attention/sparse_mla_sm120 file). The image build refuses any other closure (REVIEW_sol K8 P2-1)",
+  "pristine_copy": "base/{csrc,include} (FlashInfer data layout subset, SHA256SUMS)"
  },
- "generator": "gen_pce_sources.py (GENERATOR_VERSION 1)",
+ "generator": "gen_pce_sources.py (GENERATOR_VERSION 2: closure check before the anchored edits; the module tag covers the closure)",
  "changes": [
   {
    "file": "sparse_mla_sm120_prefill.cu -> gen/pce_prefill.cu",
@@ -22,5 +22,5 @@
   }
  ],
  "kernels": "unchanged: prefill_kernel.cuh is generic in PAGE_BLOCK_SIZE_EXTRA (block = idx / PBS, local = idx % PBS, data at block * stride + local * 576, scales at PBS * 576 + local * 8; the only PBSX-specific branch is the PBSX == 2 row XOR)",
- "module": "JIT module dsv41_pce_sparse_mla_sm120_<module_tag>, built with FlashInfer's own nvcc flags into FLASHINFER_JIT_DIR (the serving container's /root/.cache, mounted from the host)"
+ "module": "compiled at image build (dsv41_pce build, FLASHINFER_CUDA_ARCH_LIST=12.1a, FlashInfer's own JIT spec and flags) to gen/dsv41_pce_sparse_mla_sm120_<module_tag>.so; module.json pins its sha256; serving loads only that file after re-checking the installed closure, the manifest and the sha256 (no JIT at boot)"
 }

@@ -33,6 +33,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PCE = ROOT / "runtime" / "flashinfer_pce"
 BASE = PCE / "base"
+B_CSRC, B_INC = BASE / "csrc", BASE / "include"
+APPROVED = PCE / "APPROVED_CLOSURE.json"
 CANARY = ROOT / "runtime" / "flash_mla_sm120.canary.py"
 # f744d83:runtime/flash_mla_sm120.canary.py (v2.6.1), the file the inserted block must be the only change to
 CANARY_F744D83_SHA = "2fe25ba5e2ff91f6028b6a32c315ba8875d8780b9341bae9411af1cc927885bf"
@@ -74,7 +76,7 @@ class Generator(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.out = self.tmp / "gen"
-        self.m = gen.generate(BASE, self.out)
+        self.m = gen.generate(B_CSRC, B_INC, self.out)
         self.pre = (self.out / "pce_prefill.cu").read_text()
         self.orc = (self.out / "pce_paged_attention.cu").read_text()
 
@@ -112,10 +114,10 @@ class Generator(unittest.TestCase):
 
     def test_kernels_and_rest_unchanged(self):
         """Outside the edited sites the generated files are the base text (line multiset difference is the edit)."""
-        base_pre = (BASE / "sparse_mla_sm120_prefill.cu").read_text()
+        base_pre = (B_CSRC / "sparse_mla_sm120_prefill.cu").read_text()
         head = base_pre[:base_pre.index("template <ModelType MT>\ninline bool dispatch_v32(")]
         self.assertTrue(self.pre.split("\n", 1)[1].startswith(head))
-        base_orc = (BASE / "sparse_mla_sm120.cu").read_text()
+        base_orc = (B_CSRC / "sparse_mla_sm120.cu").read_text()
         norm = self.orc.split("\n", 1)[1]
         norm = norm.replace("pce_sparse_mla_prefill_dispatch(", "sparse_mla_prefill_dispatch(")
         norm = norm.replace("PceSparseMlaSm120PagedAttention(", "SparseMlaSm120PagedAttention(")
@@ -128,59 +130,103 @@ class Generator(unittest.TestCase):
         m = json.loads((self.out / "manifest.json").read_text())
         self.assertEqual(m, self.m)
         self.assertEqual(m["inputs"]["sparse_mla_sm120_prefill.cu"],
-                         _sha((BASE / "sparse_mla_sm120_prefill.cu").read_bytes()))
+                         _sha((B_CSRC / "sparse_mla_sm120_prefill.cu").read_bytes()))
         for name, h in m["outputs"].items():
             self.assertEqual(_sha((self.out / name).read_bytes()), h)
         self.assertEqual(m["native_extra_page_block_sizes"], [128, 256])
-        again = gen.generate(BASE, self.tmp / "gen2")
+        again = gen.generate(B_CSRC, B_INC, self.tmp / "gen2")
         self.assertEqual(again["module_tag"], m["module_tag"])
 
-    def _mutated(self, fname, old, new):
+    def _mutated(self, fname, old, new, approve=True):
+        """A copy of the base with one edit; approve=True also approves the edited closure (to reach the anchors)."""
         d = self.tmp / "mut"
         shutil.rmtree(d, ignore_errors=True)
-        d.mkdir()
-        for f in ("sparse_mla_sm120_prefill.cu", "sparse_mla_sm120.cu"):
-            shutil.copy(BASE / f, d / f)
-        t = (d / fname).read_text()
+        shutil.copytree(BASE, d)
+        f = d / fname
+        t = f.read_text()
         self.assertIn(old, t)
-        (d / fname).write_text(t.replace(old, new))
-        return d
+        f.write_text(t.replace(old, new))
+        ap = self.tmp / "approved-mut.json"
+        files = gen.closure(d / "csrc", d / "include") if approve else json.loads(APPROVED.read_text())["files"]
+        ap.write_text(json.dumps({"flashinfer": "test", "files": files}))
+        return d, ap
 
     def test_anchor_drift_refuses(self):
         cases = [
-            ("sparse_mla_sm120_prefill.cu", "extra_page_block_size == 64 || extra_page_block_size == 2",
+            ("csrc/sparse_mla_sm120_prefill.cu", "extra_page_block_size == 64 || extra_page_block_size == 2",
              "extra_page_block_size == 64 || extra_page_block_size == 4"),
-            ("sparse_mla_sm120_prefill.cu", "      DISPATCH_FULLTILE_BY_NH_PBSX(2);", "      DISPATCH_FULLTILE_BY_NH_PBSX(4);"),
-            ("sparse_mla_sm120_prefill.cu", "  } else if (extra_page_block_size == 2) {",
+            ("csrc/sparse_mla_sm120_prefill.cu", "      DISPATCH_FULLTILE_BY_NH_PBSX(2);", "      DISPATCH_FULLTILE_BY_NH_PBSX(4);"),
+            ("csrc/sparse_mla_sm120_prefill.cu", "  } else if (extra_page_block_size == 2) {",
              "  } else if (extra_page_block_size == 4) {"),
-            ("sparse_mla_sm120_prefill.cu", "inline bool dispatch_v32(", "inline bool dispatch_v3x("),
-            ("sparse_mla_sm120_prefill.cu", "\nbool sparse_mla_prefill_dispatch(", "\nbool sparse_mla_prefill_dispatch2("),
-            ("sparse_mla_sm120_prefill.cu", "    case ModelType::GLM_NSA:\n      return dispatch_v32",
+            ("csrc/sparse_mla_sm120_prefill.cu", "inline bool dispatch_v32(", "inline bool dispatch_v3x("),
+            ("csrc/sparse_mla_sm120_prefill.cu", "\nbool sparse_mla_prefill_dispatch(", "\nbool sparse_mla_prefill_dispatch2("),
+            ("csrc/sparse_mla_sm120_prefill.cu", "    case ModelType::GLM_NSA:\n      return dispatch_v32",
              "    case ModelType::GLM_NSA:\n      return dispatch_dsv4_dual(0) || dispatch_v32"),
-            ("sparse_mla_sm120.cu", "void SparseMlaSm120PagedAttention(", "void SparseMlaSm120PagedAttn("),
-            ("sparse_mla_sm120.cu", "\"Unsupported sparse-MLA prefill configuration: \"", "\"Unsupported: \""),
-            ("sparse_mla_sm120.cu", "  const bool ok = sparse_mla_prefill_dispatch(", "  bool ok = sparse_mla_prefill_dispatch("),
+            ("csrc/sparse_mla_sm120.cu", "void SparseMlaSm120PagedAttention(", "void SparseMlaSm120PagedAttn("),
+            ("csrc/sparse_mla_sm120.cu", "\"Unsupported sparse-MLA prefill configuration: \"", "\"Unsupported: \""),
+            ("csrc/sparse_mla_sm120.cu", "  const bool ok = sparse_mla_prefill_dispatch(", "  bool ok = sparse_mla_prefill_dispatch("),
         ]
         for fname, old, new in cases:
             with self.subTest(old=old[:50]):
-                d = self._mutated(fname, old, new)
+                d, ap = self._mutated(fname, old, new)
                 with self.assertRaises(gen.AnchorError):
-                    gen.generate(d, self.tmp / "o")
+                    gen.generate(d / "csrc", d / "include", self.tmp / "o", ap)
+
+    def test_closure_drift_refuses(self):
+        """REVIEW_sol K8 P2-1: drift the anchors cannot see (an unanchored statement, a kernel header, the glue, the
+        file set) refuses against the approved closure; the committed approval is the vendored base."""
+        self.assertEqual(json.loads(APPROVED.read_text())["files"], gen.closure(B_CSRC, B_INC))
+        cases = [
+            ("csrc/sparse_mla_sm120_prefill.cu", "  dim3 grid(num_tokens * REPLICATE_H);",
+             "  dim3 grid(num_tokens * REPLICATE_H + 1);"),
+            ("include/flashinfer/attention/sparse_mla_sm120/common/kv_cache_io.cuh",
+             "(size_t)pbs * IO::IO_STRIDE +", "(size_t)pbs * IO::IO_STRIDE + 8 +"),
+            ("include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh",
+             "USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA == 2)",
+             "USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA >= 2)"),
+            ("csrc/tvm_ffi_utils.h", "#include <tvm/ffi/dtype.h>", "#include <tvm/ffi/dtype.h>\n#define X 1"),
+            ("include/flashinfer/layout.cuh", "#include <tuple>", "#include <tuple>\n#define Y 1"),
+        ]
+        for fname, old, new in cases:
+            with self.subTest(f=fname):
+                d, ap = self._mutated(fname, old, new, approve=False)
+                with self.assertRaisesRegex(gen.ClosureError, "not the approved one"):
+                    gen.generate(d / "csrc", d / "include", self.tmp / "o", ap)
+        d, ap = self._mutated("csrc/tvm_ffi_utils.h", "#include <tvm/ffi/dtype.h>", "#include <tvm/ffi/dtype.h>",
+                              approve=False)
+        (d / "include/flashinfer/attention/sparse_mla_sm120/common/extra.cuh").write_text("// new\n")
+        with self.assertRaisesRegex(gen.ClosureError, "unexpected"):
+            gen.generate(d / "csrc", d / "include", self.tmp / "o", ap)
+        (d / "include/flashinfer/attention/sparse_mla_sm120/common/extra.cuh").unlink()
+        (d / "include/flashinfer/attention/sparse_mla_sm120/arch/barrier.cuh").unlink()
+        with self.assertRaisesRegex(gen.ClosureError, "missing"):
+            gen.generate(d / "csrc", d / "include", self.tmp / "o", ap)
+
+    def test_tag_covers_the_closure(self):
+        """An approved but different kernel header gives the same generated .cu text and a DIFFERENT module tag."""
+        d, ap = self._mutated("include/flashinfer/attention/sparse_mla_sm120/common/kv_cache_io.cuh",
+                              "(size_t)pbs * IO::IO_STRIDE +", "(size_t)pbs * IO::IO_STRIDE + 8 +")
+        m2 = gen.generate(d / "csrc", d / "include", self.tmp / "o2", ap)
+        self.assertEqual(m2["outputs"], self.m["outputs"])
+        self.assertNotEqual(m2["module_tag"], self.m["module_tag"])
+        self.assertEqual(self.m["closure"], gen.closure(B_CSRC, B_INC))
 
     def test_cli(self):
-        r = subprocess.run([sys.executable, str(PCE / "gen_pce_sources.py"), str(BASE), str(self.tmp / "cli")],
+        r = subprocess.run([sys.executable, str(PCE / "gen_pce_sources.py"), str(B_CSRC), str(B_INC), str(self.tmp / "cli")],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("PCE GEN OK module_tag=" + self.m["module_tag"], r.stdout)
-        r = subprocess.run([sys.executable, str(PCE / "gen_pce_sources.py"), str(self.tmp / "nope"), str(self.tmp / "x")],
+        r = subprocess.run([sys.executable, str(PCE / "gen_pce_sources.py"), str(self.tmp / "nope"), str(B_INC),
+                            str(self.tmp / "x")],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 1)
         self.assertIn("PCE GEN FAIL", r.stderr)
-        d = self._mutated("sparse_mla_sm120_prefill.cu", "DISPATCH_BY_NH_PBSX(2);", "DISPATCH_BY_NH_PBSX(4);")
-        r = subprocess.run([sys.executable, str(PCE / "gen_pce_sources.py"), str(d), str(self.tmp / "y")],
-                           capture_output=True, text=True)
+        d, _ = self._mutated("csrc/sparse_mla_sm120_prefill.cu", "DISPATCH_BY_NH_PBSX(2);", "DISPATCH_BY_NH_PBSX(4);",
+                             approve=False)
+        r = subprocess.run([sys.executable, str(PCE / "gen_pce_sources.py"), str(d / "csrc"), str(d / "include"),
+                            str(self.tmp / "y")], capture_output=True, text=True)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("anchor", r.stderr)
+        self.assertIn("not the approved one", r.stderr)
 
 
 @contextlib.contextmanager
@@ -236,21 +282,49 @@ class Loader(unittest.TestCase):
     def test_check_sources(self):
         tmp = Path(tempfile.mkdtemp())
         try:
-            gen.generate(BASE, tmp / "g")
-            m = pce.check_sources(tmp / "g", BASE)
+            gen.generate(B_CSRC, B_INC, tmp / "g")
+            m = pce.check_sources(tmp / "g", B_CSRC, B_INC)
             self.assertEqual(len(m["module_tag"]), 12)
             p = tmp / "g" / "pce_prefill.cu"
             p.write_text(p.read_text() + "\n")
             with self.assertRaisesRegex(RuntimeError, "does not match its manifest"):
-                pce.check_sources(tmp / "g", BASE)
-            gen.generate(BASE, tmp / "g")
+                pce.check_sources(tmp / "g", B_CSRC, B_INC)
+            gen.generate(B_CSRC, B_INC, tmp / "g")
+            # P2-1: the installed FlashInfer drifts after generation, in an unanchored kernel header
             other = tmp / "fi"
-            other.mkdir()
-            for f in ("sparse_mla_sm120_prefill.cu", "sparse_mla_sm120.cu"):
-                shutil.copy(BASE / f, other / f)
-            (other / "sparse_mla_sm120.cu").write_text((other / "sparse_mla_sm120.cu").read_text() + "// x\n")
+            shutil.copytree(BASE, other)
+            h = other / "include/flashinfer/attention/sparse_mla_sm120/common/xv_rope_mma.cuh"
+            h.write_text(h.read_text() + "// drift\n")
             with self.assertRaisesRegex(RuntimeError, "is not the source the module was generated"):
-                pce.check_sources(tmp / "g", other)
+                pce.check_sources(tmp / "g", other / "csrc", other / "include")
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_check_module(self):
+        """P2-1: the served .so is the prebuilt one: module.json present, its tag the manifest's, the .so sha pinned."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            g = tmp / "g"
+            m = gen.generate(B_CSRC, B_INC, g)
+            with self.assertRaisesRegex(RuntimeError, "no prebuilt module record"):
+                pce.check_module(g, m)
+            name = pce.module_name(m)
+            so = g / f"{name}.so"
+            so.write_bytes(b"\x7fELF fake module")
+            mj = {"name": name, "module_tag": m["module_tag"], "so_sha256": _sha(so.read_bytes())}
+            (g / "module.json").write_text(json.dumps(mj))
+            self.assertEqual(pce.check_module(g, m), so)
+            so.write_bytes(b"\x7fELF another module")
+            with self.assertRaisesRegex(RuntimeError, "sha256 is not module.json"):
+                pce.check_module(g, m)
+            so.write_bytes(b"\x7fELF fake module")
+            (g / "module.json").write_text(json.dumps({**mj, "module_tag": "000000000000"}))
+            with self.assertRaisesRegex(RuntimeError, "is not this manifest"):
+                pce.check_module(g, m)
+            (g / "module.json").write_text(json.dumps(mj))
+            so.unlink()
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                pce.check_module(g, m)
         finally:
             shutil.rmtree(tmp)
 
@@ -273,9 +347,11 @@ class AdapterText(unittest.TestCase):
             i = t.index("COPY runtime/flash_mla_sm120.canary.py ")
             j = t.index("COPY runtime/flashinfer_pce/dsv41_pce.py "
                         "/sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_pce.py")
-            k = t.index("gen_pce_sources.py \"$FI_CSRC\" /opt/dsv41/runtime/flashinfer_pce/gen")
-            self.assertTrue(i < j < k, name)
-            self.assertIn("p.check_sources(Path(p.DEFAULT_SRC)", t)
+            k = t.index("gen_pce_sources.py $FI_DIRS /opt/dsv41/runtime/flashinfer_pce/gen")
+            b = t.index("FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_pce build")
+            v = t.index("python3 -m sglang.kernels.ops.attention.dsv41_pce verify")
+            self.assertTrue(i < j < k < b < v, name)
+            self.assertIn("APPROVED_CLOSURE.json /opt/dsv41/runtime/flashinfer_pce/", t)
         self.assertEqual(pce.DEFAULT_SRC, "/opt/dsv41/runtime/flashinfer_pce/gen")
 
 
