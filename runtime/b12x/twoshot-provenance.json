@@ -46,7 +46,8 @@
   "a two-shot op after the 32-bit sequence wrapped fails closed (ready words, pipe flags and pipe_done compare equal to seq, exact until a wrap); upstream instead stops every op at INT32_MAX, which would stop a long-running server; one-shot ops keep the stock behaviour",
   "not ported from the same PR: the neighbor-ring transport, the variable-length all-gather and the sequence-space exhaustion stop",
   "every kernel of the copy (one-shot, both all-gathers, two-shot) poisons the runtime at sequence 0 before touching a flag or payload (error word and peer 0xFFFFFFFF, poison 0xFFFFFFFF, epoch frozen); the host refuses further collectives once the doorbell sequence is within 2^20 of the wrap (sticky), so in practice no kernel reaches sequence 0",
-  "ROCE_TWOSHOT_ROUTE is logged once per (threshold, rows, bytes, dtype), so each in-boot A/B variant's routed shapes are provable"
+  "ROCE_TWOSHOT_ROUTE is logged once per (threshold, rows, bytes, dtype), so each in-boot A/B variant's routed shapes are provable",
+  "2026-10-28 idle parking (DSV41_ROCE_IDLE_PARK=1, off by default; independent implementation, idea: idle RDMA proxy parking (uchkw)): _roce_idle_park.h (new) and seven '#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK' blocks in _roce_proxy.c (futex park in the idle branch, kick in roce_stop, roce_park_* API); _proxy.py builds with -DROCE_IDLE_PARK=1 under its own cache name only when IDLE_PARK is set. Without the define the source minus those blocks is f744d83's byte for byte and the compiled .text/.rodata/.data/.dynsym are identical (tests/test_roce_idle_park.py)"
  ],
  "verified_offline_2026_10_25": [
   "tests/test_roce_twoshot.py: production package hashes; copy kernels differ from production only by the kind word; kernel/proxy ctrl words; owner reduction uses the one-shot helpers in rank order; 4-rank byte-level protocol model bit-identical to the one-shot (uneven, empty shards, 64-chunk cap); routing; adapter; overlay selection",

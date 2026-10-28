@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **Idle parking for the RoCE proxy threads, `DSV41_ROCE_IDLE_PARK=1`, off by default.** Each TP rank's
+  RDMA proxy thread spins `ROCE_IDLE_SPINS` polls after its last doorbell and then polls once per
+  `nanosleep(20 us)` for as long as the engine is idle, about 10^4 wakeups a second per rank. With the
+  gate on it blocks on a futex instead, and only while the scheduler itself is idle:
+  `Scheduler.on_idle` marks idle (before `--sleep-on-idle`'s poll), `process_input_requests` with
+  requests and `run_batch` (before every forward, so before its first collective) wake it with one
+  futex wake. The proxy parks after `DSV41_ROCE_IDLE_PARK_MS` (default 1000) of marked idle with no
+  doorbell and never with RDMA writes in flight; a decode never parks (`run_batch` clears the mark,
+  and `on_idle` runs only without a batch). A parked proxy re-checks its doorbell every
+  `DSV41_ROCE_IDLE_PARK_POLL_MS` (default 20), so a missed wake costs at most that, never
+  correctness: the existing doorbell catch-up posts every pending op in order. Rank-safe: every
+  rank wakes its own proxy before its own kernels, and a collective needs every rank's kernel.
+  Needs the v2.6 transport (`DSV41_ROCE_TWOSHOT=1`); with `b12x.comm.roce` or `roce_ring` the
+  engine refuses to start. Gate unset: nothing is imported, and the proxy builds with the v2.6
+  command and cache name; the additions are seven `#if ROCE_IDLE_PARK` blocks plus the new
+  `_roce_idle_park.h`, and without the define the compiled `.text`/`.rodata`/`.data`/`.dynsym` are
+  identical to v2.6.1's. Receipts: `DSV41_ROCE_IDLE_PARK: armed`, `DSV41_ROCE_IDLE_PARK rank=R
+  proxy_tid=T`, and per idle period `DSV41_ROCE_IDLE_PARK_STATS` (parks, wakes, backstop polls,
+  late doorbells, wake latency, wake-to-first-collective lead). Tests: `tests/test_roce_idle_park.py`
+  (gate-off identity, adapter and scheduler hooks, SGLang's event loops), with
+  `tests/roce_idle_park/park_unit.c` (the state machine, a lost-wakeup race of 20,000 rounds) and
+  `park_stress.c` (four real proxy loops over an in-process fake RDMA, ranks waking in random order,
+  wakes skipped on one rank). Not yet measured on the fleet; the A / X / A' kit is in the workspace.
+  Credits: idea: idle RDMA proxy parking (uchkw), independent implementation.
+
 ## 2026-10-28 v2.6.2
 
 A correctness fix in the routed-MoE kernel, a memory fix in prefill attention and a latency fix for short requests
