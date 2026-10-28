@@ -1,21 +1,57 @@
 # Changelog
 
-## Unreleased
+## 2026-10-28 v2.6.2
 
-- Fixed (pending the fleet gate), backported from b12x: a CTA shared-memory race in b12x_next's routed-MoE dynamic kernel
-  (`moe/_shared/kernels/dynamic.py`, the producer loop). The CTA leader stores each batch claim in one shared
-  word (`ctrl[7]`); a barrier orders that store before every thread's read, but nothing ordered the reads before
-  the NEXT iteration's store, and the loop's back edge has no barrier. A warp that is late to its read can
-  therefore see the next batch's claim: tokens skipped or routed twice, or an early stop. The new patch
-  `scripts/b12x_next-claim-barrier.patch` is **Martin Vit**'s fix from b12x commit `d7937d7f` (2026-10-06, after
-  our pinned `a7d7d29b`; b12x now lives in flashinfer-ai/flashinfer, `flashinfer/experimental/b12x`), verbatim:
-  one CTA barrier right after the claim read (every thread, once per producer iteration). The same commit's
-  deterministic shared-activation gather fix serves the monolithic in-kernel FC1 path, which our
-  specializations do not compile (their external phase-1 kernel already divides by top-k), so it is not
-  carried. Registers, spills and the FC1 / FC2 kernels are unchanged at sm_121a; the dynamic
-  kernel gains one `BAR.SYNC` per iteration. `tests/test_b12x_next_claim_barrier.py`: an exhaustive interleaving
-  model (the stock loop has a counterexample, the barrier closes it) and the source pin. `SOURCE_PATCH`
-  da662ccc7e2372b5 -> 5555496ebd40f308. Found independently in an offline racecheck / SASS analysis.
+A correctness fix in the routed-MoE kernel and a memory fix in prefill attention. The production profile in
+`.env.tp4.example` adds `DSV41_PREFILL_NATIVE_EXTRA=1`; nothing else in it changes.
+
+- **Fixed: a CTA shared-memory race in the routed-MoE dynamic kernel** (`runtime/b12x_next`,
+  `moe/_shared/kernels/dynamic.py`, the producer loop). The CTA leader stores each batch claim in one shared word
+  (`ctrl[7]`). A barrier orders that store before every thread reads it, but nothing ordered those reads before the
+  next iteration's store, and the loop's back edge has no barrier. A warp that reads its claim late can therefore see
+  the next batch's claim, and tokens are then skipped or routed twice, or the loop stops early.
+  - **The fix** is a backport of **Martin Vit**'s b12x commit `d7937d7f` (2026-10-06, after our pinned `a7d7d29b`),
+    applied verbatim: one CTA barrier right after the claim read (`scripts/b12x_next-claim-barrier.patch`). b12x is now
+    developed in flashinfer-ai/flashinfer under `flashinfer/experimental/b12x`. We found the race independently in an
+    offline racecheck and SASS analysis before finding the upstream commit.
+  - **Not carried:** the same commit also fixes the deterministic shared-activation gathers of the monolithic in-kernel
+    FC1 path, which our specializations do not compile (their external phase-1 kernel already divides by top-k).
+  - **Code generation** at sm_121a: registers, spills and the FC1 / FC2 kernels are unchanged; the dynamic kernel gains
+    one `BAR.SYNC` per producer iteration.
+  - **Tests:** `tests/test_b12x_next_claim_barrier.py` holds an exhaustive interleaving model (the stock loop has a
+    counterexample with two warps; the barrier closes it) and pins the source. `SOURCE_PATCH` changes from
+    da662ccc7e2372b5 to 5555496ebd40f308.
+  - **Fleet A / X / A'** (2026-10-27): every T = 0 output of 75 qeval prompts (top-20 logprobs and greedy, c1, three
+    passes per boot) equals a v2.6 output, and load c1 / c4 / c16 run at 0.999 / 1.002 / 1.011 of the slower v2.6 boot.
+- **New in the production profile: prefill reads the extra cache's native pages** (`DSV41_PREFILL_NATIVE_EXTRA=1`;
+  `runtime/flashinfer_pce/`, read by `runtime/flash_mla_sm120.canary.py`).
+  - **Before.** Stock FlashInfer instantiates the SM120 sparse-MLA dual-cache prefill only for extra pages of 64 / 2
+    tokens. The adapter therefore copied the whole compressed extra pool into a persistent 64-token split buffer, about
+    3 GB per rank at the v2.6 pool, allocated after the KV pool is sized, and ran a page-mark and split pass on every
+    prefill call.
+  - **Now.** A separate module reads SGLang's own 128 / 256-token pages in place. FlashInfer's `prefill_kernel.cuh` is
+    generic in the page size, so the kernels are the stock templates; only the dispatch is opened to 128 / 256 and the
+    symbols are renamed. The module is generated at image build from the image's own `sparse_mla_sm120` sources: the
+    build refuses unless the whole source closure equals `APPROVED_CLOSURE.json` (FlashInfer 0.6.18, git 69ff11fc,
+    23 files). It is then compiled for sm_121a in the build and served with its sha256 pinned (no JIT at boot). The SWA
+    source is still split, and 64 / 2-token extra pages keep the stock module.
+  - **Tests:** `tests/test_prefill_native_extra.py` (CPU), `tests/pce_nvcc_check.sh` (20 kernels, registers and spills
+    equal to the stock 64-token twins) and `tests/gpu_test_prefill_native_extra.py` (OFF vs ON bit-identical on
+    42 eager and edge cases and 30 CUDA-graph replays of the wide-verify route).
+  - **Fleet A / X / A'** (2026-10-28; the coordinator's ruling over two kit faults in the receipt):
+    - every T = 0 output (lp-c1 and greedy-c1) equals a v2.6 output, and the module served the 128- and 256-token
+      pages;
+    - **persistent memory allocated after pool sizing drops by 2.45-2.76 GiB per node**;
+    - **cold 1M prefill takes 194.4 s against 205.3 / 201.7 s on v2.6** (-5.2 % against the first boot); 64k and 388K
+      are within noise;
+    - c16 load is 1.007 x the slower v2.6 boot;
+    - no NVRM `NV_ERR_NO_MEMORY` line.
+  - **Credits:** the SM120 sparse-MLA kernels are FlashInfer's: **Gabriel Wu** (flashinfer-ai/flashinfer #3395 and the
+    later refactors), with fixes from **Ka-Hyun Nam** (#4732, issue #3700) and the other contributors to
+    `sparse_mla_sm120`. Origin and changes are in `runtime/flashinfer_pce/PROVENANCE.json` and NOTICE.
+
+<!-- v2.6.2 release gate: filled in from the receipts before the PR (diagnostics RUNBOOK). -->
+Release gate (v2.6 vs v2.6.2 vs v2.6, fresh boots, production profile): PENDING.
 
 ## 2026-10-27 v2.6.1
 
