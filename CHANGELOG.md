@@ -2,8 +2,9 @@
 
 ## 2026-10-28 v2.6.2
 
-A correctness fix in the routed-MoE kernel and a memory fix in prefill attention. The production profile in
-`.env.tp4.example` adds `DSV41_PREFILL_NATIVE_EXTRA=1`; nothing else in it changes.
+A correctness fix in the routed-MoE kernel, a memory fix in prefill attention and a latency fix for short requests
+that arrive during a long prefill. The production profile in `.env.tp4.example` adds
+`DSV41_PREFILL_NATIVE_EXTRA=1` and `DSV41_PREFILL_BYPASS_SOLO=1`; nothing else in it changes.
 
 - **Fixed: a CTA shared-memory race in the routed-MoE dynamic kernel** (`runtime/b12x_next`,
   `moe/_shared/kernels/dynamic.py`, the producer loop). The CTA leader stores each batch claim in one shared word
@@ -49,6 +50,40 @@ A correctness fix in the routed-MoE kernel and a memory fix in prefill attention
   - **Credits:** the SM120 sparse-MLA kernels are FlashInfer's: **Gabriel Wu** (flashinfer-ai/flashinfer #3395 and the
     later refactors), with fixes from **Ka-Hyun Nam** (#4732, issue #3700) and the other contributors to
     `sparse_mla_sm120`. Origin and changes are in `runtime/flashinfer_pce/PROVENANCE.json` and NOTICE.
+
+- **New in the production profile: a short request that arrives during a long prefill runs in a pass of its own**
+  (`DSV41_PREFILL_BYPASS_SOLO=1`, on top of the existing `DSV41_PREFILL_BYPASS=256`; `adapter/prefill_bypass.py`).
+  - **Before.** The bypass admitted a short request next to the long prompt's in-flight 8192-token chunk, so the short
+    request's first token waited for that whole chunk pass: about 1.9 s at 93K-128K.
+  - **Now.** The short request runs in a prefill pass of its own (one per pass, a batch-size-1 extend as on an idle
+    server; a second one takes the next solo pass). The long prompt is parked for that pass (the engine's parked-chunk
+    state: empty extend range, nothing stashed, no in-flight chunk counted, the batch built without it) and resumes
+    alone in the next pass with the same chunk, so its chunks, boundaries and numerics are those of an idle run. Solo
+    and chunk passes alternate, so the long prompt is never starved. A final chunk is parked like any other, with the
+    bypass admission contract kept beside it (the cumulative fresh-token debit, no partial admission: a short request
+    that would need chunking is skipped). The interval cadence is unchanged.
+  - **Rank-invariant:** every decision reads replicated scheduler state only (the parked flag lives on the request), so
+    all ranks build the same batch. Each solo pass and each resume logs one `DSV41_SOLO_RECEIPT` JSON line (long rid,
+    prefix / total, the batch's rids and ranges), the same on every rank. Same pinned `_get_new_batch_prefill_raw` /
+    `PrefillAdder` sources and sha pins as the bypass; with the flag unset or 0 the patched function is v2.6.1's byte
+    for byte.
+  - **Tests:** `tests/test_prefill_bypass_solo.py` (run in both canary image builds): a pass simulator over the lifted
+    pinned scheduler (long prompt plus short arrivals, final chunk, continuous arrivals, rank invariance, page-256
+    final-chunk admission regressions, receipts), the off path against a v2.6.1 fixture, and refusal on anchor drift.
+  - **Fleet A / X / A'** (2026-10-28, v2.6 / v2.6 + solo / v2.6, fresh boots, KV pool pinned, abliterated checkpoint
+    on all three):
+    - **time to first token of a short request sent 1 s into a cold prefill: 0.42 s against 1.89-1.92 s** (93K and
+      128K, median of three each);
+    - on every judged run the long prompt's output tokens and the short reply equal their idle runs, and every T = 0
+      qeval output (top-20 logprobs and greedy, c1) equals one of the two v2.6 boots';
+    - cold prefill alone is unchanged (93K: 14.54 s against 14.65 / 14.57 s; 388K: 65.03 s against 64.93 /
+      64.81 s); the short request's total time, the long prompt's time and the decode gaps of a stream running beside
+      them stayed within 1.10 x, 1.03 x + 0.5 s and 1.25 x of the slower v2.6 boot;
+    - the receipts are the same sequence on all four ranks; no NVRM `NV_ERR_NO_MEMORY` line.
+  - **Credits:** our own design on top of our bypass. The idea draws on **Christopher Owen**'s late-admission and
+    prefill-interleaving work in [spark-ds41f](https://github.com/christopherowen/spark-ds41f), and the measurement
+    follows the `mixed_probe` shape of **James Meadlock**'s J-M Recipes (a short streaming chat sent 1 s after a cold
+    long prompt).
 
 <!-- v2.6.2 release gate: filled in from the receipts before the PR (diagnostics RUNBOOK). -->
 Release gate (v2.6 vs v2.6.2 vs v2.6, fresh boots, production profile): PENDING.

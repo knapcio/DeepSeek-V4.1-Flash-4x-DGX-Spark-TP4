@@ -2,9 +2,29 @@
 
 Only the pinned scheduler candidate loop and PrefillAdder are adapted. Token
 memory accounting remains with the engine. The disabled path mutates nothing.
+
+DSV41_PREFILL_BYPASS_SOLO=1 (opt-in, needs DSV41_PREFILL_BYPASS): a "solo short
+pass". When the bypass scan admits short requests while a long prompt is being
+chunked, the long prompt is parked for that one pass (the engine's own parked-
+chunk state: extend range empty, nothing to stash) and the pass carries only the
+short request. The next pass resumes the long prompt with the same chunk it
+would have run, alone (no admission), so the long prompt is computed exactly as
+on an idle server. A solo pass carries ONE short request (a plain bs-1 extend,
+as on an idle server); a second waiting short request takes the next solo pass.
+The two alternate: at most one solo pass between two chunk passes. The solo
+admission keeps the bypass contract beside a final chunk too (the cumulative
+fresh-token debit and no partial admission: a candidate that would need
+chunking is skipped), and a pass that created a new chunked request never
+parks. Every decision reads only replicated scheduler state (queue, request
+fields, the parked flag stored on the request), so all TP ranks build the same
+batch. Each solo pass and each resume logs one DSV41_SOLO_RECEIPT line (JSON:
+event, long rid, prefix / total tokens, the batch's rids and extend lengths),
+the same on every rank: the window's evidence that the solo pass ran. Off
+(unset or 0): the patched source is the bypass one, byte for byte.
 """
 import hashlib
 import inspect
+import json
 import logging
 import os
 import textwrap
@@ -44,6 +64,94 @@ def bypass_active(scheduler):
             and not scheduler.enable_unified_cache_external_linker)
 
 
+# Solo short pass patches, applied on top of the bypass patches (anchors in the
+# dedented pinned source after the bypass rewrite).
+SOLO_PATCHES = [
+    ('    if self.chunked_req is not None:\n'
+     '        self.chunked_req.init_next_round_input()\n',
+     '    # Solo short pass: the long prompt in flight before this pass, and\n'
+     '    # whether the previous pass parked it (then it runs now, alone).\n'
+     '    _dsv41_long = self.chunked_req\n'
+     '    _dsv41_resume = _dsv41_long is not None and getattr(_dsv41_long, "_dsv41_solo_parked", False)\n'
+     '    _dsv41_solo_pass = False\n'
+     '    if _dsv41_long is not None:\n'
+     '        _dsv41_long._dsv41_solo_parked = False\n'
+     '    if self.chunked_req is not None:\n'
+     '        self.chunked_req.init_next_round_input()\n'),
+    ('    _dsv41_scan = _dsv41_scan and self.chunked_req is not None\n',
+     '    # Solo: also scan beside a final chunk (it is parked like any other), never\n'
+     '    # in the pass that resumes a parked long prompt.\n'
+     '    _dsv41_scan = _dsv41_scan and _dsv41_long is not None and not _dsv41_resume\n'),
+    ('        if _dsv41_scan and _dsv41_bypass_scanned >= _dsv41_scan_limit:\n',
+     '        if _dsv41_resume or (_dsv41_scan and any(r is not _dsv41_long for r in adder.can_run_list)):\n'
+     '            # resume pass: the long prompt alone; solo pass: one short request\n'
+     '            break\n'
+     '        if _dsv41_scan and _dsv41_bypass_scanned >= _dsv41_scan_limit:\n'),
+    # Beside a final chunk self.chunked_req is already None here; the solo scan
+    # must still go through the bypass admission (cumulative debit, no partial
+    # admission), so it reports the long prompt as the chunked request.
+    ('            has_chunked_req=(self.chunked_req is not None),\n',
+     '            has_chunked_req=(self.chunked_req is not None or bool(_dsv41_scan)),\n'),
+    ('    # Update waiting queue\n',
+     '    if _dsv41_resume:\n'
+     '        _dsv41_solo_receipt("resume", _dsv41_long, adder.can_run_list)\n'
+     '    if (_dsv41_long is not None and _dsv41_scan and adder.new_chunked_req is None\n'
+     '            and any(r is not _dsv41_long for r in adder.can_run_list)):\n'
+     '        # Park the long prompt for this pass: drop it from the batch, leave\n'
+     '        # its extend range empty (nothing new to stash, the next pass rebuilds\n'
+     '        # the same chunk from the same prefix), keep it as the chunked request.\n'
+     '        adder.can_run_list = [r for r in adder.can_run_list if r is not _dsv41_long]\n'
+     '        _dsv41_long.set_extend_range(len(_dsv41_long.prefix_indices), len(_dsv41_long.prefix_indices))\n'
+     '        _dsv41_long._dsv41_solo_parked = True\n'
+     '        self.chunked_req = _dsv41_long\n'
+     '        _dsv41_solo_pass = True\n'
+     '        _dsv41_solo_receipt("pass", _dsv41_long, adder.can_run_list)\n\n'
+     '    # Update waiting queue\n'),
+    ('    if self.chunked_req is not None:\n'
+     '        self.chunked_req.inflight_middle_chunks += 1\n',
+     '    if self.chunked_req is not None and not _dsv41_solo_pass:\n'
+     '        self.chunked_req.inflight_middle_chunks += 1\n'),
+    ('        chunked_req=self.chunked_req,\n    )\n\n'
+     '    new_batch.contains_last_prefill_chunk = (\n'
+     '        self.chunked_req is None or len(can_run_list) != 1\n    )\n',
+     '        chunked_req=None if _dsv41_solo_pass else self.chunked_req,\n    )\n\n'
+     '    new_batch.contains_last_prefill_chunk = (\n'
+     '        _dsv41_solo_pass or self.chunked_req is None or len(can_run_list) != 1\n    )\n'),
+]
+_SOLO_ON = ('1', 'on', 'true', 'yes')
+_SOLO_OFF = ('', '0', 'off', 'false', 'no')
+
+
+def solo_requested(environ=os.environ):
+    """True / False for DSV41_PREFILL_BYPASS_SOLO; None for an unknown value (refuse)."""
+    raw = (environ.get('DSV41_PREFILL_BYPASS_SOLO') or '').strip().lower()
+    if raw in _SOLO_ON:
+        return True
+    if raw in _SOLO_OFF:
+        return False
+    return None
+
+
+def solo_receipt(event, long, reqs):
+    """One log line per solo pass / resume, built from replicated request state only (no time, no rank)."""
+    try:
+        logger.warning('DSV41_SOLO_RECEIPT %s', json.dumps({
+            'event': event, 'long': str(long.rid), 'prefix': len(long.prefix_indices),
+            'total': len(long.full_untruncated_fill_ids),
+            'batch': [[str(r.rid), int(r.extend_range.start), int(r.extend_range.end)] for r in reqs]},
+            sort_keys=True))
+    except Exception:  # noqa: BLE001 - evidence only; never disturb the scheduler
+        pass
+
+
+def apply_solo(source):
+    for old, new in SOLO_PATCHES:
+        if source.count(old) != 1:
+            raise ValueError('solo anchor drift')
+        source = source.replace(old, new)
+    return source
+
+
 def install(module):
     raw = os.environ.get('DSV41_PREFILL_BYPASS', '').strip()
     if not raw:
@@ -63,6 +171,10 @@ def install(module):
     except ValueError:
         logger.warning('DSV41_PREFILL_BYPASS: refusing to arm; '
                        'DSV41_PREFILL_BYPASS_SCAN must be a positive candidate limit')
+        return False
+    solo = solo_requested()
+    if solo is None:
+        logger.warning('DSV41_PREFILL_BYPASS: refusing to arm; DSV41_PREFILL_BYPASS_SOLO must be 0 or 1')
         return False
     cls = getattr(module, 'Scheduler', None)
     adder_cls = getattr(module, 'PrefillAdder', None)
@@ -115,9 +227,13 @@ def install(module):
             if source.count(old) != 1:
                 raise ValueError('candidate-loop anchor drift')
             source = source.replace(old, new)
+        if solo:
+            source = apply_solo(source)
         namespace = dict(original_raw.__globals__, _dsv41_bypass_active=bypass_active,
                          _dsv41_fresh_tokens=fresh_tokens, _dsv41_limit=limit,
                          _dsv41_scan_limit=scan_limit)
+        if solo:
+            namespace['_dsv41_solo_receipt'] = solo_receipt
         exec(compile('from __future__ import annotations\n' + source,
                      '<dsv41-prefill-bypass>', 'exec'), namespace)
         patched_raw = namespace['_get_new_batch_prefill_raw']
@@ -167,7 +283,12 @@ def install(module):
     adder_cls.add_one_req = add
     cls._get_new_batch_prefill_raw = patched_raw
     cls._dsv41_prefill_bypass = True
+    if solo:
+        cls._dsv41_prefill_bypass_solo = True
     logger.warning('DSV41_PREFILL_BYPASS armed: at most %d total fresh tokens and %d '
                    'candidates scanned per in-flight chunk pass; engine token-pool '
                    'admission retained; fleet qualification pending', limit, scan_limit)
+    if solo:
+        logger.warning('DSV41_PREFILL_BYPASS_SOLO armed: one admitted short request runs in a pass of '
+                       'its own; the parked long prompt resumes alone in the next pass')
     return True
