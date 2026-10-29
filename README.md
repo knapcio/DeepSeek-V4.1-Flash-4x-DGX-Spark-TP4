@@ -66,8 +66,7 @@ are those of an idle run. The passes alternate, so the long prompt is never star
   the long prompt's tokens and the short reply equal their idle runs; cold 388K prefill unchanged (65.0 s against
   64.9 / 64.8 s).
 
-<!-- v2.6.2 release gate: filled in from the receipts before the PR. -->
-Release gate (v2.6 vs v2.6.2 vs v2.6, fresh boots, production profile): PENDING.
+Release gate (v2.6 vs v2.6.2 vs v2.6, fresh boots, production profile, official 1017, KV pinned at 4,194,304, 2026-10-29): speedbench full c1 88.53 / 88.38 / 88.37, c4 131.17 / 130.72 / 130.12, c16 207.67 / 207.62 / 206.03 tok/s; cold prefill 64K 6029 / 6054 / 6033 and 1M 4932 / 5310 / 4940 tok/s (+7.7 %); short-reply TTFT during a 93K / 128K prefill 1.90 / 0.43 / 1.90 s and 1.90 / 0.42 / 1.89 s; 388K prefill 65.3 / 63.3 / 64.9 s; qeval 71 / 71 / 71 with no answer outside the controls, KLD within noise, 1M needle found in all three; lowest head MemAvailable 4.2 / 9.7 / 7.0 GiB and NVRM out-of-memory log lines 155 / 1 / 133 over the boot.
 
 **Fixed: logprob decode hang.** Images built from `57a9888` and earlier main commits hang every rank on a greedy native `/generate` with `return_logprob` on long code prompts. The cause was the SGLang #45251 backport, now removed; see the CHANGELOG.
 
