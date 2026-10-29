@@ -3584,6 +3584,9 @@ class MoEDynamicKernelBackend:
                 _st_shared_i32(ctrl_base_addr + Int32(28), batch_base)
             cute.arch.sync_threads()
             batch_base = _ld_shared_i32(ctrl_base_addr + Int32(28))
+            # All warps retain the claim before the leader can reuse its slot.
+            # Inactive tail warps may advance ahead of token-packing warps.
+            cute.arch.sync_threads()
             producer_limit = total_pairs
             if cutlass.const_expr(self.share_input_across_experts):
                 producer_limit = num_tokens

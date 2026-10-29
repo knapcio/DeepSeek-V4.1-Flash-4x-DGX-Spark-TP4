@@ -31,6 +31,18 @@ Third-party components and their licences:
   changes: runtime/b12x/roce_ring-provenance.json. scripts/ring_mesh/plan.py drives
   sparkring's fabric planner and the units run sparkring's RDMA-TX marker; neither is
   vendored here (both come from a sparkring checkout, Apache License 2.0).
+- runtime/b12x_next is local-inference-lab/b12x (Luke Alonso and Jason / original-el8)
+  at commit a7d7d29b2ef8869086e0ceaa787321f17544e3c9, renamed b12x -> b12x_next by
+  scripts/build_b12x_next.sh so it can sit beside runtime/b12x; Apache License 2.0
+  (runtime/b12x_next/LICENSE). Local changes are the patches that script applies, in
+  order (scripts/b12x_next-*.patch; their combined sha256 prefix is
+  runtime/b12x_next/b12x_next/SOURCE_PATCH): compact-n64-m64, prequant-input,
+  barrier-zero, det-triton-planner and claim-barrier. claim-barrier is a backport
+  of b12x commit d7937d7fc2e5511a0b61eb3572cd149f563f9b4f by Martin Vit (a CTA
+  barrier after the dynamic kernel's producer-loop batch-claim read, closing a
+  shared-memory reuse race on ctrl[7]); b12x development continues in
+  flashinfer-ai/flashinfer (flashinfer/experimental/b12x, Apache License 2.0).
+  The changes are distributed under the same licence.
 - runtime/b12x/b12x/comm/roce_twoshot is a copy of runtime/b12x/b12x/comm/roce with the
   pipelined two-shot all-reduce of flashinfer-ai/flashinfer PR 6915 by Luke Alonso (head
   effeb496, flashinfer/experimental/b12x/comm/roce, itself local-inference-lab/b12x's
@@ -38,6 +50,15 @@ Third-party components and their licences:
   2025-2026 NVIDIA; Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/).
   Origin and local changes: runtime/b12x/twoshot-provenance.json. It is opt-in
   (DSV41_ROCE_TWOSHOT=1); runtime/b12x/b12x/comm/roce is unchanged.
+- runtime/flashinfer_pce/base is an unmodified copy of FlashInfer's SM120 sparse-MLA sources
+  (flashinfer 0.6.18, git 69ff11fc, as installed in the DS v2.6 image; NVIDIA, BSD-3-Clause,
+  headers retained), kept for
+  the offline tests and the approved source closure of runtime/flashinfer_pce/gen_pce_sources.py
+  (csrc/tvm_ffi_utils.h and include/flashinfer/layout.cuh are FlashInfer's, Apache License 2.0).
+  That generator derives the opt-in DSV41_PREFILL_NATIVE_EXTRA module from the image's own
+  FlashInfer sources at build time
+  (dual-cache prefill dispatch opened to 128/256-token extra pages, symbols renamed); origin and
+  changes: runtime/flashinfer_pce/PROVENANCE.json.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

@@ -1,5 +1,93 @@
 # Changelog
 
+## 2026-10-28 v2.6.2
+
+A correctness fix in the routed-MoE kernel, a memory fix in prefill attention and a latency fix for short requests
+that arrive during a long prefill. The production profile in `.env.tp4.example` adds
+`DSV41_PREFILL_NATIVE_EXTRA=1` and `DSV41_PREFILL_BYPASS_SOLO=1`; nothing else in it changes.
+
+- **Fixed: a CTA shared-memory race in the routed-MoE dynamic kernel** (`runtime/b12x_next`,
+  `moe/_shared/kernels/dynamic.py`, the producer loop). The CTA leader stores each batch claim in one shared word
+  (`ctrl[7]`). A barrier orders that store before every thread reads it, but nothing ordered those reads before the
+  next iteration's store, and the loop's back edge has no barrier. A warp that reads its claim late can therefore see
+  the next batch's claim, and tokens are then skipped or routed twice, or the loop stops early.
+  - **The fix** is a backport of **Martin Vit**'s b12x commit `d7937d7f` (2026-10-06, after our pinned `a7d7d29b`),
+    applied verbatim: one CTA barrier right after the claim read (`scripts/b12x_next-claim-barrier.patch`). b12x is now
+    developed in flashinfer-ai/flashinfer under `flashinfer/experimental/b12x`. We found the race independently in an
+    offline racecheck and SASS analysis before finding the upstream commit.
+  - **Not carried:** the same commit also fixes the deterministic shared-activation gathers of the monolithic in-kernel
+    FC1 path, which our specializations do not compile (their external phase-1 kernel already divides by top-k).
+  - **Code generation** at sm_121a: registers, spills and the FC1 / FC2 kernels are unchanged; the dynamic kernel gains
+    one `BAR.SYNC` per producer iteration.
+  - **Tests:** `tests/test_b12x_next_claim_barrier.py` holds an exhaustive interleaving model (the stock loop has a
+    counterexample with two warps; the barrier closes it) and pins the source. `SOURCE_PATCH` changes from
+    da662ccc7e2372b5 to 5555496ebd40f308.
+  - **Fleet A / X / A'** (2026-10-27): every T = 0 output of 75 qeval prompts (top-20 logprobs and greedy, c1, three
+    passes per boot) equals a v2.6 output, and load c1 / c4 / c16 run at 0.999 / 1.002 / 1.011 of the slower v2.6 boot.
+- **New in the production profile: prefill reads the extra cache's native pages** (`DSV41_PREFILL_NATIVE_EXTRA=1`;
+  `runtime/flashinfer_pce/`, read by `runtime/flash_mla_sm120.canary.py`).
+  - **Before.** Stock FlashInfer instantiates the SM120 sparse-MLA dual-cache prefill only for extra pages of 64 / 2
+    tokens. The adapter therefore copied the whole compressed extra pool into a persistent 64-token split buffer, about
+    3 GB per rank at the v2.6 pool, allocated after the KV pool is sized, and ran a page-mark and split pass on every
+    prefill call.
+  - **Now.** A separate module reads SGLang's own 128 / 256-token pages in place. FlashInfer's `prefill_kernel.cuh` is
+    generic in the page size, so the kernels are the stock templates; only the dispatch is opened to 128 / 256 and the
+    symbols are renamed. The module is generated at image build from the image's own `sparse_mla_sm120` sources: the
+    build refuses unless the whole source closure equals `APPROVED_CLOSURE.json` (FlashInfer 0.6.18, git 69ff11fc,
+    23 files). It is then compiled for sm_121a in the build and served with its sha256 pinned (no JIT at boot). The SWA
+    source is still split, and 64 / 2-token extra pages keep the stock module.
+  - **Tests:** `tests/test_prefill_native_extra.py` (CPU), `tests/pce_nvcc_check.sh` (20 kernels, registers and spills
+    equal to the stock 64-token twins) and `tests/gpu_test_prefill_native_extra.py` (OFF vs ON bit-identical on
+    42 eager and edge cases and 30 CUDA-graph replays of the wide-verify route).
+  - **Fleet A / X / A'** (2026-10-28; the coordinator's ruling over two kit faults in the receipt):
+    - every T = 0 output (lp-c1 and greedy-c1) equals a v2.6 output, and the module served the 128- and 256-token
+      pages;
+    - **persistent memory allocated after pool sizing drops by 2.45-2.76 GiB per node**;
+    - **cold 1M prefill takes 194.4 s against 205.3 / 201.7 s on v2.6** (-5.2 % against the first boot); 64k and 388K
+      are within noise;
+    - c16 load is 1.007 x the slower v2.6 boot;
+    - no NVRM `NV_ERR_NO_MEMORY` line.
+  - **Credits:** the SM120 sparse-MLA kernels are FlashInfer's: **Gabriel Wu** (flashinfer-ai/flashinfer #3395 and the
+    later refactors), with fixes from **Ka-Hyun Nam** (#4732, issue #3700) and the other contributors to
+    `sparse_mla_sm120`. Origin and changes are in `runtime/flashinfer_pce/PROVENANCE.json` and NOTICE.
+
+- **New in the production profile: a short request that arrives during a long prefill runs in a pass of its own**
+  (`DSV41_PREFILL_BYPASS_SOLO=1`, on top of the existing `DSV41_PREFILL_BYPASS=256`; `adapter/prefill_bypass.py`).
+  - **Before.** The bypass admitted a short request next to the long prompt's in-flight 8192-token chunk, so the short
+    request's first token waited for that whole chunk pass: about 1.9 s at 93K-128K.
+  - **Now.** The short request runs in a prefill pass of its own (one per pass, a batch-size-1 extend as on an idle
+    server; a second one takes the next solo pass). The long prompt is parked for that pass (the engine's parked-chunk
+    state: empty extend range, nothing stashed, no in-flight chunk counted, the batch built without it) and resumes
+    alone in the next pass with the same chunk, so its chunks, boundaries and numerics are those of an idle run. Solo
+    and chunk passes alternate, so the long prompt is never starved. A final chunk is parked like any other, with the
+    bypass admission contract kept beside it (the cumulative fresh-token debit, no partial admission: a short request
+    that would need chunking is skipped). The interval cadence is unchanged.
+  - **Rank-invariant:** every decision reads replicated scheduler state only (the parked flag lives on the request), so
+    all ranks build the same batch. Each solo pass and each resume logs one `DSV41_SOLO_RECEIPT` JSON line (long rid,
+    prefix / total, the batch's rids and ranges), the same on every rank. Same pinned `_get_new_batch_prefill_raw` /
+    `PrefillAdder` sources and sha pins as the bypass; with the flag unset or 0 the patched function is v2.6.1's byte
+    for byte.
+  - **Tests:** `tests/test_prefill_bypass_solo.py` (run in both canary image builds): a pass simulator over the lifted
+    pinned scheduler (long prompt plus short arrivals, final chunk, continuous arrivals, rank invariance, page-256
+    final-chunk admission regressions, receipts), the off path against a v2.6.1 fixture, and refusal on anchor drift.
+  - **Fleet A / X / A'** (2026-10-28, v2.6 / v2.6 + solo / v2.6, fresh boots, KV pool pinned, abliterated checkpoint
+    on all three):
+    - **time to first token of a short request sent 1 s into a cold prefill: 0.42 s against 1.89-1.92 s** (93K and
+      128K, median of three each);
+    - on every judged run the long prompt's output tokens and the short reply equal their idle runs, and every T = 0
+      qeval output (top-20 logprobs and greedy, c1) equals one of the two v2.6 boots';
+    - cold prefill alone is unchanged (93K: 14.54 s against 14.65 / 14.57 s; 388K: 65.03 s against 64.93 /
+      64.81 s); the short request's total time, the long prompt's time and the decode gaps of a stream running beside
+      them stayed within 1.10 x, 1.03 x + 0.5 s and 1.25 x of the slower v2.6 boot;
+    - the receipts are the same sequence on all four ranks; no NVRM `NV_ERR_NO_MEMORY` line.
+  - **Credits:** our own design on top of our bypass. The idea draws on **Christopher Owen**'s late-admission and
+    prefill-interleaving work in [spark-ds41f](https://github.com/christopherowen/spark-ds41f), and the measurement
+    follows the `mixed_probe` shape of **James Meadlock**'s J-M Recipes (a short streaming chat sent 1 s after a cold
+    long prompt).
+
+<!-- v2.6.2 release gate: filled in from the receipts before the PR (diagnostics RUNBOOK). -->
+Release gate (v2.6 vs v2.6.2 vs v2.6, fresh boots, production profile, official 1017, KV pinned at 4,194,304, 2026-10-29): speedbench full c1 88.53 / 88.38 / 88.37, c4 131.17 / 130.72 / 130.12, c16 207.67 / 207.62 / 206.03 tok/s; cold prefill 64K 6029 / 6054 / 6033 and 1M 4932 / 5310 / 4940 tok/s (+7.7 %); short-reply TTFT during a 93K / 128K prefill 1.90 / 0.43 / 1.90 s and 1.90 / 0.42 / 1.89 s; 388K prefill 65.3 / 63.3 / 64.9 s; qeval 71 / 71 / 71 with no answer outside the controls, KLD within noise, 1M needle found in all three; lowest head MemAvailable 4.2 / 9.7 / 7.0 GiB and NVRM out-of-memory log lines 155 / 1 / 133 over the boot.
+
 ## 2026-10-27 v2.6.1
 
 - Fixed: building `Dockerfile.canary-roce` failed in the image test battery at

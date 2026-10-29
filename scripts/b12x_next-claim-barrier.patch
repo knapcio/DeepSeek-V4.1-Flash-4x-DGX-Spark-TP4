@@ -1,0 +1,25 @@
+Backport of local-inference-lab/b12x d7937d7fc2e5511a0b61eb3572cd149f563f9b4f
+("feat(moe): prepare lossless FP4-CSF expert scales", Martin Vit, 2026-10-06; b12x
+development now continues in flashinfer-ai/flashinfer, flashinfer/experimental/b12x):
+only its producer-loop read-completion barrier ("Correct shared routing
+synchronization"), verbatim. The producer loop's leader reuses the shared batch-claim
+slot ctrl[7]; without the barrier after the read, a warp that is late to its read can
+see the next claim. The same commit's deterministic shared-activation gather fix
+(route_divisor in _w4a8_stage_a_tile_gather / _w4a8_stage_scale_tile_gather) is not
+backported: those helpers serve the monolithic in-kernel FC1 path, which the ds41
+specializations (external materialized FC1 / FC2) do not compile, and the external
+phase-1 kernel already divides deterministic map entries by top-k with Int64 strides.
+Apache License 2.0 (runtime/b12x_next/LICENSE).
+
+--- b12x_next/moe/_shared/kernels/dynamic.py
++++ b12x_next/moe/_shared/kernels/dynamic.py
+@@ -3584,6 +3584,9 @@
+                 _st_shared_i32(ctrl_base_addr + Int32(28), batch_base)
+             cute.arch.sync_threads()
+             batch_base = _ld_shared_i32(ctrl_base_addr + Int32(28))
++            # All warps retain the claim before the leader can reuse its slot.
++            # Inactive tail warps may advance ahead of token-packing warps.
++            cute.arch.sync_threads()
+             producer_limit = total_pairs
+             if cutlass.const_expr(self.share_input_across_experts):
+                 producer_limit = num_tokens

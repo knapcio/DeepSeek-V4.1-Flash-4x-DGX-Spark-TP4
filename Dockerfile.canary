@@ -29,6 +29,16 @@ COPY adapter /opt/dsv41/adapter
 RUN g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread \
     adapter/row_store.cpp -o adapter/librow_store.so
 COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+# DSV41_PREFILL_NATIVE_EXTRA (opt-in, default off): prefill reads the extra cache's native 128/256-token pages through
+# a separate FlashInfer module generated from THIS image's sparse_mla_sm120 sources; anchor drift fails the build.
+COPY runtime/flashinfer_pce/dsv41_pce.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_pce.py
+COPY runtime/flashinfer_pce/gen_pce_sources.py runtime/flashinfer_pce/APPROVED_CLOSURE.json /opt/dsv41/runtime/flashinfer_pce/
+# The generator refuses unless the image's whole sparse_mla_sm120 source closure is the approved one; the module is then
+# compiled here (sm_121a, no GPU needed) and served from the image with its sha256 checked (no JIT at boot).
+RUN FI_DIRS="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR)')" \
+ && python3 /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py $FI_DIRS /opt/dsv41/runtime/flashinfer_pce/gen \
+ && FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_pce build \
+ && python3 -m sglang.kernels.ops.attention.dsv41_pce verify
 # Fail the build if either pinned textual-placeholder anchor has drifted.
 COPY runtime/patch_encoding_dsv41.py /opt/dsv41/runtime/patch_encoding_dsv41.py
 RUN python3 /opt/dsv41/runtime/patch_encoding_dsv41.py
@@ -113,6 +123,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && python3 /opt/dsv41/tests/test_sglang_dsv41_draft_metadata_glue_patch.py \
  && python3 /opt/dsv41/tests/test_sglang_greedy_flags_refresh_patch.py \
  && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass.py \
+ && DSV41_PREFILL_BYPASS_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers DSV41_PREFILL_BYPASS_EXPECT=supported PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_prefill_bypass_solo.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_max_new_tokens.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_loop_abort.py \
