@@ -4,7 +4,7 @@
 
 ## Current results
 
-v2.6.2 is v2.6 plus a routed-MoE race fix, a prefill memory fix and a faster first token for short requests that arrive during a long prefill (see [below](#new-in-v262)); the tables are v2.6's (v2.6.2 changes speed only at long prefill: cold 1M about 5 % faster). The default weights are the official checkpoint (below); the v2.6 tables were measured on its abliterated variant, which `.env.tp4.example` keeps as an optional profile. v2.6: image `Dockerfile.canary-roce` with this release's adapters and RoCE runtime (SGLang `dsv4.1` `f80c91a4b` + the credited backports, without #45251), the "Production profile" block of [`.env.tp4.example`](.env.tp4.example) with `EP_SIZE=1`, 1M context, checkpoint [`mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated) at `517efab`, GPU clock capped at 2200 MHz, measured 2026-10-26 on fresh boots with the host memory compacted first and the first run after each boot discarded. Speculative decoding makes tok/s depend on the generated text, so other DeepSeek releases give somewhat different numbers on the same prompts.
+v2.6.2 is v2.6 plus a routed-MoE race fix, a prefill memory fix and a faster first token for short requests that arrive during a long prefill (details in [CHANGELOG.md](CHANGELOG.md)); the tables are v2.6's (v2.6.2 changes speed only at long prefill: cold 1M about 5 % faster). The default weights are the official checkpoint (below); the v2.6 tables were measured on its abliterated variant, which `.env.tp4.example` keeps as an optional profile. v2.6: image `Dockerfile.canary-roce` with this release's adapters and RoCE runtime (SGLang `dsv4.1` `f80c91a4b` + the credited backports, without #45251), the "Production profile" block of [`.env.tp4.example`](.env.tp4.example) with `EP_SIZE=1`, 1M context, checkpoint [`mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated) at `517efab`, GPU clock capped at 2200 MHz, measured 2026-10-26 on fresh boots with the host memory compacted first and the first run after each boot discarded. Speculative decoding makes tok/s depend on the generated text, so other DeepSeek releases give somewhat different numbers on the same prompts.
 
 ### speedbench
 
@@ -36,39 +36,9 @@ The official checkpoint ([`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggin
 
 **Correctness checks.** On the release-gate boot: needle retrieval PASS at 124k and 388k tokens (passphrase at 50 % depth; 19.8 s and 66.6 s); cold prefill of a 388K-token varied-text prompt 65.2 s (5,770 tok/s); `scripts/qeval.py` 71 / 75 (code 24/25, format 7/7, json 6/8, math 13/14, prose 5/5, reason 16/16), the same score and split as v2.5; T > 0 scan (`ds_gate.py tscan`, 35 outputs) 0 garbled, 0 errors; `/v1/messages` with the image placeholder token in text and with thinking enabled without a budget: both answered; the issue #16 accelerated reproducer (`scripts/issue16_repro.py`: 190K-900K cached prefixes with 512-4096 fresh tokens, alternating c1/c4) 410 requests in 15 minutes, 0 failures ([docs/issue-16-swa-crash.md](docs/issue-16-swa-crash.md)). Exactness against v2.5: 75 qeval prompts at T = 0 with top-20 logprobs and cold prefills, on four fresh boots (v2.5, two-shot only, the full v2.6 set, v2.5 again): every v2.6 output byte-identical to v2.5. Sampling at T > 0 (v2.5 profile, 12,000 samples): the second token's counts match the verify row's own probabilities (chi-square p 0.61).
 
-### New in v2.6.2
+### v2.6.2 on the official checkpoint
 
-**Routed-MoE claim race fixed.** In the routed-MoE dynamic kernel, the CTA leader stores each batch claim in one
-shared-memory word, and every thread then reads it. Nothing made those reads finish before the leader stored the next
-claim, so a warp that was late to its read could pick up the next batch's claim: tokens were skipped or routed twice,
-or the loop stopped early.
-- **The fix:** one CTA barrier after the read, backported from b12x `d7937d7f` (Martin Vit). It is always on in the
-  image.
-- **On the fleet:** T = 0 outputs equal to v2.6 on all 75 qeval prompts, and unchanged speed (c1 / c4 / c16 load at
-  0.999 / 1.002 / 1.011 of the slower v2.6 boot).
-
-**Prefill reads the extra cache's native pages** (`DSV41_PREFILL_NATIVE_EXTRA=1`, now in the production profile).
-v2.6 kept a persistent 64-token copy of the whole compressed extra pool, about 3 GB per rank allocated after the KV
-pool is sized, because FlashInfer's SM120 prefill was instantiated only for 64-token extra pages. A module generated at
-image build from FlashInfer's own sources reads SGLang's 128 / 256-token pages in place: the kernel is generic in the
-page size, so only the dispatch changes. It is compiled in the image build, sha256-pinned and refused on any source
-drift.
-- **On the fleet:** 2.45-2.76 GiB less memory allocated after pool sizing on every node; cold 1M prefill 194 s instead
-  of 205 s (-5 %); T = 0 outputs equal to v2.6; c16 unchanged.
-
-**A short request during a long prefill runs in a pass of its own** (`DSV41_PREFILL_BYPASS_SOLO=1`, now in the
-production profile). The bypass already admitted a short request next to the long prompt's in-flight chunk, but its
-first token then waited for that whole 8192-token chunk pass. Now the short request runs alone in one prefill pass while
-the long prompt is parked, and the long prompt resumes in the next pass with the same chunk, so its chunks and outputs
-are those of an idle run. The passes alternate, so the long prompt is never starved, and every rank logs the same
-`DSV41_SOLO_RECEIPT` line per solo pass.
-- **On the fleet:** first token of a short request sent 1 s into a 93K or 128K cold prefill 0.42 s instead of 1.9 s;
-  the long prompt's tokens and the short reply equal their idle runs; cold 388K prefill unchanged (65.0 s against
-  64.9 / 64.8 s).
-
-Release gate (v2.6 vs v2.6.2 vs v2.6, fresh boots, production profile, official 1017, KV pinned at 4,194,304, 2026-10-29): speedbench full c1 88.53 / 88.38 / 88.37, c4 131.17 / 130.72 / 130.12, c16 207.67 / 207.62 / 206.03 tok/s; cold prefill 64K 6029 / 6054 / 6033 and 1M 4932 / 5310 / 4940 tok/s (+7.7 %); short-reply TTFT during a 93K / 128K prefill 1.90 / 0.43 / 1.90 s and 1.90 / 0.42 / 1.89 s; 388K prefill 65.3 / 63.3 / 64.9 s; qeval 71 / 71 / 71 with no answer outside the controls, KLD within noise, 1M needle found in all three; lowest head MemAvailable 4.2 / 9.7 / 7.0 GiB and NVRM out-of-memory log lines 155 / 1 / 133 over the boot.
-
-**Fixed: logprob decode hang.** Images built from `57a9888` and earlier main commits hang every rank on a greedy native `/generate` with `return_logprob` on long code prompts. The cause was the SGLang #45251 backport, now removed; see the CHANGELOG.
+Release gate, v2.6 / v2.6.2 / v2.6 (fresh boots, production profile, official 1017, KV pinned at 4,194,304, 2026-10-29): speedbench full c1 88.53 / 88.38 / 88.37, c4 131.17 / 130.72 / 130.12, c16 207.67 / 207.62 / 206.03 tok/s; cold prefill 64K 6029 / 6054 / 6033 and 1M 4932 / 5310 / 4940 tok/s (+7.7 %); short-reply TTFT during a 93K / 128K prefill 1.90 / 0.43 / 1.90 s and 1.90 / 0.42 / 1.89 s; 388K prefill 65.3 / 63.3 / 64.9 s; qeval 71 / 71 / 71 with no answer outside the controls, KLD within noise, 1M needle found in all three; lowest head MemAvailable 4.2 / 9.7 / 7.0 GiB and NVRM out-of-memory log lines 155 / 1 / 133 over the boot.
 
 Earlier measurements, including the v2.5 sparkDash tables (sparkDash is no longer used here), the v2.4 table on the original checkpoint, the per-stage tables and the experiments that were tried and not adopted, are in [docs/history.md](docs/history.md); what changed when, with the v2.6 A / B / A' table, is in [CHANGELOG.md](CHANGELOG.md).
 
