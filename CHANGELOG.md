@@ -14,7 +14,9 @@ spinning while the engine is idle). Unset both to return to v2.6.2. Greedy outpu
   acceptance sums S, the residual mass and the correction argmax) to the same torch operations on the same tensors.
   The accepted length and the correction token are therefore bit-identical to the torch path for the same random
   draws, and the draws are unchanged. Greedy requests never take this path. `DSV41_BLOCK_VERIFY_FOLD=check` runs
-  both and counts mismatches on device; every mode logs per-path call receipts.
+  both and counts mismatches on device; every mode logs per-path call receipts every
+  `DSV41_BLOCK_VERIFY_FOLD_LOG_EVERY` calls (default 2000) and a terminal receipt (with the check counters) at each
+  busy -> idle transition of the scheduler, so no call goes unreported (`tests/test_block_verify_fold_receipts.py`).
   - **Tests:** `tests/test_block_verify_fold.py` (Triton interpreter, also in the image build): 75 checks against
     the torch path, including the intermediate S, h, mass, residual and keys, eta exactly at the threshold and one
     ulp either side, ties, NaN / inf keys, a zero residual mass and the full 129,280-token vocabulary.
