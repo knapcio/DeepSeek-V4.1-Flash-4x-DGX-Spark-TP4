@@ -1,8 +1,29 @@
 # Changelog
 
-## Unreleased
+## 2026-10-30 v2.6.3
 
-- **Idle parking for the RoCE proxy threads, `DSV41_ROCE_IDLE_PARK=1`, off by default.** Each TP rank's
+Two switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled
+requests decode a little faster, outputs bit-identical) and `DSV41_ROCE_IDLE_PARK=1` (the RDMA proxy threads stop
+spinning while the engine is idle). Unset both to return to v2.6.2. Greedy outputs are unchanged by either.
+
+- **New in the production profile: block verification for sampled rows in three kernels**
+  (`DSV41_BLOCK_VERIFY_FOLD=1`, `adapter/block_verify_fold.py`). Sampled requests run their acceptance after the
+  verify CUDA graph, eagerly; `block_accept_probs` (block verification, since 2026-09-23) issued about 55 small torch launches
+  per step for it. The fold computes the per-element and per-request values in three Triton kernels, with torch's
+  FP32 operation order, IEEE division and no FMA contraction, and leaves the three vocabulary-wide reductions (the
+  acceptance sums S, the residual mass and the correction argmax) to the same torch operations on the same tensors.
+  The accepted length and the correction token are therefore bit-identical to the torch path for the same random
+  draws, and the draws are unchanged. Greedy requests never take this path. `DSV41_BLOCK_VERIFY_FOLD=check` runs
+  both and counts mismatches on device; every mode logs per-path call receipts.
+  - **Tests:** `tests/test_block_verify_fold.py` (Triton interpreter, also in the image build): 75 checks against
+    the torch path, including the intermediate S, h, mass, residual and keys, eta exactly at the threshold and one
+    ulp either side, ties, NaN / inf keys, a zero residual mass and the full 129,280-token vocabulary.
+    `tests/gpu_test_block_verify_fold.py`: the same cases on the GPU, 12,000 random production-shaped rows and
+    CUDA-graph replays.
+  - **Fleet** (2026-10-29, abliterated 1017): GPU unit test 0 differences, 103 vs 328 us at bs 1; in-boot A/B on
+    sampled traffic (T 0.7, top_p 0.95, thinking on) with the fold off / on / check: check mode 0 mismatches,
+    T > 0 distribution check PASS, c1 decode step -0.52 % (95 % CI -0.90..-0.11), c4 -0.8 % (CI includes 0).
+- **New in the production profile: idle parking for the RoCE proxy threads** (`DSV41_ROCE_IDLE_PARK=1`). Each TP rank's
   RDMA proxy thread spins `ROCE_IDLE_SPINS` polls after its last doorbell and then polls once per
   `nanosleep(20 us)` for as long as the engine is idle, about 10^4 wakeups a second per rank. With the
   gate on it blocks on a futex instead, and only while the scheduler itself is idle:
@@ -24,8 +45,15 @@
   (gate-off identity, adapter and scheduler hooks, SGLang's event loops), with
   `tests/roce_idle_park/park_unit.c` (the state machine, a lost-wakeup race of 20,000 rounds) and
   `park_stress.c` (four real proxy loops over an in-process fake RDMA, ranks waking in random order,
-  wakes skipped on one rank). Not yet measured on the fleet; the A / X / A' kit is in the workspace.
+  wakes skipped on one rank).
   Credits: idea: idle RDMA proxy parking (uchkw), independent implementation.
+  Fleet A / X / A' (2026-10-29, official 1017, KV pinned at 4,194,304): idle proxy CPU summed over the four
+  ranks 9.5 / 1.6 / 9.6 % of a core (6x lower), parks 20 and late doorbells 0 on every rank; speedbench load
+  c1 / c4 / c16 x0.998 / x1.002 / x1.020; first token after 60 s idle 190.2 / 193.5 / 192.4 ms; qeval 71 / 71 / 71,
+  KLD within noise, head memory and NVRM unchanged.
+
+<!-- v2.6.3 release gate: filled in from the receipts before the PR (diagnostics/ds-v263-rg-20261030 RUNBOOK). -->
+Release gate (v2.6.2 vs v2.6.3 vs v2.6.2, fresh boots, production profile): PENDING.
 
 ## 2026-10-28 v2.6.2
 
