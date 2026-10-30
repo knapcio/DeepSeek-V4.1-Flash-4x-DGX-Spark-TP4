@@ -5,7 +5,8 @@ DSV41_BLOCK_VERIFY_FOLD=1 (needs DSV41_BLOCK_VERIFY=1): adapter/block_verify.py'
 block_accept_probs() for CUDA inputs. DSV41_BLOCK_VERIFY_FOLD=check runs both on the same random draws, returns the
 torch result (production behaviour unchanged) and counts on device every row whose tau or correction token differs
 (the contract is 0); the counters are logged every DSV41_BLOCK_VERIFY_FOLD_LOG_EVERY calls (one host sync then, check
-mode only). Every mode logs a host-side receipt of its calls per path (no sync) at the same interval.
+mode only). Every mode logs a host-side receipt of its calls per path (no sync) at the same interval, and a terminal
+receipt (+ the check counters) at each busy -> idle transition of the scheduler (flush / install_scheduler).
 
 Exactness contract: the output (tau, correction token) equals block_accept_probs' bit for bit, for the same inputs
 and the same random draws. How:
@@ -251,3 +252,47 @@ def check_counts(fold_out, ref_out):
         v = c.tolist()
         print(f"[block_verify_fold] check: rank={_rank()} calls {v[0]} rows {v[1]} tau mismatches {v[2]} "
               f"token mismatches {v[3]}", flush=True)
+
+
+# Terminal receipts: the periodic lines above leave up to LOG_EVERY - 1 calls unreported. On the scheduler's busy ->
+# idle transition (every TP rank reaches it after the same step, once the work in flight has drained) each rank logs
+# its totals, and in check mode its device counters, once per transition that saw a sampled call. While idle the hook
+# costs one dict comparison per scheduler loop; the periodic cadence is unchanged.
+_LOGGED = {"calls": 0}
+
+
+def flush(at="idle"):
+    if _R["calls"] == _LOGGED["calls"]:
+        return
+    _LOGGED["calls"] = _R["calls"]
+    try:
+        print(f"[block_verify_fold] receipt rank={_rank()} calls={_R['calls']} torch={_R['torch']} "
+              f"fold={_R['fold']} check={_R['check']} rows={_R['rows']} at={at}", flush=True)
+        c = _C["counters"]
+        if c is not None:
+            v = c.tolist()
+            print(f"[block_verify_fold] check: rank={_rank()} calls {v[0]} rows {v[1]} tau mismatches {v[2]} "
+                  f"token mismatches {v[3]} at={at}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - a receipt never stops the scheduler; a missing one fails the gate
+        print(f"[block_verify_fold] terminal receipt failed: {exc!r}", flush=True)
+
+
+def install_scheduler(module):
+    """On import of sglang.srt.managers.scheduler (sitecustomize, DSV41_BLOCK_VERIFY_FOLD set): flush() in on_idle."""
+    cls = module.Scheduler
+    if getattr(cls, "_dsv41_fold_receipt", False):
+        return
+    name = next((n for n in ("on_idle", "self_check_during_idle") if hasattr(cls, n)), None)
+    if name is None:
+        print("[block_verify_fold] Scheduler has no on_idle hook: no terminal receipts", flush=True)
+        return
+    original = getattr(cls, name)
+
+    def idle_hook(self, *args, **kwargs):
+        flush("idle")
+        return original(self, *args, **kwargs)
+
+    idle_hook.__wrapped__ = original
+    setattr(cls, name, idle_hook)
+    cls._dsv41_fold_receipt = True
+    print(f"[block_verify_fold] terminal receipts on Scheduler.{name}", flush=True)

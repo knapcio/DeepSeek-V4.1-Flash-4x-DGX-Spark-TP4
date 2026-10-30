@@ -149,6 +149,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && BV_TEST_N=60000 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify_numerics.py \
  && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=/opt/dsv41/adapter:/opt/dsv41/tests python3 /opt/dsv41/tests/test_block_verify_fold.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify_fold_receipts.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_autotune_keep.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_ab_variant.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_cert_head.py \

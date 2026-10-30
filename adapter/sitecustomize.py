@@ -276,6 +276,10 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_ROCE_IDLE_PARK', '0').strip() == '1':
                 from roce_idle_park import install_scheduler as install_roce_idle_park_scheduler
                 install_roce_idle_park_scheduler(module)
+            # Gated on DSV41_BLOCK_VERIFY_FOLD: terminal fold receipts at each busy -> idle transition.
+            if os.environ.get('DSV41_BLOCK_VERIFY_FOLD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from block_verify_fold import install_scheduler as install_block_verify_fold_scheduler
+                install_block_verify_fold_scheduler(module)
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)
