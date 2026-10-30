@@ -161,6 +161,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_roce_ring.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_roce_twoshot.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_roce_idle_park.py \
+ && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_tokenizer_heap.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_moe_launch_prepared.py \
  && cd /opt/dsv41/tests && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_chunked_v3.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_nosync.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py

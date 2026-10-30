@@ -2,9 +2,10 @@
 
 ## 2026-10-30 v2.6.3
 
-Two switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled
-requests decode a little faster, outputs bit-identical) and `DSV41_ROCE_IDLE_PARK=1` (the RDMA proxy threads stop
-spinning while the engine is idle). Unset both to return to v2.6.2. Greedy outputs are unchanged by either.
+Three switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled
+requests decode a little faster, outputs bit-identical), `DSV41_ROCE_IDLE_PARK=1` (the RDMA proxy threads stop
+spinning while the engine is idle) and `DSV41_TOKENIZER_HEAP=trim` (the head's tokenizer process gives back the
+heap memory long prompts leave behind). Unset the three to return to v2.6.2. Greedy outputs are unchanged by any.
 
 - **New in the production profile: block verification for sampled rows in three kernels**
   (`DSV41_BLOCK_VERIFY_FOLD=1`, `adapter/block_verify_fold.py`). Sampled requests run their acceptance after the
@@ -25,6 +26,16 @@ spinning while the engine is idle). Unset both to return to v2.6.2. Greedy outpu
   - **Fleet** (2026-10-29, abliterated 1017): GPU unit test 0 differences, 103 vs 328 us at bs 1; in-boot A/B on
     sampled traffic (T 0.7, top_p 0.95, thinking on) with the fold off / on / check: check mode 0 mismatches,
     T > 0 distribution check PASS, c1 decode step -0.52 % (95 % CI -0.90..-0.11), c4 -0.8 % (CI includes 0).
+- **New in the production profile: the tokenizer heap is given back** (`DSV41_TOKENIZER_HEAP=trim`,
+  `adapter/mem_reclaim.py`, the tokenizer-heap switch of `perf/mem-reclaim-20261029` @ `13e68a5` taken alone).
+  Tokenizing 200K-950K-token prompts leaves glibc's main heap of the head's `launch_server` (the tokenizer manager)
+  at its high-water mark: on production (2026-10-30, a 30-minute issue-16 soak) its anonymous memory grew from 1.15 to
+  3.91 GiB, all in `[heap]`, and never came back, on the node that sizes the KV pool. With the switch, a daemon thread
+  in `launch_server` only calls `malloc_trim(0)` when at least 256 MiB are free inside the heap (`mallinfo2`), checked
+  every 2 s; the scheduler and detokenizer processes are not touched. Allocation only: no token, request or scheduling
+  change. Offline, the DeepSeek-V4.1 tokenizer through the parallel encoder on 96 requests of 200K-950K tokens: memory
+  kept after the workload +646 MiB stock, +36 MiB with the switch; tokenization time within noise; each trim at most
+  ~20 ms (it holds glibc's arena locks for that long). `tests/test_tokenizer_heap.py` (13e68a5's cases).
 - **New in the production profile: idle parking for the RoCE proxy threads** (`DSV41_ROCE_IDLE_PARK=1`). Each TP rank's
   RDMA proxy thread spins `ROCE_IDLE_SPINS` polls after its last doorbell and then polls once per
   `nanosleep(20 us)` for as long as the engine is idle, about 10^4 wakeups a second per rank. With the
