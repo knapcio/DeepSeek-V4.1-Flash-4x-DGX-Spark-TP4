@@ -4,6 +4,12 @@ Every dated table, note and rejected experiment that used to live in the README,
 
 The rows from before the sparkDash 1.8.8 sections were taken with sparkDash up to 1.8.6. sparkDash 1.8.7 replaced the code prompts (c1 and the concurrent waves), so those code columns are not comparable with the 1.8.8 tables; the prose, structured and prefill prompts are unchanged. From v2.6 (2026-10-27) the README reports speedbench only.
 
+## Official 1017 checkpoint on the v2.5 image, 2026-10-26, speedbench
+
+The README's note on the official checkpoint from v2.6 until v2.6.3, moved here unchanged (the v2.6.2 release gate on the official checkpoint is in [CHANGELOG.md](../CHANGELOG.md)):
+
+On the v2.5 image on 2026-10-26, same speedbench protocol: c1 all 88.4 (prose 66.0, code 108.4, structured 111.0), c4 132.3, c16 200.0 block tok/s, cold prefill 4k 4,605 and 128k 5,783 tok/s. This release's [v2.6's] switches leave c1 decode unchanged (T = 0 outputs byte-identical), so its c1 carries over; its c16 and short-prefill gains were measured on the abliterated checkpoint only.
+
 ## Production 2026-10-23 (v2.5 + NVMe keepalive, main `1059dfe`), sparkDash 1.8.8 and speedbench
 
 The README's results from 2026-10-23 until v2.6, moved here unchanged. sparkDash has not been used since 2026-10-25; later numbers are speedbench only.
@@ -274,7 +280,7 @@ One image, one env file. Everything in the tables below labelled **production** 
 | Rust image processor | `SGLANG_RUST_BUILD_MODE=never` | off | the branch's `cargo` probe can hang the head before the HTTP server starts; PIL path is used |
 | Adaptive chunk sizer | `DSV41_ADAPTIVE_CHUNK` | off | superseded by the bounded indexer; it would only shrink chunks needlessly |
 | DSpark SPS table / ragged verify | `DSPARK_SPS_TABLE` | ignored unless `DSPARK_SPS_ALLOW_ENGRAM=1` | compact ragged verify crashes the Engram path on this model; the guard keeps the verify-all schedule even if a stale/profiled table exists |
-| NVFP4 checkpoint (`nvidia/DeepSeek-V4.1-Flash-NVFP4`) | – | not used | routed experts only, no bandwidth saved on GB10, +16 GiB, DSpark unvalidated |
+| NVFP4 checkpoint (`nvidia/DeepSeek-V4.1-Flash-NVFP4`) | – | not used | corrected 2026-11-02 ([#64](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/64); this row said "routed experts only"): the routed experts are the official MXFP4 values re-encoded losslessly with twice the scale bytes (+16 GiB in the file, about +4 GiB per rank on the GPU and about 6 % more expert bytes read per decode step); the smaller file comes from the two Engram tables re-quantized from FP8 to FP4 (lossy; -76 GiB for the later `nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`), which saves nothing here because the engine serves Engram rows from NVMe; DSpark unvalidated |
 
 Rollback to any earlier point is an env change: `DSV41_FAST_LOAD=0` restores the stock loader, `SGLANG_ROCE_ALLREDUCE=0` drops the RDMA transport, `SPARK_PREFILL_TP_SPLIT=0` the row split, `IMAGE=dsv41-4x-spark:canary` the RoCEnante overlay, `IMAGE=dsv41-4x-spark:local` the branch.
 

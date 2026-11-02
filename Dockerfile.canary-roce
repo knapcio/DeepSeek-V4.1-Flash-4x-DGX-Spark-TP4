@@ -46,6 +46,12 @@ RUN FI_DIRS="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_
  && python3 /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py $FI_DIRS /opt/dsv41/runtime/flashinfer_pce/gen \
  && FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_pce build \
  && python3 -m sglang.kernels.ops.attention.dsv41_pce verify
+# FlashInfer PR #7676 (issue #7675, Thireus): one proxy fence after producer_acquire in the b12x SM120/SM121 dense GEMM
+# that every MXFP8 dense linear runs (adapter/mxfp8_b12x.py). The patcher only edits the pinned 0.6.18 file (sha256
+# before and after); any other FlashInfer fails the build. CuTe DSL compiles the kernel in-process at first use.
+COPY runtime/flashinfer_fi7676 /opt/dsv41/runtime/flashinfer_fi7676
+RUN python3 /opt/dsv41/runtime/flashinfer_fi7676/apply_fi7676.py \
+ && python3 /opt/dsv41/runtime/flashinfer_fi7676/apply_fi7676.py --check
 # Fail the build if either pinned textual-placeholder anchor has drifted.
 COPY runtime/patch_encoding_dsv41.py /opt/dsv41/runtime/patch_encoding_dsv41.py
 RUN python3 /opt/dsv41/runtime/patch_encoding_dsv41.py
@@ -148,6 +154,8 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_draft_head_fp8.py \
  && BV_TEST_N=60000 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify_numerics.py \
+ && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=/opt/dsv41/adapter:/opt/dsv41/tests python3 /opt/dsv41/tests/test_block_verify_fold.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify_fold_receipts.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_autotune_keep.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_ab_variant.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_cert_head.py \
@@ -158,6 +166,8 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_spec_sync_free.py \
  && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_roce_ring.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_roce_twoshot.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_roce_idle_park.py \
+ && FI7676_EXPECT=patched python3 /opt/dsv41/tests/test_fi7676_fence.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_moe_launch_prepared.py \
  && cd /opt/dsv41/tests && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_chunked_v3.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_nosync.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py

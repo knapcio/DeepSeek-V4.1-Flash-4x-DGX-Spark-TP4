@@ -8,6 +8,12 @@ The proxy is plain C over libibverbs.  It is compiled once per source hash
 with the host C compiler into the b12x cache directory, so the package stays
 pure Python for packaging purposes while the RDMA posting loop runs without
 the interpreter on its critical path.
+
+ds41 idle parking: ``IDLE_PARK`` (False here; adapter/roce_idle_park.py sets it under
+DSV41_ROCE_IDLE_PARK=1 before the first ``load``) builds the same source with
+``-DROCE_IDLE_PARK=1`` and ``_roce_idle_park.h`` into a separately named library and binds
+``roce_park_*``.  With ``IDLE_PARK`` False the build command, the cache name and the
+bindings are the v2.6 ones.
 """
 
 from __future__ import annotations
@@ -22,9 +28,16 @@ import threading
 from pathlib import Path
 
 _SOURCE = Path(__file__).with_name("_roce_proxy.c")
+_PARK_HEADER = Path(__file__).with_name("_roce_idle_park.h")
+# Set by adapter/roce_idle_park.py before the first load(); never changed after it.
+IDLE_PARK = False
 _LOCK = threading.Lock()
 _LIB: ctypes.CDLL | None = None
 ABI_VERSION = 103
+PARK_ABI_VERSION = 1
+# roce_park_stat indices (_roce_idle_park.h ROCE_PARK_STAT_*)
+PARK_STATS = ("parks", "wakes", "timeouts", "late_doorbells", "parked_ns", "last_wake_ns",
+              "max_wake_ns", "last_lead_ns", "tid", "parked", "allow", "after_ns", "poll_ns")
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 
@@ -54,13 +67,20 @@ def _compiler() -> str:
 def _build() -> Path:
     """Compile the proxy source into the cache directory keyed by source hash; returns the .so path."""
     source = _SOURCE.read_bytes()
+    park = bool(IDLE_PARK)
+    if park:
+        # the header and the define are part of what is built: key the cache on them too
+        source = source + b"\0-DROCE_IDLE_PARK=1\0" + _PARK_HEADER.read_bytes()
     digest = hashlib.sha256(source).hexdigest()[:16]
     cache = _cache_dir()
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / f"roce_twoshot_proxy-{digest}.so"
+    if park:
+        target = cache / f"roce_twoshot_proxy-park-{digest}.so"
+    else:
+        target = cache / f"roce_twoshot_proxy-{digest}.so"
     if target.exists():
         return target
-    tmp = cache / f".roce_twoshot_proxy-{digest}-{os.getpid()}.so"
+    tmp = cache / f".{target.stem}-{os.getpid()}.so"
     cmd = [
         _compiler(),
         "-O2",
@@ -73,6 +93,8 @@ def _build() -> Path:
         "-libverbs",
         "-lpthread",
     ]
+    if park:
+        cmd.insert(1, "-DROCE_IDLE_PARK=1")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -132,6 +154,19 @@ def load() -> ctypes.CDLL:
         lib.roce_destroy.argtypes = [p]
         if lib.roce_abi_version() != ABI_VERSION:
             raise RuntimeError("unexpected b12x RoCE two-shot proxy ABI version")
+        if IDLE_PARK:
+            lib.roce_park_abi.restype = ctypes.c_int
+            lib.roce_park_abi.argtypes = []
+            lib.roce_park_configure.restype = ctypes.c_int
+            lib.roce_park_configure.argtypes = [p, ctypes.c_uint32, ctypes.c_uint32]
+            lib.roce_park_allow.restype = None
+            lib.roce_park_allow.argtypes = [p]
+            lib.roce_park_wake.restype = None
+            lib.roce_park_wake.argtypes = [p]
+            lib.roce_park_stat.restype = u64
+            lib.roce_park_stat.argtypes = [p, ctypes.c_int]
+            if lib.roce_park_abi() != PARK_ABI_VERSION:
+                raise RuntimeError("unexpected b12x RoCE idle-park ABI version")
         _LIB = lib
         return lib
 
@@ -273,6 +308,25 @@ class Proxy:
                 for hca in range(len(self.hca_names))
             ],
         }
+
+    # -- idle parking (only in a library built with IDLE_PARK) -------------------
+
+    def park_configure(self, after_ms: int, poll_ms: int) -> None:
+        """Let the proxy park once the engine said idle and no doorbell came for ``after_ms``."""
+        if self._lib.roce_park_configure(self._ctx, int(after_ms), int(poll_ms)) != 0:
+            raise ValueError(f"invalid idle-park configuration after_ms={after_ms} poll_ms={poll_ms}")
+
+    def park_allow(self) -> None:
+        """The engine is idle: the proxy may park after ``after_ms`` without a doorbell."""
+        self._lib.roce_park_allow(self._ctx)
+
+    def park_wake(self) -> None:
+        """Work is coming: clear the idle mark and wake a parked proxy (one futex wake)."""
+        self._lib.roce_park_wake(self._ctx)
+
+    def park_stats(self) -> dict[str, int]:
+        """Idle-park counters (``PARK_STATS``)."""
+        return {name: int(self._lib.roce_park_stat(self._ctx, i)) for i, name in enumerate(PARK_STATS)}
 
     def close(self) -> None:
         """Stop the thread and release the RDMA resources."""

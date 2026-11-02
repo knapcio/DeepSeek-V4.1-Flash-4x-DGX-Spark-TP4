@@ -57,6 +57,12 @@
 //
 // This file is compiled by b12x.comm.roce_twoshot._proxy at first use with the host
 // gcc and libibverbs; it must stay plain C with no CUDA dependency.
+//
+// ds41 idle parking (DSV41_ROCE_IDLE_PARK=1, adapter/roce_idle_park.py): built with
+// -DROCE_IDLE_PARK=1, the proxy blocks on a futex while the engine is idle instead of
+// nanosleep-polling (see _roce_idle_park.h).  Every addition is inside
+// "#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK"; without the define the compiled
+// code is the v2.6 proxy's.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -69,6 +75,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK
+#include "_roce_idle_park.h"
+static int park_tick(void *arg);
+#endif
 
 #define ROCE_MAX_PEERS 16
 #define ROCE_MAX_HCAS 2
@@ -152,6 +162,9 @@ typedef struct {
     uint64_t ops_posted;
     uint64_t writes_completed;
     char err[512];
+#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK
+    roce_park_t park;
+#endif
 } roce_ctx_t;
 
 void roce_destroy(roce_ctx_t *c);
@@ -718,6 +731,10 @@ static int run_pipe_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes, uint32_t ch
 static void *proxy_main(void *arg) {
     roce_ctx_t *c = (roce_ctx_t *)arg;
     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
+#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK
+    atomic_store(&c->park.tid, (int32_t)syscall(SYS_gettid));
+    pthread_setname_np(pthread_self(), "roce-proxy");
+#endif
     // Spin while ops are flowing.  After ROCE_IDLE_SPINS polls without a
     // doorbell, request a short nanosleep between polls (the OS decides the
     // actual delay) so an idle runtime does not hold a core next to the
@@ -734,6 +751,19 @@ static void *proxy_main(void *arg) {
                     atomic_store(&c->failed, 1);
                     return NULL;
                 }
+#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK
+                // The engine said idle and no doorbell for after_ms: block until
+                // it wakes us (never with writes in flight; retried in 64 polls).
+                if (roce_park_due(&c->park, idle) && outstanding_writes(c) == 0) {
+                    if (roce_park_block(&c->park, &ctrl[CTRL_SEQ], c->last_seq, &c->running,
+                                        park_tick, c) < 0) {
+                        atomic_store(&c->failed, 1);
+                        return NULL;
+                    }
+                    idle = 0;
+                    continue;
+                }
+#endif
             }
             if (idle >= ROCE_IDLE_SPINS) {
                 nanosleep(&nap, NULL);
@@ -741,6 +771,9 @@ static void *proxy_main(void *arg) {
             continue;
         }
         idle = 0;
+#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK
+        roce_park_on_doorbell(&c->park);
+#endif
         // The doorbell holds only the newest sequence.  Our kernel for op N
         // completes on the peers' payloads alone, so op N+1 can ring before
         // this thread has seen op N (it slept, or the scheduler moved it).
@@ -805,6 +838,9 @@ int roce_start(roce_ctx_t *c) {
 
 void roce_stop(roce_ctx_t *c) {
     if (atomic_exchange(&c->running, 0)) {
+#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK
+        roce_park_kick(&c->park);
+#endif
         pthread_join(c->thread, NULL);
     }
 }
@@ -869,3 +905,25 @@ void roce_destroy(roce_ctx_t *c) {
     }
     free(c);
 }
+
+#if defined(ROCE_IDLE_PARK) && ROCE_IDLE_PARK
+// Idle parking API (adapter/roce_idle_park.py through _proxy.py).  Engine side; any
+// thread.  after_ms == 0 keeps the proxy from ever parking (the default).
+static int park_tick(void *arg) { return drain_all((roce_ctx_t *)arg); }
+
+int roce_park_abi(void) { return ROCE_PARK_ABI; }
+
+int roce_park_configure(roce_ctx_t *c, uint32_t after_ms, uint32_t poll_ms) {
+    if (poll_ms == 0 || poll_ms > 1000 || after_ms > 3600000) {
+        return -1;
+    }
+    roce_park_set(&c->park, after_ms, poll_ms);
+    return 0;
+}
+
+void roce_park_allow(roce_ctx_t *c) { roce_park_allow_now(&c->park); }
+
+void roce_park_wake(roce_ctx_t *c) { roce_park_wake_now(&c->park); }
+
+uint64_t roce_park_stat(roce_ctx_t *c, int which) { return roce_park_stat_of(&c->park, which); }
+#endif

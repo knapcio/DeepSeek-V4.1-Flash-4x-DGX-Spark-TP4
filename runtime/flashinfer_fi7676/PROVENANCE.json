@@ -1,0 +1,16 @@
+{
+ "component": "FlashInfer b12x SM120/SM121 dense block-scaled GEMM (flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py), one-line fix",
+ "upstream": {
+  "issue": "https://github.com/flashinfer-ai/flashinfer/issues/7675 (Thireus, 2026-10-28): the TMA refill of a mainloop stage is not ordered after the MMA warps' ldmatrix reads; under concurrent GPU work a tile is computed from the next pipeline lap's data (RTX 5090: 1,537 of 17,920 graph replays wrong on DeepSeek-V4.1 shapes, 0 with the fence; independently reproduced on an RTX 5060 Ti)",
+  "pull_request": "https://github.com/flashinfer-ai/flashinfer/pull/7676 (Thireus), commit c1d1214; open, not merged as of 2026-11-02",
+  "change": "cute.arch.fence_proxy(\"async.shared\", space=\"cta\") right after mainloop_pipeline.producer_acquire(mainloop_producer_state) in the TMA producer's k-tile loop",
+  "pr_blobs": "base 4451824ad68 -> head e8b94b00b67; apply_fi7676.patch_text on the base reproduces the head blob exactly (git hash-object, 2026-11-02)"
+ },
+ "base": "flashinfer 0.6.18, git 69ff11fc4954396d98326656dc85debd2223f637 (PyPI wheel sha256 d5d26edb48f8def0bf28b2c94415aef7f0754e2cd9e3cb3d6e7081262d068aad); the DS v2.6 image's installed copy has the same sha256 (receipt diagnostics/fleet-windows-20261026/raw/pg-20261028/run.json)",
+ "pins": {
+  "0.6.18": {"before": "eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960", "after": "d583991c917f8cbd609f412a82651445b3f9fa1e4cac9adf24e7176e3c741d05"},
+  "main 2026-11-02 (PR base)": {"before": "6739702e27afad21767b71024678b35c6892e3f9c74aaff375fb3f6734399f86", "after": "4924ff095448f59b204b9f5ba8627ec9769eddd23777b34a1212bfc754b0e8b6"}
+ },
+ "applied": "Dockerfile.canary-roce at build time (apply_fi7676.py; refuses any unpinned file); boot receipt in adapter/mxfp8_b12x.py ('DSV41 b12x dense GEMM fence (FlashInfer #7676): present|ABSENT|unpinned sha256=...')",
+ "licence": "FlashInfer, Apache License 2.0; the edit is distributed under the same terms"
+}

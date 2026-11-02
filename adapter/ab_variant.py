@@ -75,13 +75,15 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # adapter/roce_twoshot.py: two-shot all-reduce row threshold (0 = one-shot), per capture
            "DSV41_ROCE_TWOSHOT_ROWS",
            # adapter/indexer_chunked_v3.py: eager prefill indexer slot ids without host syncs
-           "DSV41_INDEXER_NOSYNC")
+           "DSV41_INDEXER_NOSYNC",
+           # adapter/block_verify.py: sampled block verification through the fold kernels (eager, per call)
+           "DSV41_BLOCK_VERIFY_FOLD")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
                 "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0}
 HASHED_SOURCES = ("ab_variant", "l2_prefetch", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
-                  "indexer_chunked_v3", "moe_launch_prepared")
+                  "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")
@@ -142,6 +144,18 @@ def _parse_parts(value, all_parts):
     return parts
 
 
+def _fold_value(value):
+    """DSV41_BLOCK_VERIFY_FOLD as the behaviour block_verify dispatches on: off / on / check."""
+    v = (value or "0").strip().lower()
+    if v in _OFF:
+        return "off"
+    if v == "check":
+        return "check"
+    if v in ("1", "on", "true", "yes"):
+        return "on"
+    raise RuntimeError(f"DSV41_BLOCK_VERIFY_FOLD={value!r}: expected 0 / 1 / check")
+
+
 def _norm(cfg):
     """Effective behaviour of one variant's registry values (defaults applied; L2 knobs are moot
     while the L2 main gate is off)."""
@@ -165,6 +179,8 @@ def _norm(cfg):
         elif key == "DSV41_MOE_LAUNCH_PREPARED":   # off / plan / plan,direct are three behaviours
             v = (value or "0").strip().lower().replace(" ", "")
             out[key] = "off" if v in _OFF else ("plan,direct" if "direct" in v else "plan")
+        elif key == "DSV41_BLOCK_VERIFY_FOLD":     # off / on / check are three behaviours
+            out[key] = _fold_value(value)
         else:
             out[key] = truthy(value)
     return out

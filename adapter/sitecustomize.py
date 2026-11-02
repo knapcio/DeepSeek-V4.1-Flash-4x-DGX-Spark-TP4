@@ -253,6 +253,11 @@ class EngramLoader(importlib.abc.Loader):
                     and os.environ.get('DSV41_ROCE_TWOSHOT', '0').strip() == '1'):
                 from roce_twoshot import install as install_roce_twoshot
                 install_roce_twoshot(module)
+            # Gated on DSV41_ROCE_IDLE_PARK=1: the proxy thread parks on a futex while the scheduler
+            # is idle (adapter/roce_idle_park.py); refuses on the roce / roce_ring packages.
+            if os.environ.get('DSV41_ROCE_IDLE_PARK', '0').strip() == '1':
+                from roce_idle_park import install_runtime as install_roce_idle_park
+                install_roce_idle_park(module)
         elif module.__name__ == 'sglang.srt.layers.logits_processor':
             # Gated on DSV41_CERT_HEAD: the target-verify LM head through the certified path.
             if os.environ.get('DSV41_CERT_HEAD', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
@@ -267,6 +272,14 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_PREFILL_BYPASS', '').strip():
                 from prefill_bypass import install as install_prefill_bypass
                 install_prefill_bypass(module)
+            # Gated on DSV41_ROCE_IDLE_PARK=1: idle mark in on_idle, proxy wake before run_batch.
+            if os.environ.get('DSV41_ROCE_IDLE_PARK', '0').strip() == '1':
+                from roce_idle_park import install_scheduler as install_roce_idle_park_scheduler
+                install_roce_idle_park_scheduler(module)
+            # Gated on DSV41_BLOCK_VERIFY_FOLD: terminal fold receipts at each busy -> idle transition.
+            if os.environ.get('DSV41_BLOCK_VERIFY_FOLD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from block_verify_fold import install_scheduler as install_block_verify_fold_scheduler
+                install_block_verify_fold_scheduler(module)
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)

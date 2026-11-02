@@ -82,6 +82,47 @@ def block_accept_probs(X, target_probs, draft_probs, eta=None, gumbel=None, live
     return tau, corr
 
 
+try:  # DSV41_BLOCK_VERIFY_FOLD (adapter/block_verify_fold.py): the same rule in 4 Triton launches
+    import block_verify_fold as _fold_mod
+    _fold = _fold_mod if _fold_mod.ENABLED else None
+except ImportError:  # pragma: no cover
+    _fold_mod = _fold = None
+try:  # DSV41_AB_VARIANTS in-boot A/B (test only): the fold is eager, so it switches per call
+    import ab_variant as _ab
+except ImportError:  # pragma: no cover
+    _ab = None
+_FOLD_CPU = os.environ.get("DSV41_BLOCK_VERIFY_FOLD_CPU", "0") == "1"   # tests only (Triton interpreter)
+
+
+def _fold_mode():
+    """None (torch path), "on" or "check" for this call."""
+    if _fold_mod is not None and _ab is not None and getattr(_ab, "ACTIVE", False):
+        v = _ab._fold_value(_ab.env("DSV41_BLOCK_VERIFY_FOLD", "0"))     # the value configure() validated
+        return None if v == "off" else v
+    if _fold is None:
+        return None
+    return "check" if _fold.CHECK else "on"
+
+
+def _folded(candidates, target_probs, draft_probs, bs, gamma, stride, cutoff_verify_lens, check=False):
+    """block_accept_probs through the fold kernels. The random draws are the ones block_accept_probs makes, in
+    its order and shapes (eta [bs, gamma] uniform, then [bs, V] fp32 exponential), so the stream is unchanged."""
+    tp = target_probs.view(bs, stride, -1)
+    dp = draft_probs.view(bs, gamma, -1)
+    dev = candidates.device
+    eta = torch.rand(bs, gamma, device=dev)
+    gumbel = torch.empty((bs, tp.shape[-1]), dtype=torch.float32, device=dev).exponential_()
+    X = candidates.view(bs, stride)[:, 1:gamma + 1]
+    cut = None if cutoff_verify_lens is None else cutoff_verify_lens[:bs]
+    got = _fold_mod.fold(X, tp, dp, eta, gumbel, live=cut, live_sub=1)
+    if not check:
+        return got
+    live = None if cut is None else cut.to(torch.int64) - 1
+    ref = block_accept_probs(X.long(), tp, dp, eta=eta, gumbel=gumbel, live=live)
+    _fold_mod.check_counts(got, ref)
+    return ref
+
+
 def install(accept_module):
     """sglang.kernels.ops.speculative.dspark.dspark_accept: swap AcceptSampling for sampled rows."""
     if not ENABLED:
@@ -114,6 +155,14 @@ def install(accept_module):
                 next_token_logits=target_logits, sampling_info=sampling_info,
                 draft_token_num=verify_num_draft_tokens, bs=bs, max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value)
+        mode = _fold_mode()
+        if mode is not None and (candidates.is_cuda or _FOLD_CPU):
+            tau, corr = _folded(candidates, target_probs, draft_probs, bs, gamma, verify_num_draft_tokens,
+                                cutoff_verify_lens, check=mode == "check")
+            _fold_mod.receipt("check" if mode == "check" else "fold", bs)
+            return tau.to(torch.int32), corr, torch.zeros(bs, dtype=torch.int32, device=candidates.device)
+        if _fold_mod is not None:
+            _fold_mod.receipt("torch", bs)
         X = candidates.view(bs, verify_num_draft_tokens)[:, 1:gamma + 1].long()
         live = None if cutoff_verify_lens is None else (cutoff_verify_lens[:bs].to(torch.int64) - 1)
         tau, corr = block_accept_probs(X, target_probs.view(bs, verify_num_draft_tokens, -1),
@@ -122,4 +171,5 @@ def install(accept_module):
 
     cls._dsv41_orig_execute = cls.execute
     cls.execute = staticmethod(execute)
-    print("[block_verify] armed: block verification for sampled DSpark rows", flush=True)
+    fold_note = "" if _fold is None else f", fold {'check' if _fold.CHECK else 'on'} (DSV41_BLOCK_VERIFY_FOLD)"
+    print(f"[block_verify] armed: block verification for sampled DSpark rows{fold_note}", flush=True)

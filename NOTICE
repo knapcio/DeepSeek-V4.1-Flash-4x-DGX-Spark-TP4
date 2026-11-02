@@ -59,6 +59,12 @@ Third-party components and their licences:
   FlashInfer sources at build time
   (dual-cache prefill dispatch opened to 128/256-token extra pages, symbols renamed); origin and
   changes: runtime/flashinfer_pce/PROVENANCE.json.
+- runtime/flashinfer_fi7676/apply_fi7676.py applies, at image build time, the one-line fix of
+  flashinfer-ai/flashinfer PR 7676 by Thireus (issue 7675, commit c1d1214: a proxy fence after
+  producer_acquire in the b12x SM120/SM121 dense block-scaled GEMM) to the image's FlashInfer 0.6.18
+  (git 69ff11fc) file flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py; Apache License 2.0.
+  FlashInfer: Copyright 2025-2026 NVIDIA; Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/).
+  Origin and pins: runtime/flashinfer_fi7676/PROVENANCE.json.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.
