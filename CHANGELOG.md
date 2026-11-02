@@ -3,8 +3,10 @@
 ## 2026-11-02 v2.6.3
 
 Two switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled
-requests decode a little faster, outputs bit-identical) and `DSV41_ROCE_IDLE_PARK=1` (the RDMA proxy threads stop
-spinning while the engine is idle). Unset both to return to v2.6.2. Greedy outputs are unchanged by either. The
+requests decode a little faster: speedbench sampled c1 +0.8 / +1.4 % and c4 +0.5 / +0.7 % against the two v2.6.2
+boots of the release gate; the accepted tokens are bit-identical to the torch path for the same random draws) and
+`DSV41_ROCE_IDLE_PARK=1` (the RDMA proxy threads stop spinning while the engine is idle: idle proxy CPU 9.6 % ->
+1.75 % of a core over the four nodes). Unset both to return to v2.6.2. Greedy outputs are unchanged by either. The
 `canary-roce` image also carries one correctness fix with no switch: FlashInfer PR #7676's proxy fence in the b12x
 dense MXFP8 GEMM. The tokenizer heap trim (`DSV41_TOKENIZER_HEAP=trim`) of the first v2.6.3 candidate is not in this
 release: in a production soak it cut long-prompt (200K-950K tokens) throughput by 17 % (it holds glibc's arena locks
@@ -48,6 +50,8 @@ while the tokenizer works); an idle-gated version is deferred to v2.6.4.
   - **Fleet** (2026-10-29, abliterated 1017): GPU unit test 0 differences, 103 vs 328 us at bs 1; in-boot A/B on
     sampled traffic (T 0.7, top_p 0.95, thinking on) with the fold off / on / check: check mode 0 mismatches,
     T > 0 distribution check PASS, c1 decode step -0.52 % (95 % CI -0.90..-0.11), c4 -0.8 % (CI includes 0).
+  - **Credits:** block verification is Sun et al. (ICLR 2025), in this profile since 2026-09-23
+    (`adapter/block_verify.py`); the three-kernel fold is our own.
 - **New in the production profile: idle parking for the RoCE proxy threads** (`DSV41_ROCE_IDLE_PARK=1`). Each TP rank's
   RDMA proxy thread spins `ROCE_IDLE_SPINS` polls after its last doorbell and then polls once per
   `nanosleep(20 us)` for as long as the engine is idle, about 10^4 wakeups a second per rank. With the
@@ -76,9 +80,28 @@ while the tokenizer works); an idle-gated version is deferred to v2.6.4.
   ranks 9.5 / 1.6 / 9.6 % of a core (6x lower), parks 20 and late doorbells 0 on every rank; speedbench load
   c1 / c4 / c16 x0.998 / x1.002 / x1.020; first token after 60 s idle 190.2 / 193.5 / 192.4 ms; qeval 71 / 71 / 71,
   KLD within noise, head memory and NVRM unchanged.
+- **Docs: NVIDIA's NVFP4 checkpoints described correctly**
+  ([#64](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/64)). The README and
+  `docs/history.md` said they change the routed experts only. Their routed experts are the official MXFP4 values
+  re-encoded losslessly with twice the scale bytes (+15.8 GiB in the file, about +4 GiB per rank on the GPU); the
+  smaller file (-76 GiB for `nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`) comes from the two Engram tables re-quantized
+  from FP8 to FP4, which is lossy, and this engine serves Engram rows from NVMe, so it saves no GPU memory. Not used.
 
-<!-- v2.6.3 release gate: filled in from the receipts before the PR (diagnostics/ds-v263-rg-20261030 RUNBOOK). -->
-Release gate (v2.6.2 vs v2.6.3 vs v2.6.2, fresh boots, production profile): PENDING.
+Release gate (v2.6.2 vs v2.6.3 vs v2.6.2, fresh boots in that order, production profile, abliterated 1017 `517efab`,
+KV pinned at 4,194,304, 2026-11-02; the v2.6.3 boot ran the v2.6.2 image with this release's files overlaid and the
+fence applied by the release's own `apply_fi7676.py`): speedbench full, median of two runs, greedy c1 all-prompt
+geomean 89.73 / 89.77 / 89.94 and prose 65.94 / 65.93 / 65.88 tok/s, c4 132.58 / 132.87 / 132.38 and c16
+211.77 / 211.81 / 210.85 aggregate tok/s; sampled (T 0.7, top-p 0.95, seed 1) c1 86.31 / 87.03 / 85.87 and prose
+63.26 / 63.84 / 62.10 tok/s, c4 129.50 / 130.18 / 129.28 aggregate tok/s; cold prefill 1M 5287 / 5299 / 5307 tok/s;
+idle RDMA proxy CPU summed over the four nodes 9.6 % of a core on v2.6.2, 1.75 % on v2.6.3; qeval 71 / 71 / 71, KLD
+within the controls' noise, 1M needle found in all three; the fence logged as present on every rank of the v2.6.3
+boot.
+Long-session soak (separate window, 2026-11-02, five fresh boots v2.6.2 / v2.6.3 / v2.6.3 with the idle park off /
+v2.6.3 / v2.6.2; issue #16 reproduction for 30 min plus a c2 speedbench load, the same seeded document order on every
+boot): issue #16 requests 868 / 883 / 885 / 883 / 881 with 0 failures, companion 46.84 / 45.88 / 46.45 / 46.12 / 46.21
+tok/s, head MemAvailable low-water 10.28 / 10.49 / 10.62 / 10.53 / 10.53 GiB. The release gate's own soak could not
+judge memory (its two v2.6.2 boots differed by 2.9 GiB): its document order was drawn from the clock, so each boot
+re-prefilled a different set of evicted documents; the soak window above fixes the order.
 
 ## 2026-10-28 v2.6.2
 
