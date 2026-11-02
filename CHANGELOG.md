@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased: FlashInfer #7676 fence in the b12x dense GEMM (not yet gated on the fleet)
+## 2026-11-02 v2.6.3
+
+Two switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled
+requests decode a little faster, outputs bit-identical) and `DSV41_ROCE_IDLE_PARK=1` (the RDMA proxy threads stop
+spinning while the engine is idle). Unset both to return to v2.6.2. Greedy outputs are unchanged by either. The
+`canary-roce` image also carries one correctness fix with no switch: FlashInfer PR #7676's proxy fence in the b12x
+dense MXFP8 GEMM. The tokenizer heap trim (`DSV41_TOKENIZER_HEAP=trim`) of the first v2.6.3 candidate is not in this
+release: in a production soak it cut long-prompt (200K-950K tokens) throughput by 17 % (it holds glibc's arena locks
+while the tokenizer works); an idle-gated version is deferred to v2.6.4.
 
 - **Fix (correctness): a proxy fence in the b12x SM120/SM121 dense MXFP8 GEMM**, the kernel every MXFP8 dense linear
   runs (`adapter/mxfp8_b12x.py`). The kernel refills a pipeline stage with TMA as soon as `producer_acquire` returns,
@@ -15,14 +23,12 @@
   any other file fails the build; provenance in `runtime/flashinfer_fi7676/PROVENANCE.json`), and every rank logs
   `DSV41 b12x dense GEMM fence (FlashInfer #7676): present|ABSENT ...` at boot. Outputs of an undisturbed GEMM are
   unchanged (the fence orders memory, not arithmetic). Tests: `tests/test_fi7676_fence.py` (also in the image build).
-  GB10 reproduction and the TP4 gate are pending.
-
-## 2026-10-30 v2.6.3
-
-Two switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled
-requests decode a little faster, outputs bit-identical) and `DSV41_ROCE_IDLE_PARK=1` (the RDMA proxy threads stop
-spinning while the engine is idle). Unset both to return to v2.6.2. Greedy outputs are unchanged by either.
-
+  - **GB10** (2026-11-02, one DGX Spark, FlashInfer 0.6.18 of the v2.6.2 image, production's pinned tactic, nine
+    TP4 dense shapes at decode M 6-96 and prefill M 128 / 2048, every replay compared byte for byte with the quiet
+    production call): the race reproduces on GB10. Stock kernel: 26 of 2,304 eager prefill calls and 2 of 23,040
+    graph replays with a second stream busy were wrong; with the fence, 0 wrong in every mode, and quiet outputs
+    byte-identical to stock. Quiet speed with the fence x1.0005 of stock. The routed MoE (b12x_next W4A8, which
+    fills shared memory without TMA) under the same noise: 0 wrong replays.
 - **New in the production profile: block verification for sampled rows in three kernels**
   (`DSV41_BLOCK_VERIFY_FOLD=1`, `adapter/block_verify_fold.py`). Sampled requests run their acceptance after the
   verify CUDA graph, eagerly; `block_accept_probs` (block verification, since 2026-09-23) issued about 55 small torch launches

@@ -48,7 +48,7 @@ Earlier measurements, including the v2.5 sparkDash tables (sparkDash is no longe
 
 | Layer | Setting | What it does |
 |---|---|---|
-| Image | `Dockerfile.canary-roce` | upstream SGLang `dsv4.1` branch at `f80c91a4b` + credited #41303/#42901 backports + rhys101's RoCEnante overlay + all adapters |
+| Image | `Dockerfile.canary-roce` | upstream SGLang `dsv4.1` branch at `f80c91a4b` + credited #41303/#42901 backports + rhys101's RoCEnante overlay + all adapters; FlashInfer 0.6.18's b12x dense MXFP8 GEMM gets the proxy fence of [flashinfer#7676](https://github.com/flashinfer-ai/flashinfer/pull/7676) at build (a race under concurrent GPU work; each rank logs `DSV41 b12x dense GEMM fence (FlashInfer #7676): present` at boot) |
 | Slots | `MAX_RUNNING_REQUESTS=16` | adds the c16 tier |
 | Experts | `EP_SIZE=1`, `DSV41_MOE_B12X_NEXT=1`, `DSV41_MOE_B12X_NEXT_DETERMINISTIC=1` | every rank holds a quarter of all 384 experts and the routed MoE runs on b12x main: no expert-group straggler at the MoE all-reduce (all-reduce 5.9 → ~2.6 ms per step), MoE time unchanged. The deterministic reduction (per-slot buffer and a fixed-order sum instead of atomics) costs nothing measurable and makes greedy output bit-identical run to run; its <= 8-row plans use a Triton route planner and zero the barrier words in one fill (bit-identical to b12x's internal planner) |
 | Engram | `DSV41_CACHE_GIB=4`, `DSV41_CACHE_WAYS=16`, `DSV41_ENGRAM_PREFETCH=1`, `DSV41_ENGRAM_KEEPALIVE_MS=25` (default) | row cache (67–76 % hits) and row lookups on a side stream, rows bit-identical. While lookups arrive, one 4 KiB read every 25 ms keeps the NVMe drive out of its power-saving states: at c16 the drive slept between steps and each step's row reads paid ~10 ms to wake it (c16 step 149 → 140 ms, +5-6 % c16 aggregate; c1 unchanged) |
@@ -195,6 +195,7 @@ This repository is a downstream profile of **[MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-
 
 Other work this profile builds on:
 
+- **Thireus**, [flashinfer#7675](https://github.com/flashinfer-ai/flashinfer/issues/7675) and [flashinfer#7676](https://github.com/flashinfer-ai/flashinfer/pull/7676) (commit `c1d1214`): found the missing proxy fence in FlashInfer's b12x SM120/SM121 dense block-scaled GEMM and fixed it; the image applies that line at build (`runtime/flashinfer_fi7676/apply_fi7676.py`).
 - **uchkw**: the idea of parking idle RDMA proxy threads instead of polling, implemented independently as `DSV41_ROCE_IDLE_PARK` (`adapter/roce_idle_park.py`, `runtime/b12x/b12x/comm/roce_twoshot/_roce_idle_park.h`).
 - **kpham-sgl**, [sgl-project/sglang#39187](https://github.com/sgl-project/sglang/pull/39187): the bounded dense-indexer prefill transient, backported here as `adapter/indexer_chunked*.py` (whose prefill slot ids `DSV41_INDEXER_NOSYNC` builds without host syncs).
 - **BBuf** and the SGLang `dsv4.1` branch contributors ([#39370](https://github.com/sgl-project/sglang/pull/39370), [#39646](https://github.com/sgl-project/sglang/pull/39646), [#39648](https://github.com/sgl-project/sglang/pull/39648), [#39653](https://github.com/sgl-project/sglang/pull/39653)): the decode kernel work in the optional `Dockerfile.canary` image.
