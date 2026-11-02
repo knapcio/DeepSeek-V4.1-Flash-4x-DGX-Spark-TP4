@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased: FlashInfer #7676 fence in the b12x dense GEMM (not yet gated on the fleet)
+
+- **Fix (correctness): a proxy fence in the b12x SM120/SM121 dense MXFP8 GEMM**, the kernel every MXFP8 dense linear
+  runs (`adapter/mxfp8_b12x.py`). The kernel refills a pipeline stage with TMA as soon as `producer_acquire` returns,
+  with nothing ordering the MMA warps' `ldmatrix` reads of that stage before the TMA write; under concurrent GPU work a
+  tile can be computed from the next pipeline lap's data. Found and fixed upstream by Thireus
+  ([flashinfer#7675](https://github.com/flashinfer-ai/flashinfer/issues/7675),
+  [flashinfer#7676](https://github.com/flashinfer-ai/flashinfer/pull/7676), commit `c1d1214`): on an RTX 5090,
+  1,537 of 17,920 CUDA-graph replays on DeepSeek-V4.1 shapes were wrong with a second stream busy, 0 with the fence.
+  Our decode graphs run dense GEMMs beside other work by design (the shared expert on SGLang's `alt_stream` next to
+  the routed MoE, the attention multi-stream overlap, the L2-prefetch branch). The image applies PR #7676's line to
+  FlashInfer 0.6.18's file at build time (`runtime/flashinfer_fi7676/apply_fi7676.py`: sha256 pinned before and after,
+  any other file fails the build; provenance in `runtime/flashinfer_fi7676/PROVENANCE.json`), and every rank logs
+  `DSV41 b12x dense GEMM fence (FlashInfer #7676): present|ABSENT ...` at boot. Outputs of an undisturbed GEMM are
+  unchanged (the fence orders memory, not arithmetic). Tests: `tests/test_fi7676_fence.py` (also in the image build).
+  GB10 reproduction and the TP4 gate are pending.
+
 ## 2026-10-30 v2.6.3
 
 Two switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled

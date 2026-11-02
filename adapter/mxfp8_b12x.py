@@ -12,6 +12,8 @@ SM12x option. DSV41_MXFP8_BACKEND selects it (default b12x; '', 'cutlass',
 'off', or '0' restores SGLang's choice). A shape the chosen backend rejects falls back to
 cutlass for the rest of the process, logged once.
 """
+import hashlib
+import importlib.util
 import logging
 import os
 
@@ -22,6 +24,35 @@ from mxfp8_mode import mxfp8_backend_disabled
 logger = logging.getLogger(__name__)
 
 _REJECTED = set()
+
+# FlashInfer PR #7676 (issue #7675): the b12x dense GEMM's TMA stage refill needs a proxy fence after producer_acquire.
+# The image applies it at build time (runtime/flashinfer_fi7676/apply_fi7676.py); this only reports which source the
+# process will compile. sha256 of flashinfer 0.6.18's file without / with the fence.
+_FI7676_ABSENT = 'eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960'
+_FI7676_PRESENT = 'd583991c917f8cbd609f412a82651445b3f9fa1e4cac9adf24e7176e3c741d05'
+_FI7676_LINE = 'cute.arch.fence_proxy("async.shared", space="cta")'
+_FI7676_REL = os.path.join('gemm', 'kernels', 'dense_blockscaled_gemm_sm120_b12x.py')
+
+
+def fi7676_receipt(path=None):
+    """One log line naming the b12x dense GEMM source this process compiles and whether it has the #7676 fence."""
+    try:
+        if path is None:
+            spec = importlib.util.find_spec('flashinfer')
+            path = os.path.join(list(spec.submodule_search_locations)[0], _FI7676_REL)
+        with open(path, 'rb') as f:
+            data = f.read()
+    except Exception as exc:  # a receipt never breaks loading
+        return f'DSV41 b12x dense GEMM fence (FlashInfer #7676): unknown ({exc})'
+    digest = hashlib.sha256(data).hexdigest()
+    if digest == _FI7676_PRESENT:
+        state = 'present'
+    elif digest == _FI7676_ABSENT:
+        state = 'ABSENT'
+    else:
+        state = 'unpinned (fence line %s)' % ('found' if _FI7676_LINE.encode() in data.split(
+            b'mainloop_pipeline.producer_acquire(mainloop_producer_state)', 1)[-1][:200] else 'not found')
+    return f'DSV41 b12x dense GEMM fence (FlashInfer #7676): {state} sha256={digest[:16]}'
 
 
 def install(module):
@@ -45,6 +76,7 @@ def install(module):
                         output_dtype, backend=backend, pin_tactic=pin_tactic)
 
     module.flashinfer_mxfp8_blockscaled_linear = linear
+    logger.warning(fi7676_receipt())
 
     # TP=3 pads heads 64->96 and o_groups 8->12, so rank 2's wq_b / wo_b shards are
     # entirely padding: zero weights with zero block scales. A zero scale is not a
