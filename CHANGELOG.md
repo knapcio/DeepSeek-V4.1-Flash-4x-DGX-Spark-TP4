@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **Opt-in, off by default: `DSV41_SWA_NATIVE_DECODE=1`** ("swan"). Every decode attention call (<= 64 query rows: the
+  DSpark verify and draft forwards up to c4) used to copy each touched 256-token SWA page into four 64-token pages
+  first (`_split_kv_pages_to_64` in `runtime/flash_mla_sm120.canary.py`: mask fill + page mark + page split, 43 times
+  per c1 step), because FlashInfer's decode-dsv4 kernel is instantiated for 64-token pages only. Its address math is
+  generic in the page size, so the same kernel instantiated at 256-token pages (`runtime/flashinfer_v41c/csrc/
+  swan_decode_dsv4.cu`, FlashInfer's launcher and stock kernel body) reads the SWA pool in place and loads exactly the
+  bytes the split copy held: same shared-memory rows, same tactic (the stock call's AutoTuner entry), same output bits.
+  Calls it does not serve (other head counts / top-k, > 64 rows, AutoTuner tuning mode) keep the split, counted and
+  logged once per reason. The module is built at image build next to the K8 module (`dsv41_v41c build` / `verify`,
+  .so sha256 recorded and checked at load). Offline: `tests/test_swa_native_decode.py` (load rule on the native view ==
+  on the canary's own Triton split, launcher text, routing, canary block), `tests/v41n_nvcc_check.sh` (sm_121a: the
+  64-token twin of the swan kernel has the stock kernel's SASS; the 256-token kernel differs only in the page
+  constant). One GB10, 38 per-layer SWA pools, CUDA graphs (2026-11-02, spark-02): output bits equal to the split path
+  in every cell (short / 64K / 256K windows, c1 / c4, 16 and 64 heads, top-k 128 / 192, after replay and in-place
+  mutation); per 38-layer step -164..-276 us, 8 of 8 rounds faster in every cell. Serving speed: not yet measured
+  (TP4 A/B pending); not in the production profile.
+
 ## 2026-11-02 v2.6.3
 
 Two switches added to the production profile in `.env.tp4.example`: `DSV41_BLOCK_VERIFY_FOLD=1` (sampled

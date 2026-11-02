@@ -46,6 +46,15 @@ RUN FI_DIRS="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_
  && python3 /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py $FI_DIRS /opt/dsv41/runtime/flashinfer_pce/gen \
  && FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_pce build \
  && python3 -m sglang.kernels.ops.attention.dsv41_pce verify
+# DSV41_SWA_NATIVE_DECODE (opt-in, default off): FlashInfer's sparse-MLA decode at the SWA pool's own 256-token pages.
+# The module (runtime/flashinfer_v41c: vendored FlashInfer sources, VENDORED.json) is built here against the same
+# approved FlashInfer closure as the K8 module above, .so sha256 recorded in lib/module.json and checked at load.
+COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py
+COPY runtime/flashinfer_v41c/csrc /opt/dsv41/runtime/flashinfer_v41c/csrc
+COPY runtime/flashinfer_v41c/include /opt/dsv41/runtime/flashinfer_v41c/include
+COPY runtime/flashinfer_v41c/VENDORED.json /opt/dsv41/runtime/flashinfer_v41c/VENDORED.json
+RUN FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_v41c build \
+ && python3 -m sglang.kernels.ops.attention.dsv41_v41c verify
 # FlashInfer PR #7676 (issue #7675, Thireus): one proxy fence after producer_acquire in the b12x SM120/SM121 dense GEMM
 # that every MXFP8 dense linear runs (adapter/mxfp8_b12x.py). The patcher only edits the pinned 0.6.18 file (sha256
 # before and after); any other FlashInfer fails the build. CuTe DSL compiles the kernel in-process at first use.

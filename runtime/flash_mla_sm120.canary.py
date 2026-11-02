@@ -642,6 +642,16 @@ def _flash_mla_flashinfer(
     # the persistent dst buffer is left untouched and never read).
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
+    # DSV41_SWA_NATIVE_DECODE=1 (opt-in, default off): the decode kernel reads the SWA pool's own 256-token pages, no
+    # per-call 64-token split (dsv41_v41c.swan_call); None = not served, the split below runs unchanged.
+    if src_pbs != _PBS_DST:
+        from .dsv41_v41c import swan_call as _swan_call
+
+        _swan_out = _swan_call(q, kv_u8, indices, topk_length, attn_sink, head_dim_v, softmax_scale, extra_k_cache,
+                               extra_indices, extra_topk_length)
+        if _swan_out is not None:
+            return _swan_out
+
     kv_64 = (
         _split_kv_pages_to_64(kv_u8, src_pbs, touched_indices=idx)
         if src_pbs != _PBS_DST
