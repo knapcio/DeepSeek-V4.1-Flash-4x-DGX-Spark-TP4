@@ -354,15 +354,6 @@ if os.environ.get('DSV41_AB_VARIANTS', '').strip() not in ('', '0', '1'):
         print(f'DSV41_AB: refusing to start: {exc!r}', flush=True)
         os._exit(1)
 
-# DSV41_TOKENIZER_HEAP=trim|mmap|both (off by default): launch_server only (the tokenizer manager); its glibc heap
-# high-water from tokenizing 200K-950K-token prompts is returned to the OS (adapter/mem_reclaim.py). Allocation only.
-if os.environ.get('DSV41_SOURCE') and os.environ.get('DSV41_TOKENIZER_HEAP', '').strip().lower() not in ('', '0', 'off', 'false', 'no'):
-    try:
-        from mem_reclaim import install_tokenizer_heap as _install_tokenizer_heap
-        _install_tokenizer_heap()
-    except Exception as exc:
-        print(f'DSV41_TOKENIZER_HEAP: not installed ({exc!r})', flush=True)
-
 if os.environ.get('DSV41_SOURCE'):
     try:
         import tp3_pad
