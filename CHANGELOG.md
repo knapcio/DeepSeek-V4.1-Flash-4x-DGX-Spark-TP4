@@ -1,23 +1,46 @@
 # Changelog
 
-## Unreleased
+## 2026-11-03 v2.6.4 (candidate)
 
-- **Opt-in, off by default: `DSV41_SWA_NATIVE_DECODE=1`** ("swan"). Every decode attention call (<= 64 query rows: the
-  DSpark verify and draft forwards up to c4) used to copy each touched 256-token SWA page into four 64-token pages
-  first (`_split_kv_pages_to_64` in `runtime/flash_mla_sm120.canary.py`: mask fill + page mark + page split, 43 times
-  per c1 step), because FlashInfer's decode-dsv4 kernel is instantiated for 64-token pages only. Its address math is
-  generic in the page size, so the same kernel instantiated at 256-token pages (`runtime/flashinfer_v41c/csrc/
-  swan_decode_dsv4.cu`, FlashInfer's launcher and stock kernel body) reads the SWA pool in place and loads exactly the
-  bytes the split copy held: same shared-memory rows, same tactic (the stock call's AutoTuner entry), same output bits.
-  Calls it does not serve (other head counts / top-k, > 64 rows, AutoTuner tuning mode) keep the split, counted and
-  logged once per reason. The module is built at image build next to the K8 module (`dsv41_v41c build` / `verify`,
-  .so sha256 recorded and checked at load). Offline: `tests/test_swa_native_decode.py` (load rule on the native view ==
-  on the canary's own Triton split, launcher text, routing, canary block), `tests/v41n_nvcc_check.sh` (sm_121a: the
-  64-token twin of the swan kernel has the stock kernel's SASS; the 256-token kernel differs only in the page
-  constant). One GB10, 38 per-layer SWA pools, CUDA graphs (2026-11-02, spark-02): output bits equal to the split path
-  in every cell (short / 64K / 256K windows, c1 / c4, 16 and 64 heads, top-k 128 / 192, after replay and in-place
-  mutation); per 38-layer step -164..-276 us, 8 of 8 rounds faster in every cell. Serving speed: not yet measured
-  (TP4 A/B pending); not in the production profile.
+One switch added to the production profile in `.env.tp4.example`: `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the decode
+attention reads the sliding-window (SWA) cache in place instead of copying it into smaller pages first. Outputs are
+bit-identical; greedy c1 decode +1.4 / +1.9 % in two in-boot A/Bs on the four Sparks. Unset it to return to v2.6.3.
+The switch is also volatile for `DSV41_AUTOTUNE_KEEP` (toggling it reuses the tuned MoE tactics, see below).
+
+- **New in the production profile: SWA pages read in place by the decode** (`DSV41_SWA_NATIVE_DECODE=1`). Every
+  decode attention call (<= 64 query rows: the DSpark verify and draft forwards up to c4) used to copy each touched
+  256-token SWA page into four 64-token pages first (`_split_kv_pages_to_64` in `runtime/flash_mla_sm120.canary.py`:
+  mask fill + page mark + page split, 43 times per c1 step), because FlashInfer's decode-dsv4 kernel is instantiated
+  for 64-token pages only. Its address math is generic in the page size, so the same kernel instantiated at 256-token
+  pages (`runtime/flashinfer_v41c/csrc/swan_decode_dsv4.cu`, FlashInfer's launcher and stock kernel body) reads the
+  SWA pool in place and loads exactly the bytes the split copy held: same shared-memory rows, same tactic (the stock
+  call's AutoTuner entry), same output bits. Calls it does not serve (other head counts / top-k, > 64 rows, AutoTuner
+  tuning mode) keep the split, counted and logged once per reason; the module's own default stays off, the profile
+  turns it on. The module (`runtime/flashinfer_v41c`, module tag `00505fe850b7`) is built at image build next to the
+  K8 module (`dsv41_v41c build` / `verify`, .so sha256 recorded and checked at load); it also compiles the V4.1 FP4
+  readers of the same directory, which have no caller in this tree (about 25 s of nvcc in total). Offline:
+  `tests/test_swa_native_decode.py` (load rule on the native view == on the canary's own Triton split, launcher text,
+  routing, canary block, the profile line and the autotune key), `tests/v41n_nvcc_check.sh` (sm_121a: the 64-token
+  twin of the swan kernel has the stock kernel's SASS; the 256-token kernel differs only in the page constant).
+  - **One GB10** (2026-11-02, 38 per-layer SWA pools, CUDA graphs): output bits equal to the split path in every
+    cell (short / 64K / 256K windows, c1 / c4, 16 and 64 heads, top-k 128 / 192, after replay and in-place
+    mutation); per 38-layer step -164 to -276 us, 8 of 8 rounds faster in every cell.
+  - **Four Sparks, TP4** (v2.6.3 image + this module, production profile, abliterated 1017 `517efab`, KV pool pinned
+    at 4,194,304; one boot with both variants' CUDA graphs captured and the switch toggled between speedbench full
+    runs in A B B A A B order): two A/Bs on 2026-11-02 / 11-03. Greedy c1 prose + code +1.36 % and +1.86 % (A's own
+    run-to-run spread 1.36 % / 1.59 %; in the second, means of three runs: prose 65.5 -> 66.9, code 112.1 -> 114.0
+    tok/s), greedy c4 -0.06 % and +0.85 %, sampled c1 -1.95 % and +0.79 % (the sampled cells' spread between A runs
+    is up to 3 %). T = 0 outputs: 76 of 77 prompts (qeval 75 + 16K + 300K cold) gave the same text in both A runs,
+    and swan's text equals A's on all 76.
+- **`adapter/autotune_keep.py`: `DSV41_SWA_NATIVE_DECODE` is volatile.** Swan never tunes (tuning mode takes the
+  stock split) and runs the tactic the stock call resolves for the same shape, so the tuned shapes and kernels are
+  the same with it on or off; without this, switching it on would change the launch fingerprint and re-draw every
+  fused-MoE tactic on the next boot.
+- Credits: FlashInfer's SM120 sparse-MLA decode kernel (Gabriel Wu and the contributors of flashinfer-ai/flashinfer
+  #3395 and later), whose page-size-generic address math is what lets the stock kernel body read 256-token pages; the
+  256-token instantiation, its routing and the tests are ours.
+
+Release gate (v2.6.3 vs v2.6.4 vs v2.6.3, fresh boots, production profile): PENDING.
 
 ## 2026-11-02 v2.6.3
 

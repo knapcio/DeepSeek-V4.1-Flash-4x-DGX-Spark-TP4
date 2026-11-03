@@ -67,8 +67,8 @@ Third-party components and their licences:
   Origin and pins: runtime/flashinfer_fi7676/PROVENANCE.json.
 - runtime/flashinfer_v41c contains NVIDIA FlashInfer sparse_mla_sm120 sources (flashinfer 0.6.18,
   BSD-3-Clause, headers retained) with local changes listed in runtime/flashinfer_v41c/PROVENANCE.json.
-  The opt-in DSV41_SWA_NATIVE_DECODE path uses csrc/swan_decode_dsv4.cu: FlashInfer's decode-dsv4
-  launcher and its stock kernel body instantiated for 256-token pages. The other sources of that
+  The DSV41_SWA_NATIVE_DECODE path (production profile since v2.6.4) uses csrc/swan_decode_dsv4.cu:
+  FlashInfer's decode-dsv4 launcher and its stock kernel body instantiated for 256-token pages. The other sources of that
   directory (the V4.1 FP4 readers of the v41c / v41n work) are compiled into the same module but have
   no caller in this tree.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model

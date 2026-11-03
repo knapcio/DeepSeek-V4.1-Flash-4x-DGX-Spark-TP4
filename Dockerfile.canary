@@ -39,7 +39,9 @@ RUN FI_DIRS="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_
  && python3 /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py $FI_DIRS /opt/dsv41/runtime/flashinfer_pce/gen \
  && FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_pce build \
  && python3 -m sglang.kernels.ops.attention.dsv41_pce verify
-# DSV41_SWA_NATIVE_DECODE (opt-in, default off): FlashInfer's sparse-MLA decode at the SWA pool's own 256-token pages.
+# DSV41_SWA_NATIVE_DECODE (module default off; on in the production profile since v2.6.4): FlashInfer's sparse-MLA
+# decode at the SWA pool's own 256-token pages. One module with all six sources of runtime/flashinfer_v41c (the
+# swan kernel plus v41c / v41n readers that have no caller here): the bytes the TP4 A/Bs ran; ~25 s of nvcc.
 # The module (runtime/flashinfer_v41c: vendored FlashInfer sources, VENDORED.json) is built here against the same
 # approved FlashInfer closure as the K8 module above, .so sha256 recorded in lib/module.json and checked at load.
 COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py

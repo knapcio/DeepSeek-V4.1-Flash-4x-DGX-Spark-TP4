@@ -523,5 +523,51 @@ class CanaryRouting(_Fixture):
         self.assertEqual([c[0] for c in self.calls], ["split", "stock"])
 
 
+
+# ------------------------------------------------------------------------------------------------ v2.6.4 profile
+class Profile(unittest.TestCase):
+    """v2.6.4: the production line of .env.tp4.example switches swan on; the module default stays off; the switch is
+    volatile in adapter/autotune_keep.py (swan never tunes and runs the stock tactic, so toggling it must reuse the
+    tuned cache instead of re-drawing tactics); both canary Dockerfiles build and verify the module."""
+
+    def _production_line(self):
+        lines = (ROOT / ".env.tp4.example").read_text().splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
+        return lines[i - 1]
+
+    def test_production_line_enables_swan_once(self):
+        items = self._production_line().split('"')[1].split()
+        self.assertEqual([x for x in items if x.startswith("DSV41_SWA_NATIVE_DECODE")], ["DSV41_SWA_NATIVE_DECODE=1"])
+        self.assertEqual(items[-3:], ["DSV41_BLOCK_VERIFY_FOLD=1", "DSV41_ROCE_IDLE_PARK=1",
+                                      "DSV41_SWA_NATIVE_DECODE=1"])
+
+    def test_only_the_production_line_enables_swan(self):
+        text = (ROOT / ".env.tp4.example").read_text()
+        on = [line for line in text.splitlines() if line.startswith("#EXTRA_CONTAINER_ENV=") and "SWA_NATIVE" in line]
+        self.assertEqual(on, [self._production_line()])
+
+    def test_volatile_in_autotune_keep(self):
+        tree = ast.parse((ROOT / "adapter" / "autotune_keep.py").read_text())
+        vol = next(ast.literal_eval(n.value) for n in tree.body
+                   if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_VOLATILE")
+        self.assertIn("DSV41_SWA_NATIVE_DECODE", vol)
+
+    def test_default_off_in_module(self):
+        src = (V41C / "v41c.py").read_text()
+        self.assertIn('SWAN_ENV = "DSV41_SWA_NATIVE_DECODE"', src)
+        self.assertIn('if raw in ("", "0", "off", "false", "no"):\n        return False', src)
+
+    def test_dockerfiles_build_and_verify_the_module(self):
+        for name in ("Dockerfile.canary", "Dockerfile.canary-roce"):
+            d = (ROOT / name).read_text()
+            self.assertIn("COPY runtime/flashinfer_v41c/v41c.py "
+                          "/sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py", d, name)
+            self.assertIn("python3 -m sglang.kernels.ops.attention.dsv41_v41c build", d, name)
+            self.assertIn("python3 -m sglang.kernels.ops.attention.dsv41_v41c verify", d, name)
+            self.assertLess(d.index("dsv41_v41c verify"), d.index("COPY tests /opt/dsv41/tests") if
+                            "COPY tests /opt/dsv41/tests" in d else len(d), name)
+
+
 if __name__ == "__main__":
     unittest.main()

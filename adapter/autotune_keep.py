@@ -33,7 +33,10 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              "DSV41_DYN_SHARED_RATIO", "DSV41_DYN_SHARED_FIXED", "DSV41_DYN_SHARED_MAX_M",
              "DSV41_DYN_SHARED_SERIAL", "DSV41_VERIFY_CAP_LOG", "DSV41_VERIFY_CAP_LOG_FEATURES",
              "DSV41_ROUTE_STATS", "DSV41_ROUTE_RING", "DSV41_DRAFT_TAU_POS", "DSV41_ENGRAM_DRM_NODE",
-             "DSV41_ENGRAM_DRM_MIB", "DSV41_ENGRAM_DRM_LAYER")
+             "DSV41_ENGRAM_DRM_MIB", "DSV41_ENGRAM_DRM_LAYER",
+             # the swan decode never tunes (tuning mode takes the stock split) and runs the tactic the stock
+             # call resolves for the same shape: the tuned shapes and kernels are the same with it on or off
+             "DSV41_SWA_NATIVE_DECODE")
 
 
 def launch_fingerprint() -> str:
