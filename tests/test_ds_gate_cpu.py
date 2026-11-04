@@ -63,6 +63,15 @@ class Fake(http.server.BaseHTTPRequestHandler):
                                "max_model_len": 1048576})
         if self.path == "/generate":
             return self._send(self.generate(body))
+        if Fake.chat.get(KIND[body["messages"][0]["content"]]) == "namedexit":
+            # The named loop exit (DSV41_LOOP_NAMED_EXIT=1): SGLang's non-stream error body, HTTP 500.
+            b = json.dumps({"object": "error", "message": "loop_abort: DSV41 repetition (art=line, period=0, "
+                            "output_tokens=900, kept=900)", "type": "500", "param": None, "code": 500}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b)
+            return
         return self._send(self.chat_reply(body))
 
     def generate(self, body):
@@ -362,6 +371,12 @@ class DsGateCPU(unittest.TestCase):
         n_prose, n_story, n_think, n_json = (sum(r["kind"] == k for r in rows) for k in ("prose", "story", "think", "json"))
         self.assertIn(f"TSCAN: {n_prose + n_story + n_think} salad of 35 outputs (errors 0, bad json {n_json})", out)
         self.assertIn("(repetition) LOOP", out)
+        Fake.chat = {"think": "namedexit"}
+        rc, rows, out = self.tscan("named-exit")
+        self.assertEqual(rc, 1)
+        self.assertEqual({tuple(r["flags"]) for r in rows if r["kind"] == "think"}, {("LOOP",)})
+        self.assertIn(f"TSCAN: {n_think} salad of 35 outputs (errors 0, bad json 0)", out)
+        self.assertIn("(loop_abort) LOOP", out)
         Fake.chat = {"json": "badjson"}
         rc, _, out = self.tscan("badjson-only")
         self.assertEqual(rc, 0, out)  # BADJSON is a warning only

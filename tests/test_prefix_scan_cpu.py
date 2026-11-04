@@ -18,7 +18,7 @@ import prefix_scan as P  # noqa: E402
 
 
 class Fake(http.server.BaseHTTPRequestHandler):
-    mode = "clean"     # clean | degenerate | stale | nohit | phantom | worse | loopabort
+    mode = "clean"     # clean | degenerate | stale | nohit | phantom | worse | loopabort | loopabort500
     report = True      # usage.prompt_tokens_details.cached_tokens (SGLang --enable-cache-report)
     seen = set()
     hits = 0.0
@@ -56,6 +56,15 @@ class Fake(http.server.BaseHTTPRequestHandler):
             Fake.seen.add((salt, n))
             if warm and Fake.mode != "nohit":
                 Fake.hits += 90000
+        if Fake.mode == "loopabort500" and warm:
+            # The named loop exit (DSV41_LOOP_NAMED_EXIT=1): SGLang's non-stream error body, HTTP 500.
+            b = json.dumps({"object": "error", "message": "loop_abort: DSV41 repetition (art=ngram, period=32, "
+                            "output_tokens=128, kept=32)", "type": "500", "param": None, "code": 500}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b)
+            return
         if q.startswith("Give the ref code"):
             a, b = (int(x) for x in re.findall(r"Record (\d{5})", q))
             ca = "ZZZZZ" if (warm and Fake.mode == "worse") else pfx.codes[a]
@@ -138,6 +147,12 @@ class PrefixScanCPU(unittest.TestCase):
         rc, res = self.go("loopabort")
         self.assertEqual(rc, 1)
         self.assertGreater(res["summary"]["degenerate"], 0)
+
+    def test_named_loop_exit_is_degenerate_not_error(self):
+        rc, res = self.go("loopabort500")
+        self.assertEqual(rc, 1)
+        self.assertGreater(res["summary"]["degenerate"], 0)
+        self.assertFalse(any("request error" in r for r in res["summary"]["reasons"]), res["summary"])
 
     def test_degenerate_fails(self):
         rc, res = self.go("degenerate")

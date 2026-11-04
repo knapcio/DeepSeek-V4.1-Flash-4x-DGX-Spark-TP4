@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+A loop-aborted request now ends as a named error instead of a normal stop, and a request whose history holds a
+broken tool call is no longer rejected with HTTP 400 ([#66](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/66)).
+Ported from upstream: [MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks#55](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/55)
+(upstream commit `bdf657c`, issue [#54](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/issues/54)).
+Requests the loop detector does not stop are unchanged, token for token; the detector's thresholds and what it keeps
+are unchanged.
+
+- **Fix: named exit for the loop abort** (`adapter/loop_abort.py`, `DSV41_LOOP_NAMED_EXIT`, default 1). The detector
+  used to finish a looping request with `finish_reason=stop` / `matched_stop=repetition`, which a client cannot tell
+  from a finished answer: an agent client (OpenCode) took a reasoning-only step that ended this way as the end of its
+  turn and sat idle, and a tool call cut mid-arguments looked like a complete one. A hit now finishes the request with
+  SGLang's `FINISH_ABORT` (HTTP 500 status, error type `loop_abort`) and a message that names the cause, e.g.
+  `loop_abort: DSV41 repetition (art=ngram, period=32, output_tokens=1102, kept=823)`. Streaming clients get an error
+  event after the tokens already sent; non-streaming clients get HTTP 500 with that message. On the Anthropic
+  Messages endpoint the stream ends with an `api_error` event carrying the message; a non-streaming Messages request
+  gets HTTP 500 with SGLang's generic 5xx text. The log line gains `art=`, `period=` and `exit=`.
+  `DSV41_LOOP_NAMED_EXIT=0` restores the stop exit. The old exit had one more defect that goes away with it: SGLang's
+  detokenizer trims a string `matched_stop` at its first occurrence in the finished output, so an aborted answer that
+  contained the word "repetition" was also cut there.
+- **Fix: broken tool calls in the request history** (`adapter/history_repair.py`, `DSV41_HISTORY_REPAIR`, default 1).
+  An agent client keeps a truncated tool call in its history next to its own "invalid JSON, try again" tool result;
+  SGLang's `parse_tool_call_arguments` rejected that history with HTTP 400, which agent clients do not retry. Tool-call
+  arguments that are not a JSON object are now passed to the template as `{"_unparseable_arguments": <raw text>}`
+  and logged as `DSV41 history repair: len=... reason=json|not_object`, so the model sees its own broken call. Valid
+  arguments go through SGLang's parser unchanged. `DSV41_HISTORY_REPAIR=0` restores the 400.
+- `start.sh` passes both switches to every container (head and workers), like the other `DSV41_LOOP_*` keys, so a
+  value set in `.env.tp4` takes effect; both are documented in `.env.tp4.example` / `.env.example`.
+- `scripts/ds_gate.py tscan` and `scripts/prefix_scan.py` count the named exit (an HTTP error whose message starts
+  with `loop_abort:`) as a loop / degenerate output, as they counted `matched_stop=repetition`, instead of as a
+  request error.
+- **Tests:** upstream's `tests/test_loop_abort.py` (15, three new) and `tests/test_history_repair.py` (6), in the
+  build of all three images. New `tests/test_loop_exit_passthrough.py` (`Dockerfile.canary-roce` build, against the
+  image's own SGLang tree): the detector decides hit / no hit and the kept length exactly as v2.6.3's on a fuzz
+  corpus; a decode loop with speculative accept lengths, EOS and the length cap gives identical tokens, finish step,
+  finish reason and `finished_len` with no hook, the named exit, `DSV41_LOOP_NAMED_EXIT=0` and `DSV41_LOOP_ABORT=0`
+  for every request the detector does not stop; for stopped requests the two exits keep the same tokens; valid tool
+  histories encode to byte-identical prompts through the pinned `encoding_dsv41` with and without the repair; and
+  the serving layer still has the `FINISH_ABORT` signature, the streaming error branch for an `HTTPStatus` abort and
+  the non-streaming HTTP 500 that the named exit relies on.
+- **Credits:** Alexander Busse ([GanyX19](https://github.com/GanyX19)) found the problem on a TP4 agent workload and
+  wrote the fix (MiaAI-Lab#54, #55, merged upstream by MiaAI-Lab as `bdf657c`); `adapter/history_repair.py`,
+  `tests/test_history_repair.py` and the `loop_abort.py` / `test_loop_abort.py` changes are his, unchanged.
+  [slidonnici](https://github.com/slidonnici) reported the stall on this repository with OpenCode (#66).
+
 ## 2026-11-05 v2.6.4
 
 Four switches added to the production profile in `.env.tp4.example`. `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the

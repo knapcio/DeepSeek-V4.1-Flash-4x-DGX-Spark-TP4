@@ -81,6 +81,8 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.entrypoints.openai.serving_chat':
             from encoding_compat import install_serving_chat
             install_serving_chat(module)
+            from history_repair import install as install_history_repair
+            install_history_repair(module)
         elif module.__name__ == 'sglang.srt.entrypoints.anthropic.protocol':
             from encoding_compat import install_anthropic_protocol
             install_anthropic_protocol(module)

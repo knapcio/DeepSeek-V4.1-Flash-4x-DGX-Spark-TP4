@@ -71,6 +71,11 @@ Third-party components and their licences:
   FlashInfer's decode-dsv4 launcher and its stock kernel body instantiated for 256-token pages. The other sources of that
   directory (the V4.1 FP4 readers of the v41c / v41n work) are compiled into the same module but have
   no caller in this tree.
+- adapter/history_repair.py, tests/test_history_repair.py and the named loop-abort exit in
+  adapter/loop_abort.py / tests/test_loop_abort.py are MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
+  PR 55 by Alexander Busse (GanyX19), upstream commit bdf657c (issue 54), contributed there under
+  the AGPL-3.0 and ported here unchanged under the same licence. The stall it fixes on this
+  repository was reported by slidonnici (issue 66).
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.
