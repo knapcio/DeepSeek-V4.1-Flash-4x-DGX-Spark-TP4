@@ -60,6 +60,7 @@ jobs:
             tests/test_b12x_memory_requirements.py \
             tests/test_b12x_next_claim_barrier.py \
             tests/test_prefill_native_extra.py \
+            tests/test_decode_yield.py \
             tests/test_roce_ring.py \
             tests/test_remote_dotenv.py \
             tests/test_upstream_launcher_ports.py \
@@ -126,6 +127,7 @@ jobs:
             tests/test_b12x_memory_requirements.py \
             tests/test_b12x_next_claim_barrier.py \
             tests/test_prefill_native_extra.py \
+            tests/test_decode_yield.py \
             tests/test_v41_tool_constraint.py
           bash -n start.sh stop.sh scripts/fetch-sglang-canary.sh
       - name: Vendored detector identity

@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+- **Opt-in: running streams keep a decode share while a long prompt prefills** (`DSV41_DECODE_YIELD=<pct>`,
+  `adapter/decode_yield.py`; not in the production profile until a fleet A / X / A' window qualifies it).
+  - **Before.** Between two 8192-token chunks of a long prompt (~1.35-1.7 s each) the engine runs only the
+    `--prefill-decode-interval` decode steps (2 in the production profile, ~0.06-0.18 s). In the 2026-11-03/04
+    production log every long prefill with streams running shows 20 chunks per 40-step `Decode batch` line, and the
+    other agents' gen throughput falls from 100-160 to 3-28 tok/s for 0.5-2 minutes.
+  - **Now.** After a non-final chunk beside running streams, the next prefill is deferred until the streams have had
+    decode time worth `pct / (100 - pct)` of that chunk's time (50: as much decode as chunk time). Both times come from
+    an integer cost model fitted to the production log (8192-token chunk 1.3545 s + 0.487 us per prefix token; decode
+    step 26.3 ms + 15.2 ms per running request), never a clock. The deferral is the engine's own
+    `_should_defer_prefill` path that `--prefill-decode-interval` already uses between chunks in production. The yield
+    ends at once when no stream is left or the chunked prompt is gone, is never shorter than the configured interval
+    and never longer than 128 steps. Nothing is armed after a final chunk, a solo short pass, a chunk with no stream
+    running (a lone long prompt prefills exactly as before), or under DP attention / dLLM.
+  - **Trade-off (model, 2 streams beside a 500K cold prompt):** share 50 gives the streams ~7x their decode steps during
+    the prefill (0.51 instead of 0.07 of the time) and makes that prompt's first token ~1.87x later; share 33: ~4.7x
+    and ~1.40x. Streams that finish sooner hand the time back.
+  - **Exactness / rank invariance:** only when the next chunk runs changes; chunk boundaries, chunk batches and decode
+    batches are the engine's own. Every input is replicated scheduler state (the scheduled batch, the running batch
+    size, the chunk position, the request id) and integer constants, so all TP ranks take the same decision.
+    `DSV41_DECODE_YIELD_RID_ARMS=1` (test only) lets a long prompt's request id (`dyield-s<NN>-...`) pick the share,
+    for in-boot A/B.
+  - **Tests:** `tests/test_decode_yield.py` drives the pinned `get_next_batch_to_run`, `_should_defer_prefill` and
+    `_arm_prefill_decode_interval` (lifted from the staged SGLang source) through a simulated event loop: off and
+    share 0 are the stock trace round for round, the long prompt's chunks are unchanged, the share is reached, a lone
+    prompt / final chunk / solo pass arm nothing, a yield ends when the streams finish or the prompt is aborted, four
+    simulated ranks with different clocks and environments produce one trace, pins, drift refusal, env parsing.
+  - **Evaluated and not used:** a smaller chunk while streams run (each chunk carries a ~0.33 s fixed cost, derived from
+    v2.4's 4096 -> 8192 change, and other chunk boundaries change the long prompt's numerics); `--enable-mixed-chunk`
+    (with DSpark the running rows degrade to a 1-token plain decode through the extend path, eager, while the decode
+    CUDA graphs and speculative steps are what make them fast); a fixed larger `--prefill-decode-interval` (also
+    delays every short prompt queued behind any prefill, and gives a share that varies 2x with the batch size).
+  - **Credits:** the deferral mechanism is SGLang's `--prefill-decode-interval`, with **Shangming Cai**'s #44001 gate
+    already backported. **Christopher Owen**'s prefill yield (spark-ds41f, vLLM 0545: a long prompt's chunk step goes
+    to short prompts and held first tokens) was the starting point of the comparison; it addresses short prompts,
+    which our solo short pass covers, rather than the cadence of running streams.
+
 ## 2026-11-03 v2.6.4 (candidate)
 
 One switch added to the production profile in `.env.tp4.example`: `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the decode

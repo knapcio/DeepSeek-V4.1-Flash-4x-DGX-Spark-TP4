@@ -280,6 +280,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_BLOCK_VERIFY_FOLD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from block_verify_fold import install_scheduler as install_block_verify_fold_scheduler
                 install_block_verify_fold_scheduler(module)
+            # Gated on DSV41_DECODE_YIELD=<pct>: running streams keep a decode share while a long
+            # prompt prefills (adapter/decode_yield.py). Gate checked BEFORE the import.
+            if os.environ.get('DSV41_DECODE_YIELD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from decode_yield import install as install_decode_yield
+                install_decode_yield(module)
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)
