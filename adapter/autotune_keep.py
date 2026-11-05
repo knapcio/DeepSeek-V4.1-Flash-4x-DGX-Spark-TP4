@@ -36,7 +36,10 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              "DSV41_ENGRAM_DRM_MIB", "DSV41_ENGRAM_DRM_LAYER",
              # the swan decode never tunes (tuning mode takes the stock split) and runs the tactic the stock
              # call resolves for the same shape: the tuned shapes and kernels are the same with it on or off
-             "DSV41_SWA_NATIVE_DECODE")
+             "DSV41_SWA_NATIVE_DECODE",
+             # the decode yield only decides WHEN the next prefill chunk runs (scheduler side, after boot):
+             # no GEMM shape, kernel or tuning pass depends on it
+             "DSV41_DECODE_YIELD", "DSV41_DECODE_YIELD_RID_ARMS")
 
 
 def launch_fingerprint() -> str:

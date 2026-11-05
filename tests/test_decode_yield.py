@@ -509,5 +509,52 @@ class SimulatedSchedulerTests(unittest.TestCase):
         self.assertTrue(all(a[4] < b[4] for a, b in zip(rows, rows[1:])))
 
 
+# ---------------------------------------------------------------- v2.6.4 profile (no staged source needed)
+class Profile(unittest.TestCase):
+    """v2.6.4: the production line of .env.tp4.example sets DSV41_DECODE_YIELD=33 (owner's share; measured on the
+    fleet 2026-11-05); the module stays off when unset; the switch (and its test-only rid arms) is volatile in
+    adapter/autotune_keep.py (scheduler-side timing only, so toggling it must reuse the tuned MoE tactics); both canary
+    Dockerfiles run this test against the image's own scheduler source."""
+
+    def _production_line(self):
+        lines = (ROOT / '.env.tp4.example').read_text().splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith('# Production settings, together with the line'))
+        self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
+        return lines[i - 1]
+
+    def test_production_line_sets_share_33_once_last(self):
+        items = self._production_line().split('"')[1].split()
+        self.assertEqual([x for x in items if x.startswith('DSV41_DECODE_YIELD')], ['DSV41_DECODE_YIELD=33'])
+        self.assertEqual(items[-2:], ['DSV41_SWA_NATIVE_DECODE=1', 'DSV41_DECODE_YIELD=33'])
+        self.assertEqual(dy.parse_pct('33'), 33)
+
+    def test_only_the_production_line_sets_it(self):
+        text = (ROOT / '.env.tp4.example').read_text()
+        on = [line for line in text.splitlines() if line.startswith('#EXTRA_CONTAINER_ENV=') and 'DECODE_YIELD' in line]
+        self.assertEqual(on, [self._production_line()])
+        on = [line for line in text.splitlines() if line.lstrip('#').startswith(('EXTRA_CONTAINER_ENV=', 'DSV41_'))
+              and 'DECODE_YIELD_RID_ARMS' in line]
+        self.assertEqual(on, [], 'the rid arms are test only')
+
+    def test_volatile_in_autotune_keep(self):
+        tree = ast.parse((ROOT / 'adapter' / 'autotune_keep.py').read_text())
+        vol = next(ast.literal_eval(n.value) for n in tree.body
+                   if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == '_VOLATILE')
+        self.assertIn('DSV41_DECODE_YIELD', vol)
+        self.assertIn('DSV41_DECODE_YIELD_RID_ARMS', vol)
+
+    def test_default_off_in_module(self):
+        self.assertFalse(dy.requested({}))
+        self.assertFalse(dy.requested({dy.ENV: '0'}))
+        self.assertTrue(dy.requested({dy.ENV: '33'}))
+        self.assertFalse(install(type('S', (), {}), ''))
+
+    def test_dockerfiles_run_this_test_on_the_image_source(self):
+        for name in ('Dockerfile.canary', 'Dockerfile.canary-roce'):
+            d = (ROOT / name).read_text()
+            self.assertIn('DSV41_DECODE_YIELD_SOURCE_ROOT=/sgl-workspace/sglang/python/sglang/srt/managers '
+                          'PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_decode_yield.py', d, name)
+
+
 if __name__ == '__main__':
     unittest.main()

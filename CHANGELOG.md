@@ -1,50 +1,14 @@
 # Changelog
 
-## Unreleased
+## 2026-11-05 v2.6.4 (candidate)
 
-- **Opt-in: running streams keep a decode share while a long prompt prefills** (`DSV41_DECODE_YIELD=<pct>`,
-  `adapter/decode_yield.py`; not in the production profile until a fleet A / X / A' window qualifies it).
-  - **Before.** Between two 8192-token chunks of a long prompt (~1.35-1.7 s each) the engine runs only the
-    `--prefill-decode-interval` decode steps (2 in the production profile, ~0.06-0.18 s). In the 2026-11-03/04
-    production log every long prefill with streams running shows 20 chunks per 40-step `Decode batch` line, and the
-    other agents' gen throughput falls from 100-160 to 3-28 tok/s for 0.5-2 minutes.
-  - **Now.** After a non-final chunk beside running streams, the next prefill is deferred until the streams have had
-    decode time worth `pct / (100 - pct)` of that chunk's time (50: as much decode as chunk time). Both times come from
-    an integer cost model fitted to the production log (8192-token chunk 1.3545 s + 0.487 us per prefix token; decode
-    step 26.3 ms + 15.2 ms per running request), never a clock. The deferral is the engine's own
-    `_should_defer_prefill` path that `--prefill-decode-interval` already uses between chunks in production. The yield
-    ends at once when no stream is left or the chunked prompt is gone, is never shorter than the configured interval
-    and never longer than 128 steps. Nothing is armed after a final chunk, a solo short pass, a chunk with no stream
-    running (a lone long prompt prefills exactly as before), or under DP attention / dLLM.
-  - **Trade-off (model, 2 streams beside a 500K cold prompt):** share 50 gives the streams ~7x their decode steps during
-    the prefill (0.51 instead of 0.07 of the time) and makes that prompt's first token ~1.87x later; share 33: ~4.7x
-    and ~1.40x. Streams that finish sooner hand the time back.
-  - **Exactness / rank invariance:** only when the next chunk runs changes; chunk boundaries, chunk batches and decode
-    batches are the engine's own. Every input is replicated scheduler state (the scheduled batch, the running batch
-    size, the chunk position, the request id) and integer constants, so all TP ranks take the same decision.
-    `DSV41_DECODE_YIELD_RID_ARMS=1` (test only) lets a long prompt's request id (`dyield-s<NN>-...`) pick the share,
-    for in-boot A/B.
-  - **Tests:** `tests/test_decode_yield.py` drives the pinned `get_next_batch_to_run`, `_should_defer_prefill` and
-    `_arm_prefill_decode_interval` (lifted from the staged SGLang source) through a simulated event loop: off and
-    share 0 are the stock trace round for round, the long prompt's chunks are unchanged, the share is reached, a lone
-    prompt / final chunk / solo pass arm nothing, a yield ends when the streams finish or the prompt is aborted, four
-    simulated ranks with different clocks and environments produce one trace, pins, drift refusal, env parsing.
-  - **Evaluated and not used:** a smaller chunk while streams run (each chunk carries a ~0.33 s fixed cost, derived from
-    v2.4's 4096 -> 8192 change, and other chunk boundaries change the long prompt's numerics); `--enable-mixed-chunk`
-    (with DSpark the running rows degrade to a 1-token plain decode through the extend path, eager, while the decode
-    CUDA graphs and speculative steps are what make them fast); a fixed larger `--prefill-decode-interval` (also
-    delays every short prompt queued behind any prefill, and gives a share that varies 2x with the batch size).
-  - **Credits:** the deferral mechanism is SGLang's `--prefill-decode-interval`, with **Shangming Cai**'s #44001 gate
-    already backported. **Christopher Owen**'s prefill yield (spark-ds41f, vLLM 0545: a long prompt's chunk step goes
-    to short prompts and held first tokens) was the starting point of the comparison; it addresses short prompts,
-    which our solo short pass covers, rather than the cadence of running streams.
-
-## 2026-11-03 v2.6.4 (candidate)
-
-One switch added to the production profile in `.env.tp4.example`: `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the decode
+Two switches added to the production profile in `.env.tp4.example`: `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the decode
 attention reads the sliding-window (SWA) cache in place instead of copying it into smaller pages first. Outputs are
-bit-identical; greedy c1 decode +1.4 / +1.9 % in two in-boot A/Bs on the four Sparks. Unset it to return to v2.6.3.
-The switch is also volatile for `DSV41_AUTOTUNE_KEEP` (toggling it reuses the tuned MoE tactics, see below).
+bit-identical; greedy c1 decode +1.4 / +1.9 % in two in-boot A/Bs on the four Sparks. And `DSV41_DECODE_YIELD=33`:
+while one prompt prefills in chunks, the other running streams keep about 40 % of their decode rate instead of 8 %
+(measured on the four Sparks), and that prompt's first token comes x1.47 later. Unset both to return to v2.6.3
+(`DSV41_DECODE_YIELD` alone: the stock prefill / decode cadence). Both switches are volatile for `DSV41_AUTOTUNE_KEEP`
+(toggling them reuses the tuned MoE tactics, see below).
 
 - **New in the production profile: SWA pages read in place by the decode** (`DSV41_SWA_NATIVE_DECODE=1`). Every
   decode attention call (<= 64 query rows: the DSpark verify and draft forwards up to c4) used to copy each touched
@@ -71,11 +35,61 @@ The switch is also volatile for `DSV41_AUTOTUNE_KEEP` (toggling it reuses the tu
     tok/s), greedy c4 -0.06 % and +0.85 %, sampled c1 -1.95 % and +0.79 % (the sampled cells' spread between A runs
     is up to 3 %). T = 0 outputs: 76 of 77 prompts (qeval 75 + 16K + 300K cold) gave the same text in both A runs,
     and swan's text equals A's on all 76.
+- **New in the production profile (share 33): running streams keep a decode share while a long prompt prefills**
+  (`DSV41_DECODE_YIELD=33`, `adapter/decode_yield.py`; the module is off when the variable is unset).
+  - **Before.** Between two 8192-token chunks of a long prompt (~1.35-1.7 s each) the engine runs only the
+    `--prefill-decode-interval` decode steps (2 in the production profile, ~0.06-0.18 s). In the 2026-11-03/04
+    production log every long prefill with streams running shows 20 chunks per 40-step `Decode batch` line, and the
+    other agents' gen throughput falls from 100-160 to 3-28 tok/s for 0.5-2 minutes.
+  - **Now.** After a non-final chunk beside running streams, the next prefill is deferred until the streams have had
+    decode time worth `pct / (100 - pct)` of that chunk's time (50: as much decode as chunk time). Both times come from
+    an integer cost model fitted to the production log (8192-token chunk 1.3545 s + 0.487 us per prefix token; decode
+    step 26.3 ms + 15.2 ms per running request), never a clock. The deferral is the engine's own
+    `_should_defer_prefill` path that `--prefill-decode-interval` already uses between chunks in production. The yield
+    ends at once when no stream is left or the chunked prompt is gone, is never shorter than the configured interval
+    and never longer than 128 steps. Nothing is armed after a final chunk, a solo short pass, a chunk with no stream
+    running (a lone long prompt prefills exactly as before), or under DP attention / dLLM.
+  - **Four Sparks, TP4 (measured 2026-11-05, run `run-20261105-064842-138505`, verdict PASS on every pre-registered
+    rule):** fresh boots A / X / A' on the v2.6.2 image plus this adapter, production profile, abliterated 1017
+    `517efab`; X at share 50 with the test-only rid arms, so one boot measured shares 0, 33 and 50 (the loop guard
+    `DSV41_LOOP_ABORT=0` in all three boots: the workload's random-token streams would otherwise trip it). Two streams
+    decoding on 300K contexts (T 0) while a cold 500K prompt prefilled: the streams' decode rate during the prefill,
+    relative to their rate in the 20 s before it, **0.080 stock -> 0.393 at share 33** (0.524 at 50); the 500K
+    prompt's time to first token **x1.47 at 33** (x1.94 at 50). Switch off (A, A') = stock scheduling. Speedbench
+    full with X (share 50) vs the mean of A and A': c1 prose +0.99 %, c1 code +0.76 %, c4 prose +0.72 %, c4 code
+    +0.81 % (no cost outside long prefills). The T 0 identity rule (16K, 300K cold) and the long prompt's
+    first-output-ids rule passed. Share 33 is the production compromise between the streams' rate and the long prompt's first token.
+  - **Trade-off (model, 2 streams beside a 500K cold prompt):** share 50 gives the streams ~7x their decode steps during
+    the prefill (0.51 instead of 0.07 of the time) and makes that prompt's first token ~1.87x later; share 33: ~4.7x
+    and ~1.40x. Streams that finish sooner hand the time back.
+  - **Exactness / rank invariance:** only when the next chunk runs changes; chunk boundaries, chunk batches and decode
+    batches are the engine's own. Every input is replicated scheduler state (the scheduled batch, the running batch
+    size, the chunk position, the request id) and integer constants, so all TP ranks take the same decision.
+    `DSV41_DECODE_YIELD_RID_ARMS=1` (test only) lets a long prompt's request id (`dyield-s<NN>-...`) pick the share,
+    for in-boot A/B; never set it in serving.
+  - **Tests:** `tests/test_decode_yield.py` drives the pinned `get_next_batch_to_run`, `_should_defer_prefill` and
+    `_arm_prefill_decode_interval` (lifted from the staged SGLang source) through a simulated event loop: off and
+    share 0 are the stock trace round for round, the long prompt's chunks are unchanged, the share is reached, a lone
+    prompt / final chunk / solo pass arm nothing, a yield ends when the streams finish or the prompt is aborted, four
+    simulated ranks with different clocks and environments produce one trace, pins, drift refusal, env parsing; the
+    v2.6.4 profile (`Profile`: share 33 last on the production line and only there, volatile keys, module default off,
+    both canary Dockerfiles run the test on the image's own scheduler source).
+  - **Evaluated and not used:** a smaller chunk while streams run (each chunk carries a ~0.33 s fixed cost, derived from
+    v2.4's 4096 -> 8192 change, and other chunk boundaries change the long prompt's numerics); `--enable-mixed-chunk`
+    (with DSpark the running rows degrade to a 1-token plain decode through the extend path, eager, while the decode
+    CUDA graphs and speculative steps are what make them fast); a fixed larger `--prefill-decode-interval` (also
+    delays every short prompt queued behind any prefill, and gives a share that varies 2x with the batch size).
+  - **Credits:** the deferral mechanism is SGLang's `--prefill-decode-interval`, with **Shangming Cai**'s #44001 gate
+    already backported. **Christopher Owen**'s prefill yield (spark-ds41f, vLLM 0545: a long prompt's chunk step goes
+    to short prompts and held first tokens) was the starting point of the comparison; it addresses short prompts,
+    which our solo short pass covers, rather than the cadence of running streams.
 - **`adapter/autotune_keep.py`: `DSV41_SWA_NATIVE_DECODE` is volatile.** Swan never tunes (tuning mode takes the
   stock split) and runs the tactic the stock call resolves for the same shape, so the tuned shapes and kernels are
   the same with it on or off; without this, switching it on would change the launch fingerprint and re-draw every
-  fused-MoE tactic on the next boot.
-- Credits: FlashInfer's SM120 sparse-MLA decode kernel (Gabriel Wu and the contributors of flashinfer-ai/flashinfer
+  fused-MoE tactic on the next boot. **`DSV41_DECODE_YIELD` and `DSV41_DECODE_YIELD_RID_ARMS` are volatile** too:
+  the yield only decides when the next prefill chunk runs, in the scheduler, after boot; no GEMM shape, kernel or
+  tuning pass depends on it.
+- Credits (swan): FlashInfer's SM120 sparse-MLA decode kernel (Gabriel Wu and the contributors of flashinfer-ai/flashinfer
   #3395 and later), whose page-size-generic address math is what lets the stock kernel body read 256-token pages; the
   256-token instantiation, its routing and the tests are ours.
 

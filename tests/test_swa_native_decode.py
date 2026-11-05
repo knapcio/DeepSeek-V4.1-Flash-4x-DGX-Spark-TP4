@@ -539,8 +539,9 @@ class Profile(unittest.TestCase):
     def test_production_line_enables_swan_once(self):
         items = self._production_line().split('"')[1].split()
         self.assertEqual([x for x in items if x.startswith("DSV41_SWA_NATIVE_DECODE")], ["DSV41_SWA_NATIVE_DECODE=1"])
-        self.assertEqual(items[-3:], ["DSV41_BLOCK_VERIFY_FOLD=1", "DSV41_ROCE_IDLE_PARK=1",
-                                      "DSV41_SWA_NATIVE_DECODE=1"])
+        i = items.index("DSV41_SWA_NATIVE_DECODE=1")     # after v2.6.3's two keys (v2.6.4's decode yield follows)
+        self.assertEqual(items[i - 2:i + 1], ["DSV41_BLOCK_VERIFY_FOLD=1", "DSV41_ROCE_IDLE_PARK=1",
+                                              "DSV41_SWA_NATIVE_DECODE=1"])
 
     def test_only_the_production_line_enables_swan(self):
         text = (ROOT / ".env.tp4.example").read_text()

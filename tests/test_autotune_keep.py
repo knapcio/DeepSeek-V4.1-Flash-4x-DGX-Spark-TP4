@@ -52,6 +52,9 @@ def main():
     assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_SWA_NATIVE_DECODE"] = "1"          # swan: stock tactics, never tunes: volatile
     assert ak.launch_fingerprint() == fp_before
+    os.environ["DSV41_DECODE_YIELD"] = "33"              # scheduler-side chunk timing: volatile
+    os.environ["DSV41_DECODE_YIELD_RID_ARMS"] = "1"
+    assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_VERIFY_CAP"] = "conf:0.1"          # A/B-neutral switch: same fingerprint
     assert ak.launch_fingerprint() == ak.launch_fingerprint()
     fp_a = ak.launch_fingerprint()
