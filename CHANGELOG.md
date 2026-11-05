@@ -2,14 +2,25 @@
 
 ## 2026-11-05 v2.6.4 (candidate)
 
-Two switches added to the production profile in `.env.tp4.example`: `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the decode
-attention reads the sliding-window (SWA) cache in place instead of copying it into smaller pages first. Outputs are
-bit-identical; greedy c1 decode +1.4 / +1.9 % in two in-boot A/Bs on the four Sparks. And `DSV41_DECODE_YIELD=33`:
+Four switches added to the production profile in `.env.tp4.example`. `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the
+decode attention reads the sliding-window (SWA) cache in place instead of copying it into smaller pages first. Outputs
+are bit-identical; greedy c1 decode +1.4 / +1.9 % in two in-boot A/Bs on the four Sparks. `DSV41_DECODE_YIELD=33`:
 while one prompt prefills in chunks, the other running streams keep about 40 % of their decode rate instead of 8 %
-(measured on the four Sparks), and that prompt's first token comes x1.47 later. Unset both to return to v2.6.3
-(`DSV41_DECODE_YIELD` alone: the stock prefill / decode cadence). Both switches are volatile for `DSV41_AUTOTUNE_KEEP`
-(toggling them reuses the tuned MoE tactics, see below).
+(measured on the four Sparks), and that prompt's first token comes x1.47 later. `DSV41_SWA_THIN=1` with
+`--swa-prefix-tails 384` (was 128): idle agent sessions keep their prefix-cache resume points (resumed 300-330K
+sessions 3.9-6.5 s instead of 61-64 s on the four Sparks), for a full KV pool of ~3.6M instead of ~5.1M tokens.
+`DSV41_SWA_CONE_REPLAY=1` with `DSV41_SWA_CONE_TOKENS=8192`: a resume point that is evicted anyway costs a
+one-chunk replay (1.6-2.1 s) instead of a whole-context re-prefill (22-68 s at 130-400K tokens). Unset all four
+(and set `--swa-prefix-tails 128`) to return to v2.6.3; each can be unset alone. All the new keys are volatile for
+`DSV41_AUTOTUNE_KEEP` (toggling them reuses the tuned MoE tactics, see below); the tails change is a launch argument,
+so the first boot after it re-tunes once.
 
+- **KV pool: ~5.1M -> ~3.6M tokens** (`--swa-prefix-tails 384`). The SWA pool is a fixed cost subtracted from the
+  KV budget before the full pool is sized, so 98,304 more SWA slots (~23.9 KB each per rank, +2.2 GiB) cost ~1.4M
+  full-pool tokens: measured 5.06-5.16M -> 3.60-3.75M on the four Sparks. The static pool and the head's
+  MemAvailable are unchanged (low-water 12.69 / 12.50 GiB with it vs 12.71 / 12.64 without). Three 1M-token
+  contexts still fit, four no longer do; the production peak in flight over a full day was 1.91M. **Rollback is
+  config only:** unset `DSV41_SWA_THIN` and set `--swa-prefix-tails 128` (256 is the middle step, ~4.4M tokens).
 - **New in the production profile: SWA pages read in place by the decode** (`DSV41_SWA_NATIVE_DECODE=1`). Every
   decode attention call (<= 64 query rows: the DSpark verify and draft forwards up to c4) used to copy each touched
   256-token SWA page into four 64-token pages first (`_split_kv_pages_to_64` in `runtime/flash_mla_sm120.canary.py`:
@@ -83,7 +94,7 @@ while one prompt prefills in chunks, the other running streams keep about 40 % o
     already backported. **Christopher Owen**'s prefill yield (spark-ds41f, vLLM 0545: a long prompt's chunk step goes
     to short prompts and held first tokens) was the starting point of the comparison; it addresses short prompts,
     which our solo short pass covers, rather than the cadence of running streams.
-- **New adapter: superseded SWA checkpoints are evicted first** (`DSV41_SWA_THIN`, `adapter/swa_thin.py`; off when
+- **New in the production profile: superseded SWA checkpoints are evicted first** (`DSV41_SWA_THIN`, `adapter/swa_thin.py`; off when
   unset). A cached prefix is reusable only at a node whose last sliding window (128 tokens) still holds SWA slots, and
   the SWA pool is small (cap mode: request cap 35,328 + `--swa-prefix-tails` x 384 slots). Every 8192-token prefill
   chunk leaves a 512-slot checkpoint and every agent turn ~512 more, so in stock LRU order an idle session loses its
@@ -101,7 +112,24 @@ while one prompt prefills in chunks, the other running streams keep about 40 % o
   the canary-roce image build): stock loses the two older documents under SWA pressure and the switch keeps both; in
   an agent-session pattern the idle session's resume point survives 264 evicted SWA tokens instead of 96; without
   pressure every match and both allocators equal stock.
-- **New adapter: a lost SWA resume point costs a replay of one chunk instead of a whole-context re-prefill**
+  - **In the production profile since v2.6.4, with `--swa-prefix-tails 384`.** Four Sparks, TP4, v2.6.2 image +
+    this adapter, production profile, abliterated 1017 `517efab`, fresh boots A / X / A' (X = `DSV41_SWA_THIN=1` +
+    tails 384). Window 1 (`run-20261105-005746-3350673`), the owner's pattern (two long sessions of 330K / 300K
+    tokens idle for 3-14 minutes, a sub-agent turn every second, two new 500K sessions): whole-session re-prefills
+    A 2 / A' 2 / X 0; the resumed sessions' first token 62.3 / 64.1 s (A), 61.2 / 63.0 s (A') -> 3.9 / 6.5 s (X),
+    cached 338,944 / 326,912 tokens; the other agents' sub-agent turns peaked at 64.4 / 62.2 s during the controls'
+    re-prefills and never in X; median sub-agent turn 3.62 / 3.66 -> 3.03 s; uncached prefill 1.44M -> 0.77M tokens.
+    Window 2 (`run-20261105-040948-3893907`, six boots, three speedbench runs per cell): mean(X, X') vs mean(A, A')
+    c1 prose +0.17 %, c1 code +0.22 %, c4 prose +0.36 %, c4 code +0.78 %; every X run inside the controls' range.
+    Neither window passed its pre-registered rules to the letter: window 1 read a c4 code KILL from one run per cell
+    (a step-time shift only in X's last ~45 s, coinciding with head timer jobs; not reproduced in six later X runs),
+    window 2 is INVALID because its two controls sat 3.2 % apart on c4 prose (head apt / clock-cap jobs during A').
+    The review (2026-11-05) judged the whole evidence: ship. T 0 outputs: no candidate-specific difference (the
+    controls already disagree with each other on the cold items); head memory unchanged; no guard, Xid or engine
+    events. Model of the owner's pattern: whole-session misses 1.41-4.11/h stock -> 0.00-0.01/h.
+  - **Known limit:** a request that forks a session from an older turn boundary (an edit or rewind, 2-4 % of
+    production requests) falls back further under SWA pressure than stock, since superseded checkpoints go first.
+- **New in the production profile: a lost SWA resume point costs a replay of one chunk instead of a whole-context re-prefill**
   (`DSV41_SWA_CONE_REPLAY`, `adapter/swa_cone.py`; off when unset). When a request's prefix match stops early only
   because the last sliding window at its resume point F was evicted while the full KV (ratio-1/2 latents and index
   keys) is still resident, it matches on full KV at s = F - N instead (N = `DSV41_SWA_CONE_TOKENS`, default 8192,
@@ -118,12 +146,35 @@ while one prompt prefills in chunks, the other running streams keep about 40 % o
   `UnifiedRadixCache` (CPU, also in the canary-roce image build) the whole turn: plan, page copy, write mask, floor,
   dedup, no slot leaks, resume, the finish-at-prefill path the chunked-pass rule closes, and the import hook next to
   `DSV41_SWA_THIN`, the prefill bypass and the decode yield.
+  - **In the production profile since v2.6.4 (`DSV41_SWA_CONE_TOKENS=8192`).** Four Sparks, TP4, v2.6.2 image + this
+    adapter at N = 8192 with the test switch (forced eviction before the match, a stock re-prefill reference by
+    request id), one boot. Window `run-20261105-082118-415058`: 16 chat prompts of 130-400K tokens, per prompt a
+    cold run, three stock re-prefills (ref), two plain prefix hits (warm) and three cone replays, 64 tokens each.
+    Cone vs re-prefill distance relative to warm vs re-prefill: G = 1.013 (90 % CI 0.76-1.34, bound 2.0), 0
+    confident token flips; geometric-mean symmetric KL of the top-20 lists: cone-warm 0.040 < warm-ref 0.052 <
+    cone-ref 0.060 (ref-ref 0.010); a cone arm reproduced a warm arm token for token on 6 prompts. Path: 48 plan
+    and 48 copy lines, 0 reverts, after every cone arm the tree held exactly 768 evictable SWA tokens (no replay-row
+    SWA adopted). First token: cone 1.63-2.07 s, re-prefill 21.8-68.3 s, plain hit 0.31-0.50 s. The window is
+    INVALID by the letter of one rule (median positions compared: the re-prefill references themselves diverge
+    after a median of 17 tokens); the first window (`run-20261105-033337-3800238`, raw-text prompts that mostly
+    ended at token 0) was INVALID on its A/A ceiling, with 20 plans, 20 copies, 0 reverts. The review (2026-11-05)
+    judged the whole evidence: the cone is in the exactness class of a prefix hit; ship on by default with
+    N = 8192. Its fleet windows ran without `DSV41_SWA_THIN` and with tails 128; this release's gate runs them
+    together.
+  - **Residual risks (availability, not exactness):** an invariant violation raises (all ranks stop) instead of
+    falling back; next to a co-batched prefill, or with a chunk smaller than N, the replay reverts to the stock
+    re-prefill; an engine pin drift makes it a logged no-op.
 - **`adapter/autotune_keep.py`: `DSV41_SWA_NATIVE_DECODE` is volatile.** Swan never tunes (tuning mode takes the
   stock split) and runs the tactic the stock call resolves for the same shape, so the tuned shapes and kernels are
   the same with it on or off; without this, switching it on would change the launch fingerprint and re-draw every
   fused-MoE tactic on the next boot. **`DSV41_DECODE_YIELD` and `DSV41_DECODE_YIELD_RID_ARMS` are volatile** too:
   the yield only decides when the next prefill chunk runs, in the scheduler, after boot; no GEMM shape, kernel or
-  tuning pass depends on it.
+  tuning pass depends on it. **`DSV41_SWA_THIN`, `DSV41_SWA_CONE_REPLAY`, `DSV41_SWA_CONE_TOKENS`,
+  `DSV41_SWA_CONE_MIN_SAVE` and `DSV41_SWA_CONE_TEST` are volatile:** they act on the prefix-cache tree and on replays
+  of a cached prefix after boot; the autotune pass has no cached prefix, so no replay runs while tuning.
+- Credits (SWA thin, cone replay): built on SGLang's unified radix cache (SWA LRU, tombstones) and the `dsv4.1`
+  branch's decoder bounded replay, whose `swa_replay_start` window floor the replay reuses; the eviction rule, the
+  replay, the page copy and the write mask are ours.
 - Credits (swan): FlashInfer's SM120 sparse-MLA decode kernel (Gabriel Wu and the contributors of flashinfer-ai/flashinfer
   #3395 and later), whose page-size-generic address math is what lets the stock kernel body read 256-token pages; the
   256-token instantiation, its routing and the tests are ours.

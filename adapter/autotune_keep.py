@@ -39,7 +39,12 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              "DSV41_SWA_NATIVE_DECODE",
              # the decode yield only decides WHEN the next prefill chunk runs (scheduler side, after boot):
              # no GEMM shape, kernel or tuning pass depends on it
-             "DSV41_DECODE_YIELD", "DSV41_DECODE_YIELD_RID_ARMS")
+             "DSV41_DECODE_YIELD", "DSV41_DECODE_YIELD_RID_ARMS",
+             # SWA thin / cone replay act on the prefix-cache tree and on replays of a cached prefix (scheduler
+             # planning, a page copy and a write mask in the prefill metadata), after boot; the autotune pass has
+             # no cached prefix, so no replay runs while tuning, and no tuned shape or kernel depends on them
+             "DSV41_SWA_THIN", "DSV41_SWA_CONE_REPLAY", "DSV41_SWA_CONE_TOKENS", "DSV41_SWA_CONE_MIN_SAVE",
+             "DSV41_SWA_CONE_TEST")
 
 
 def launch_fingerprint() -> str:

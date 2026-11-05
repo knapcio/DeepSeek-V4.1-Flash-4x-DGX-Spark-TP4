@@ -10,10 +10,12 @@ and B's last chunk checkpoints (a request on A + another suffix reuses 0 tokens)
 hook A and B keep them (reuse = last chunk boundary inside the document) and C keeps its
 own last chunk checkpoint. The tree's sanity check, sizes and pin hashes are checked too.
 """
+import ast
 import importlib.util
 import os
 import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "adapter"))
@@ -425,6 +427,64 @@ class Engine(unittest.TestCase):
         self.assertEqual(stock[0], thin[0])
         self.assertEqual(stock[1:], thin[1:])
         self.assertEqual(thin[0][("C", 100)], 96)        # interior checkpoints still usable
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class Profile(unittest.TestCase):
+    """v2.6.4: the production line of .env.tp4.example sets DSV41_SWA_THIN=1 (after the decode yield) and the
+    production EXTRA_SGLANG_ARGS carry --swa-prefix-tails 384 (was 128); the module stays off when unset; the switch is
+    volatile in adapter/autotune_keep.py (LRU order after boot only); the canary-roce Dockerfile runs this test."""
+
+    def _production_line(self):
+        lines = (ROOT / ".env.tp4.example").read_text().splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
+        return lines[i - 1]
+
+    def _production_args(self):
+        lines = (ROOT / ".env.tp4.example").read_text().splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        args = [line for line in lines[i:i + 8] if line.startswith('#EXTRA_SGLANG_ARGS="')]
+        self.assertEqual(len(args), 1, lines[i:i + 8])
+        return args[0].split('"')[1].split()
+
+    def _volatile(self):
+        tree = ast.parse((ROOT / "adapter" / "autotune_keep.py").read_text())
+        return next(ast.literal_eval(n.value) for n in tree.body
+                    if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_VOLATILE")
+
+    def test_production_line_sets_thin_once_after_the_yield(self):
+        items = self._production_line().split('"')[1].split()
+        self.assertEqual([x for x in items if x.startswith("DSV41_SWA_THIN")], ["DSV41_SWA_THIN=1"])
+        i = items.index("DSV41_SWA_THIN=1")
+        self.assertEqual(items[i - 2:i + 1], ["DSV41_SWA_NATIVE_DECODE=1", "DSV41_DECODE_YIELD=33", "DSV41_SWA_THIN=1"])
+        self.assertEqual(T.mode({T.ENV: "1"}), "all")
+
+    def test_production_args_tails_384_once(self):
+        args = self._production_args()
+        idx = [n for n, a in enumerate(args) if a == "--swa-prefix-tails"]
+        self.assertEqual(len(idx), 1, args)
+        self.assertEqual(args[idx[0] + 1], "384")
+
+    def test_only_the_production_line_sets_it(self):
+        text = (ROOT / ".env.tp4.example").read_text()
+        on = [line for line in text.splitlines() if line.startswith("#EXTRA_CONTAINER_ENV=") and "SWA_THIN" in line]
+        self.assertEqual(on, [self._production_line()])
+        self.assertFalse([line for line in text.splitlines() if line.startswith("DSV41_SWA_THIN")])
+
+    def test_volatile_in_autotune_keep(self):
+        self.assertIn("DSV41_SWA_THIN", self._volatile())
+
+    def test_default_off_in_module(self):
+        self.assertIsNone(T.mode({}))
+        self.assertIsNone(T.mode({T.ENV: "0"}))
+        self.assertFalse(T.install(SimpleNamespace(), env={}))
+
+    def test_dockerfile_runs_this_test(self):
+        d = (ROOT / "Dockerfile.canary-roce").read_text()
+        self.assertIn("RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py", d)
 
 
 if __name__ == "__main__":

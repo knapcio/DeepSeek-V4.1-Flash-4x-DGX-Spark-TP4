@@ -522,10 +522,11 @@ class Profile(unittest.TestCase):
         self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
         return lines[i - 1]
 
-    def test_production_line_sets_share_33_once_last(self):
+    def test_production_line_sets_share_33_once_after_swan(self):
         items = self._production_line().split('"')[1].split()
         self.assertEqual([x for x in items if x.startswith('DSV41_DECODE_YIELD')], ['DSV41_DECODE_YIELD=33'])
-        self.assertEqual(items[-2:], ['DSV41_SWA_NATIVE_DECODE=1', 'DSV41_DECODE_YIELD=33'])
+        i = items.index('DSV41_DECODE_YIELD=33')        # right after swan (v2.6.4's SWA thin / cone keys follow)
+        self.assertEqual(items[i - 1:i + 1], ['DSV41_SWA_NATIVE_DECODE=1', 'DSV41_DECODE_YIELD=33'])
         self.assertEqual(dy.parse_pct('33'), 33)
 
     def test_only_the_production_line_sets_it(self):

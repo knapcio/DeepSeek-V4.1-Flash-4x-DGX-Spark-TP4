@@ -23,11 +23,13 @@ Engine part (CPU container + the pinned SGLang tree on PYTHONPATH):
     the replay reverts to the stock match. Also: real DeepSeekV4SingleKVPool / DeepSeekV4IndexerPool
     page rows are copied byte for byte.
 """
+import ast
 import importlib.util
 import os
 import random
 import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "adapter"))
@@ -726,6 +728,73 @@ class Engine(unittest.TestCase):
                 self.assertTrue(torch.equal(b[d_ * per:(d_ + 1) * per].view(torch.uint8),
                                             b0[s_ * per:(s_ + 1) * per].view(torch.uint8)))
             self.assertTrue(torch.equal(b[:1].view(torch.uint8), b0[:1].view(torch.uint8)))
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class Profile(unittest.TestCase):
+    """v2.6.4: the production line of .env.tp4.example ends with DSV41_SWA_CONE_REPLAY=1 DSV41_SWA_CONE_TOKENS=8192
+    (after DSV41_SWA_THIN=1); the code default is 8192 too (the production chunk); DSV41_SWA_CONE_TEST is in no
+    profile; the module stays off when unset; the keys are volatile in adapter/autotune_keep.py; the canary-roce
+    Dockerfile runs this test."""
+
+    def _production_line(self):
+        lines = (ROOT / ".env.tp4.example").read_text().splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
+        return lines[i - 1]
+
+    def _production_args(self):
+        lines = (ROOT / ".env.tp4.example").read_text().splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        args = [line for line in lines[i:i + 8] if line.startswith('#EXTRA_SGLANG_ARGS="')]
+        self.assertEqual(len(args), 1, lines[i:i + 8])
+        return args[0].split('"')[1].split()
+
+    def _volatile(self):
+        tree = ast.parse((ROOT / "adapter" / "autotune_keep.py").read_text())
+        return next(ast.literal_eval(n.value) for n in tree.body
+                    if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_VOLATILE")
+
+    def test_production_line_ends_with_the_cone(self):
+        items = self._production_line().split('"')[1].split()
+        self.assertEqual([x for x in items if x.startswith("DSV41_SWA_CONE")],
+                         ["DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
+        self.assertEqual(items[-3:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
+
+    def test_code_default_is_the_production_chunk(self):
+        self.assertEqual(C.DEFAULT_TOKENS, 8192)
+        text = (ROOT / ".env.tp4.example").read_text().splitlines()
+        self.assertIn("#CHUNKED_PREFILL_SIZE=8192", text)
+        self.assertGreaterEqual(C.DEFAULT_TOKENS, C.min_replay_tokens(128, 20, 256))
+        self.assertEqual(C.DEFAULT_TOKENS % 256, 0)
+        C.configure({C.ENV: "1"})
+        self.assertEqual((C.STATE.tokens, C.STATE.min_save, C.STATE.test), (8192, 8192, False))
+        C.configure({})
+        self.assertFalse(C.STATE.active)
+
+    def test_test_switch_in_no_profile(self):
+        text = (ROOT / ".env.tp4.example").read_text()
+        on = [line for line in text.splitlines() if line.lstrip("#").startswith(("EXTRA_CONTAINER_ENV=", "DSV41_"))
+              and "SWA_CONE_TEST" in line]
+        self.assertEqual(on, [], "DSV41_SWA_CONE_TEST is test only")
+        on = [line for line in text.splitlines() if line.startswith("#EXTRA_CONTAINER_ENV=") and "SWA_CONE" in line]
+        self.assertEqual(on, [self._production_line()])
+
+    def test_volatile_in_autotune_keep(self):
+        vol = self._volatile()
+        for k in (C.ENV, C.ENV_TOKENS, C.ENV_MIN_SAVE, C.ENV_TEST):
+            self.assertIn(k, vol)
+
+    def test_default_off_in_module(self):
+        self.assertFalse(C.enabled({}))
+        self.assertFalse(C.enabled({C.ENV: "0"}))
+        self.assertTrue(C.enabled({C.ENV: "1"}))
+
+    def test_dockerfile_runs_this_test(self):
+        d = (ROOT / "Dockerfile.canary-roce").read_text()
+        self.assertIn("RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone.py", d)
 
 
 if __name__ == "__main__":
