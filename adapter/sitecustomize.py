@@ -63,6 +63,18 @@ class EngramLoader(importlib.abc.Loader):
                 else:
                     from indexer_chunked_v3 import install as install_indexer_chunked
                 install_indexer_chunked(module)
+            # Gated on DSV41_SWA_CONE_REPLAY=1: replay rows of a lost SWA resume point get their window
+            # floored at the replay start and their latent / index-key writes sent to the padding slot
+            # (adapter/swa_cone.py). Gate checked BEFORE the import.
+            if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from swa_cone import install_backend as install_swa_cone_backend
+                install_swa_cone_backend(module)
+        elif module.__name__ == 'sglang.srt.model_executor.forward_batch_info':
+            # Gated on DSV41_SWA_CONE_REPLAY=1: the resident latents / index keys of a replay are copied
+            # into the request's fresh pages on the forward stream (adapter/swa_cone.py).
+            if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from swa_cone import install_forward_batch as install_swa_cone_forward_batch
+                install_swa_cone_forward_batch(module)
         elif module.__name__ == 'sglang.srt.entrypoints.openai.encoding_dsv41':
             from encoding_compat import install_encoder
             install_encoder(module)
@@ -269,9 +281,18 @@ class EngramLoader(importlib.abc.Loader):
             from replay_guard import install as install_replay_guard
             install_replay_guard(module)
         elif module.__name__ == 'sglang.srt.managers.scheduler':
+            # DSV41_SWA_CONE_REPLAY: pin the stock PrefillAdder selection BEFORE the bypass wraps it,
+            # wrap it (a first chunk shorter than the replay falls back to the stock match) AFTER.
+            swa_cone_on = os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no')
+            if swa_cone_on:
+                from swa_cone import pin_adder as pin_swa_cone_adder
+                pin_swa_cone_adder()
             if os.environ.get('DSV41_PREFILL_BYPASS', '').strip():
                 from prefill_bypass import install as install_prefill_bypass
                 install_prefill_bypass(module)
+            if swa_cone_on:
+                from swa_cone import install_adder as install_swa_cone_adder
+                install_swa_cone_adder()
             # Gated on DSV41_ROCE_IDLE_PARK=1: idle mark in on_idle, proxy wake before run_batch.
             if os.environ.get('DSV41_ROCE_IDLE_PARK', '0').strip() == '1':
                 from roce_idle_park import install_scheduler as install_roce_idle_park_scheduler
@@ -288,6 +309,11 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)
+            # Gated on DSV41_SWA_CONE_REPLAY=1: a request whose SWA resume point is gone matches on full
+            # KV at F - N and replays N rows exactly instead of re-prefilling (adapter/swa_cone.py).
+            if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from swa_cone import install_schedule_batch as install_swa_cone_schedule_batch
+                install_swa_cone_schedule_batch(module)
         elif module.__name__ == 'sglang.srt.mem_cache.unified_radix_cache':
             # Gated on DSV41_SWA_THIN=1: superseded chunk-boundary SWA checkpoints go to the
             # evict-first end of the SWA LRU (adapter/swa_thin.py). Gate checked BEFORE the import.
@@ -315,6 +341,7 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                             'sglang.srt.layers.quantization.fp8',
                             'sglang.srt.model_executor.model_runner',
                             'sglang.srt.layers.attention.deepseek_v4_backend',
+                            'sglang.srt.model_executor.forward_batch_info',
                             'sglang.srt.entrypoints.openai.encoding_dsv41',
                             'sglang.srt.entrypoints.openai.serving_chat',
                             'sglang.srt.entrypoints.anthropic.protocol',

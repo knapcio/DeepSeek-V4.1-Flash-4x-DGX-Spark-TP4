@@ -196,6 +196,8 @@ ENV PYTHONPATH=/opt/dsv41/adapter:/opt/b12x:/opt/b12x_next \
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_adapter_engine_pins.py
 # DSV41_SWA_THIN on the real UnifiedRadixCache (CPU): engine pins + the eviction-order scenario.
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py
+# DSV41_SWA_CONE_REPLAY on the real UnifiedRadixCache (CPU): engine pins, the cone flow, the hook install.
+RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone.py
 EXPOSE 8888
 HEALTHCHECK --interval=30s --timeout=30s --start-period=30m --retries=3 \
     CMD ["python3", "-S", "/opt/dsv41/boot.py", "health"]

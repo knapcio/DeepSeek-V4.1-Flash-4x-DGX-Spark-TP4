@@ -101,6 +101,23 @@ while one prompt prefills in chunks, the other running streams keep about 40 % o
   the canary-roce image build): stock loses the two older documents under SWA pressure and the switch keeps both; in
   an agent-session pattern the idle session's resume point survives 264 evicted SWA tokens instead of 96; without
   pressure every match and both allocators equal stock.
+- **New adapter: a lost SWA resume point costs a replay of one chunk instead of a whole-context re-prefill**
+  (`DSV41_SWA_CONE_REPLAY`, `adapter/swa_cone.py`; off when unset). When a request's prefix match stops early only
+  because the last sliding window at its resume point F was evicted while the full KV (ratio-1/2 latents and index
+  keys) is still resident, it matches on full KV at s = F - N instead (N = `DSV41_SWA_CONE_TOKENS`, default 8192,
+  minimum 3072) and prefills [s, L): the replay rows get the resident latents / index keys copied into their fresh
+  pages before the forward, their own latent / index-key writes go to the padding slot, and their window is floored
+  at s. Rows from F on depend only on resident KV and on rows >= F - 127 x 20, so they compute what a prefix hit at
+  F computes (same class as any hit off a chunk boundary: other chunk shape, top-k order noise). The first pass must
+  be a chunk that covers the replay and ends before the prompt end, else the stock match is kept (a whole-prompt
+  pass could finish at its first token and insert the replay rows' approximate SWA); the first insert re-points the
+  request to the tree's resident pages, and no SWA from inside the replay reaches the tree. Replays only when it
+  saves >= `DSV41_SWA_CONE_MIN_SAVE` (8192) rows. Each replay logs one `DSV41_SWA_CONE plan` and one `copy` line;
+  `DSV41_SWA_CONE_TEST=1` is test only. `tests/test_swa_cone.py`: the length rule on a toy model of the same
+  dependency structure (exact at 127 x 20 rows, not one row fewer, not without the write mask), and on the real
+  `UnifiedRadixCache` (CPU, also in the canary-roce image build) the whole turn: plan, page copy, write mask, floor,
+  dedup, no slot leaks, resume, the finish-at-prefill path the chunked-pass rule closes, and the import hook next to
+  `DSV41_SWA_THIN`, the prefill bypass and the decode yield.
 - **`adapter/autotune_keep.py`: `DSV41_SWA_NATIVE_DECODE` is volatile.** Swan never tunes (tuning mode takes the
   stock split) and runs the tactic the stock call resolves for the same shape, so the tuned shapes and kernels are
   the same with it on or off; without this, switching it on would change the launch fingerprint and re-draw every
