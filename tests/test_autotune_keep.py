@@ -50,6 +50,17 @@ def main():
     assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_REPLICATED_SPLIT"] = "wqkv_a"      # decode-side switch: volatile
     assert ak.launch_fingerprint() == fp_before
+    os.environ["DSV41_SWA_NATIVE_DECODE"] = "1"          # swan: stock tactics, never tunes: volatile
+    assert ak.launch_fingerprint() == fp_before
+    os.environ["DSV41_DECODE_YIELD"] = "33"              # scheduler-side chunk timing: volatile
+    os.environ["DSV41_DECODE_YIELD_RID_ARMS"] = "1"
+    assert ak.launch_fingerprint() == fp_before
+    os.environ["DSV41_SWA_THIN"] = "1"                   # prefix-cache LRU order / cone replay: after boot,
+    os.environ["DSV41_SWA_CONE_REPLAY"] = "1"            # never during the tuning pass: volatile
+    os.environ["DSV41_SWA_CONE_TOKENS"] = "8192"
+    os.environ["DSV41_SWA_CONE_MIN_SAVE"] = "8192"
+    os.environ["DSV41_SWA_CONE_TEST"] = "1"
+    assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_VERIFY_CAP"] = "conf:0.1"          # A/B-neutral switch: same fingerprint
     assert ak.launch_fingerprint() == ak.launch_fingerprint()
     fp_a = ak.launch_fingerprint()

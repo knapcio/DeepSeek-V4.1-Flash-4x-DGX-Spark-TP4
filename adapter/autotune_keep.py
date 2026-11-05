@@ -33,7 +33,18 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              "DSV41_DYN_SHARED_RATIO", "DSV41_DYN_SHARED_FIXED", "DSV41_DYN_SHARED_MAX_M",
              "DSV41_DYN_SHARED_SERIAL", "DSV41_VERIFY_CAP_LOG", "DSV41_VERIFY_CAP_LOG_FEATURES",
              "DSV41_ROUTE_STATS", "DSV41_ROUTE_RING", "DSV41_DRAFT_TAU_POS", "DSV41_ENGRAM_DRM_NODE",
-             "DSV41_ENGRAM_DRM_MIB", "DSV41_ENGRAM_DRM_LAYER")
+             "DSV41_ENGRAM_DRM_MIB", "DSV41_ENGRAM_DRM_LAYER",
+             # the swan decode never tunes (tuning mode takes the stock split) and runs the tactic the stock
+             # call resolves for the same shape: the tuned shapes and kernels are the same with it on or off
+             "DSV41_SWA_NATIVE_DECODE",
+             # the decode yield only decides WHEN the next prefill chunk runs (scheduler side, after boot):
+             # no GEMM shape, kernel or tuning pass depends on it
+             "DSV41_DECODE_YIELD", "DSV41_DECODE_YIELD_RID_ARMS",
+             # SWA thin / cone replay act on the prefix-cache tree and on replays of a cached prefix (scheduler
+             # planning, a page copy and a write mask in the prefill metadata), after boot; the autotune pass has
+             # no cached prefix, so no replay runs while tuning, and no tuned shape or kernel depends on them
+             "DSV41_SWA_THIN", "DSV41_SWA_CONE_REPLAY", "DSV41_SWA_CONE_TOKENS", "DSV41_SWA_CONE_MIN_SAVE",
+             "DSV41_SWA_CONE_TEST")
 
 
 def launch_fingerprint() -> str:
