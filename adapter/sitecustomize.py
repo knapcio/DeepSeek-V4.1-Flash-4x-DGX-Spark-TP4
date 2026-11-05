@@ -288,6 +288,12 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)
+        elif module.__name__ == 'sglang.srt.mem_cache.unified_radix_cache':
+            # Gated on DSV41_SWA_THIN=1: superseded chunk-boundary SWA checkpoints go to the
+            # evict-first end of the SWA LRU (adapter/swa_thin.py). Gate checked BEFORE the import.
+            if os.environ.get('DSV41_SWA_THIN', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from swa_thin import install as install_swa_thin
+                install_swa_thin(module)
         else:
             # V4.1 ratio-1/2 indexers always call the FP4 DeepGEMM kernel.
             # SM120 needs its split-128 planner even when the legacy FP8
@@ -319,6 +325,7 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                             'sglang.srt.speculative.dspark_components.dspark_draft_sampler',
                             'sglang.kernels.ops.speculative.dspark.dspark_accept',
                             'sglang.srt.managers.schedule_batch',
+                            'sglang.srt.mem_cache.unified_radix_cache',
                             'sglang.srt.managers.scheduler',
                             'sglang.srt.managers.tokenizer_manager',
                             'sglang.kernels.ops.moe.moe_fused_gate',

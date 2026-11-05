@@ -83,6 +83,24 @@ while one prompt prefills in chunks, the other running streams keep about 40 % o
     already backported. **Christopher Owen**'s prefill yield (spark-ds41f, vLLM 0545: a long prompt's chunk step goes
     to short prompts and held first tokens) was the starting point of the comparison; it addresses short prompts,
     which our solo short pass covers, rather than the cadence of running streams.
+- **New adapter: superseded SWA checkpoints are evicted first** (`DSV41_SWA_THIN`, `adapter/swa_thin.py`; off when
+  unset). A cached prefix is reusable only at a node whose last sliding window (128 tokens) still holds SWA slots, and
+  the SWA pool is small (cap mode: request cap 35,328 + `--swa-prefix-tails` x 384 slots). Every 8192-token prefill
+  chunk leaves a 512-slot checkpoint and every agent turn ~512 more, so in stock LRU order an idle session loses its
+  resume point after ~70-100K slots of other traffic, and its next turn re-prefills the whole context although its
+  full KV is still cached (production 2026-11-04: 8 re-prefills of 170-680K tokens in 6 h, 32-129 s each).
+  `1`: a checkpoint its own request has moved past goes to the evict-first end of the SWA LRU: chunk boundaries a
+  chunked prefill has passed (a 950K prefill no longer evicts every other document's resume point: the issue16 soak
+  lost the 200K and 400K documents after every cold phase, 33 / 67 s each), and the prefix-match node of a request
+  that needed no chunked step (an agent turn's previous resume point, now replaced by the turn's own prompt-end and
+  output checkpoints). `chunk`: chunk boundaries only. Locked nodes, branch points and a prompt's last chunk boundary
+  keep their place; a match on a demoted checkpoint refreshes it as before. Only the LRU order changes: kernels, pool
+  sizes and outputs are untouched. Engine source sha256-pinned (refuses to install on drift); no-op with radix
+  sessions, HiCache or Mamba. Receipt `DSV41_SWA_THIN receipt: mode= chunk_steps= prompt_steps= demoted= errors=` on
+  the first hooked insert and every 1024th. `tests/test_swa_thin.py` (real `UnifiedRadixCache` on CPU, also run in
+  the canary-roce image build): stock loses the two older documents under SWA pressure and the switch keeps both; in
+  an agent-session pattern the idle session's resume point survives 264 evicted SWA tokens instead of 96; without
+  pressure every match and both allocators equal stock.
 - **`adapter/autotune_keep.py`: `DSV41_SWA_NATIVE_DECODE` is volatile.** Swan never tunes (tuning mode takes the
   stock split) and runs the tactic the stock call resolves for the same shape, so the tuned shapes and kernels are
   the same with it on or off; without this, switching it on would change the launch fingerprint and re-draw every

@@ -194,6 +194,8 @@ ENV PYTHONPATH=/opt/dsv41/adapter:/opt/b12x:/opt/b12x_next \
     CARGO_NET_OFFLINE=true
 # Every hash-pinned adapter must install on this engine tree (a drift kills the head at boot).
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_adapter_engine_pins.py
+# DSV41_SWA_THIN on the real UnifiedRadixCache (CPU): engine pins + the eviction-order scenario.
+RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py
 EXPOSE 8888
 HEALTHCHECK --interval=30s --timeout=30s --start-period=30m --retries=3 \
     CMD ["python3", "-S", "/opt/dsv41/boot.py", "health"]
