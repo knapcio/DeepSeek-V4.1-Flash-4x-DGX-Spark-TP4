@@ -545,5 +545,53 @@ class DefaultOff(unittest.TestCase):
             self.assertIn("python3 /opt/dsv41/tests/test_v41c_pool.py", (ROOT / df).read_text(), df)
 
 
+V41N_KEYS = ["DSV41_KV_LAYOUT=v41c", "DSV41_V41C_ARM=1", "DSV41_V41C_READER=native"]
+
+
+@unittest.skipUnless((ROOT / ".env.tp4.example").exists(), "not a repo checkout (in an image)")
+class Profile(unittest.TestCase):
+    """v2.6.4n: the production line of .env.tp4.example ends with the three v41n keys (after v2.6.4's cone keys), no
+    other profile line sets the layout or a reader, no diagnostic v41c / v41n knob is in any profile, every v41n key is
+    volatile for DSV41_AUTOTUNE_KEEP, and the module stays off when the layout is unset."""
+
+    def _lines(self):
+        return (ROOT / ".env.tp4.example").read_text().splitlines()
+
+    def _production_line(self):
+        lines = self._lines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
+        return lines[i - 1]
+
+    def test_production_line_ends_with_v41n_once(self):
+        items = self._production_line().split('"')[1].split()
+        self.assertEqual(items[-6:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"] + V41N_KEYS)
+        for k in V41N_KEYS:
+            self.assertEqual(sum(x.split("=")[0] == k.split("=")[0] for x in items), 1, k)
+
+    def test_only_the_production_line_sets_the_layout(self):
+        on = [line for line in self._lines() if "DSV41_KV_LAYOUT" in line and not line.startswith("# ")]
+        self.assertEqual(on, [self._production_line()])
+        knobs = ("DSV41_V41N_", "DSV41_V41C_DEDUP", "DSV41_V41C_READER=io", "DSV41_V41C_READER=group")
+        bad = [line for line in self._lines() if not line.startswith("# ") and any(k in line for k in knobs)]
+        self.assertEqual(bad, [], "diagnostic / alternative reader knobs are in no profile")
+
+    def test_volatile_in_autotune_keep(self):
+        tree = ast.parse((ADAPTER / "autotune_keep.py").read_text())
+        vol = next(ast.literal_eval(n.value) for n in tree.body
+                   if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_VOLATILE")
+        for k in V41N_KEYS + ["DSV41_V41C_DEDUP_ROWS", "DSV41_V41C_DEDUP_MIN_ROWS", "DSV41_V41N_TACTICS",
+                              "DSV41_V41N_DIAG", "DSV41_V41N_PREFILL", "DSV41_V41N_PAGE_MIN_ROWS", "DSV41_V41N_PAGE_CAP_MB"]:
+            self.assertIn(k.split("=")[0], vol)
+
+    def test_default_off_in_module(self):
+        with env(DSV41_KV_LAYOUT=None):
+            self.assertFalse(P.enabled())
+        with env(DSV41_KV_LAYOUT="v4"):
+            self.assertFalse(P.enabled())
+        with env(DSV41_KV_LAYOUT="v41c"):
+            self.assertTrue(P.enabled())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

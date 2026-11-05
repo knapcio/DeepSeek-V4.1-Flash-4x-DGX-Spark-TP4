@@ -2,6 +2,23 @@
 
 ## Unreleased (branch perf/v41n-v264-20261105 = the v2.6.4 candidate 469277e + v41n; not in any release)
 
+- **Production profile (v2.6.4n candidate): `DSV41_KV_LAYOUT=v41c DSV41_V41C_ARM=1 DSV41_V41C_READER=native`** at
+  the end of the production line of `.env.tp4.example` (after v2.6.4's cone keys). It enters a release only after the
+  memory ladder's combined window (v2.6.4 control vs v2.6.4n on the four Sparks) passes.
+  - **KV pool.** Bytes per full token 1670.75 -> 912.25 (x1.83 tokens for the same KV bytes). Measured with tails 128
+    (capacity A/B, 2026-11-03..05): 4.89-5.05M -> 9.05M tokens; at the same pool the head had 2.7 GiB more
+    MemAvailable (13.98 vs 11.29 GiB); 8 x 1M needles resident at once, all retrieved, head minimum 7.45 GiB. With
+    v2.6.4's `--swa-prefix-tails 384` the SWA reserve is unchanged by v41n, so the full pool goes from ~3.6M to
+    ~6.4-6.9M tokens (estimated from the same byte budget; the ladder measures it): four 1M contexts fit again, and
+    `MAX_TOTAL_TOKENS=8000000` does not bind.
+  - **Speed** (12 boots of three capacity A/Bs, 6 v41n vs 6 controls): c1, c4, prose and load c1 / c4 within +-0.1 %;
+    **c16 -0.4..-0.8 %** (5 of 6 v41n boots below the lowest control; the read-time conversion, +0.6 ms per c16 step
+    in the one-GB10 microbench); cold 1M prefill +1.6 %, 64K within noise.
+  - **Exactness.** One GB10: output bits equal to V4 for decode, prefill (8192 rows) and swan on v41n (38 / 38
+    layers). TP4 serving: KLD against the control 0.0031-0.0053, inside control-vs-control (0.0073 / 0.0076); qeval
+    71 / 71 / 71 in all three A/Bs; 256K and 1M needles pass.
+  - **Rollback, config only:** unset the three keys (the pool returns to ~3.6M tokens; nothing else changes).
+
 - **v41n on v2.6.4, off by default** (`DSV41_KV_LAYOUT=v41c DSV41_V41C_READER=native`): the ratio-1 / ratio-2
   compressed KV pools hold SGLang's own V4.1 FP4 records (288 B instead of the 584-byte V4 slot; `adapter/v41c_pool.py`)
   and the sparse-MLA readers convert them in place (`runtime/flashinfer_v41c`, DSV41_V41C_READER=native). Port of
