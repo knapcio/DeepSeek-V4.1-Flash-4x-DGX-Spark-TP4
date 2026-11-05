@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-11-05 v2.6.4 (candidate)
+## 2026-11-05 v2.6.4
 
 Four switches added to the production profile in `.env.tp4.example`. `DSV41_SWA_NATIVE_DECODE=1` ("swan"): the
 decode attention reads the sliding-window (SWA) cache in place instead of copying it into smaller pages first. Outputs
@@ -8,16 +8,18 @@ are bit-identical; greedy c1 decode +1.4 / +1.9 % in two in-boot A/Bs on the fou
 while one prompt prefills in chunks, the other running streams keep about 40 % of their decode rate instead of 8 %
 (measured on the four Sparks), and that prompt's first token comes x1.47 later. `DSV41_SWA_THIN=1` with
 `--swa-prefix-tails 384` (was 128): idle agent sessions keep their prefix-cache resume points (resumed 300-330K
-sessions 3.9-6.5 s instead of 61-64 s on the four Sparks), for a full KV pool of ~3.6M instead of ~5.1M tokens.
+sessions 3.9-6.5 s instead of 61-64 s on the four Sparks), for a full KV pool of 3.44-3.75M instead of 5.0-5.16M
+tokens.
 `DSV41_SWA_CONE_REPLAY=1` with `DSV41_SWA_CONE_TOKENS=8192`: a resume point that is evicted anyway costs a
 one-chunk replay (1.6-2.1 s) instead of a whole-context re-prefill (22-68 s at 130-400K tokens). Unset all four
 (and set `--swa-prefix-tails 128`) to return to v2.6.3; each can be unset alone. All the new keys are volatile for
 `DSV41_AUTOTUNE_KEEP` (toggling them reuses the tuned MoE tactics, see below); the tails change is a launch argument,
 so the first boot after it re-tunes once.
 
-- **KV pool: ~5.1M -> ~3.6M tokens** (`--swa-prefix-tails 384`). The SWA pool is a fixed cost subtracted from the
+- **KV pool: ~5.1M -> ~3.4-3.75M tokens** (`--swa-prefix-tails 384`). The SWA pool is a fixed cost subtracted from the
   KV budget before the full pool is sized, so 98,304 more SWA slots (~23.9 KB each per rank, +2.2 GiB) cost ~1.4M
-  full-pool tokens: measured 5.06-5.16M -> 3.60-3.75M on the four Sparks. The static pool and the head's
+  full-pool tokens: measured 5.06-5.16M -> 3.60-3.75M on the four Sparks, and 4,997,632 / 5,101,824 -> 3,444,224
+  in the release gate (below; no KV pin, each boot sized its own pool). The static pool and the head's
   MemAvailable are unchanged (low-water 12.69 / 12.50 GiB with it vs 12.71 / 12.64 without). Three 1M-token
   contexts still fit, four no longer do; the production peak in flight over a full day was 1.91M. **Rollback is
   config only:** unset `DSV41_SWA_THIN` and set `--swa-prefix-tails 128` (256 is the middle step, ~4.4M tokens).
@@ -159,8 +161,8 @@ so the first boot after it re-tunes once.
     after a median of 17 tokens); the first window (`run-20261105-033337-3800238`, raw-text prompts that mostly
     ended at token 0) was INVALID on its A/A ceiling, with 20 plans, 20 copies, 0 reverts. The review (2026-11-05)
     judged the whole evidence: the cone is in the exactness class of a prefix hit; ship on by default with
-    N = 8192. Its fleet windows ran without `DSV41_SWA_THIN` and with tails 128; this release's gate runs them
-    together.
+    N = 8192. Its fleet windows ran without `DSV41_SWA_THIN` and with tails 128; the release gate ran them
+    together (below: one forced evicted resume, replayed on every node).
   - **Residual risks (availability, not exactness):** an invariant violation raises (all ranks stop) instead of
     falling back; next to a co-batched prefill, or with a chunk smaller than N, the replay reverts to the stock
     re-prefill; an engine pin drift makes it a logged no-op.
@@ -179,7 +181,34 @@ so the first boot after it re-tunes once.
   #3395 and later), whose page-size-generic address math is what lets the stock kernel body read 256-token pages; the
   256-token instantiation, its routing and the tests are ours.
 
-Release gate (v2.6.3 vs v2.6.4 vs v2.6.3, fresh boots, production profile): PENDING.
+Release gate: PASS (run `run-20261105-170445-1455369`, 2026-11-05, 274 min including the restore of production; 0
+KILL, 0 INVALID). v2.6.3 / v2.6.4 / v2.6.3, three fresh boots in that order, production profile, abliterated 1017
+`517efab`; the v2.6.4 boot ran the v2.6.3 gate image with this release's files overlaid and the swan module built in
+the image, launched with `--swa-prefix-tails 384`. No KV pin (earlier gates pinned 4,194,304): each boot sized its own
+pool, so the v2.6.4 boot ran with the pool it ships with. Speedbench 0.3 full, median of two runs: greedy c1
+all-prompt geomean 89.34 / 89.09 / 88.73 and prose 65.62 / 65.95 / 65.34 tok/s, c4 131.75 / 132.62 / 131.76
+aggregate tok/s; sampled (T 0.7, top-p 0.95, one run per cell) c1 87.30 / 85.72 / 86.01 and prose 62.76 / 61.65 /
+62.52 tok/s, c4 129.03 / 129.53 / 129.37 aggregate tok/s; speedbench load c16 215.47 / 216.16 / 216.65 aggregate
+tok/s (the full c16 run was not repeated). Cold 64K prefill 6147 / 6137 / 6166 tok/s (median of three flushed
+prompts); a cold 388K-token prompt's first token 64.0 / 63.6 / 63.4 s (median of three); a short request beside a
+131,072-token prefill 0.43 / 0.42 / 0.47 s. qeval 71 / 71 / 71; at T = 0 the v2.6.4 outputs equal the controls' on
+all 74 of the 75 prompts on which the two controls agree. KLD long 0.00677 and short 0.0045 (PASS); T = 1
+distribution check PASS (12,000 samples); 1M needle (969,071 tokens) found in 195 s. Idle RDMA proxy CPU summed over
+the four nodes 1.75 / 1.63 / 2.68 % of a core; median first token after 60 s idle 189.8 / 190.7 / 192.9 ms. Every
+rank of the v2.6.4 boot logged the swan module (`00505fe850b7`, no fallback), SWA thin (mode all, 0 errors), the cone
+replay (N 8192) and the decode yield (share 33) as installed; the controls logged none of them. The FlashInfer #7676
+fence was present on every rank of all three boots.
+- **KV pool:** 4,997,632 / 3,444,224 / 5,101,824 tokens. The 384 prefix tails reserve 182,784 SWA slots instead of
+  84,480 (a fixed 4.08 instead of 1.88 GB in the head's pool sizing), so the full pool is 1,605,504 tokens below the
+  controls' mean: the price of keeping idle sessions' resume points. Rollback is config only: unset `DSV41_SWA_THIN`
+  and set `--swa-prefix-tails 128`.
+- **Evicted resume point** (v2.6.4 boot): a 300,000-token document (prefill 49.7 s), then 800 distinct 1K-token
+  prompts that pushed its SWA window out (800 of 800 OK, 150.5 s), then the document plus 2,048 tokens. Every node
+  planned and copied one cone replay of 8,192 rows from token 291,328, with 0 reverts; first token 2.07 s with
+  291,328 of 302,048 prompt tokens cached, 0 errors.
+- **Soak** (issue #16 reproduction, seeded document order, plus a c2 companion load, 12 timed minutes): 256 / 318 /
+  263 requests with 0 failures, companion 39.07 / 48.96 / 39.11 tok/s (v2.6.4 keeps the soak's documents cached where
+  the controls re-prefill them, so its soak does less prefill), head MemAvailable low-water 9.55 / 8.37 / 8.73 GiB.
 
 ## 2026-11-02 v2.6.3
 
