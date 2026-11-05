@@ -43,6 +43,17 @@ Third-party components and their licences:
   shared-memory reuse race on ctrl[7]); b12x development continues in
   flashinfer-ai/flashinfer (flashinfer/experimental/b12x, Apache License 2.0).
   The changes are distributed under the same licence.
+  Local changes for the opt-in mixed KV layout (DSV41_KV_LAYOUT=v41c) are listed in
+  runtime/b12x_next/v41c-provenance.json.
+- runtime/flashinfer_v41c contains NVIDIA FlashInfer sparse_mla_sm120 sources (flashinfer 0.6.18,
+  BSD-3-Clause, headers retained) with local changes listed in runtime/flashinfer_v41c/PROVENANCE.json:
+  the opt-in V4.1 FP4 record readers (DSV41_KV_LAYOUT=v41c) and, for DSV41_SWA_NATIVE_DECODE (production
+  profile since v2.6.4), csrc/swan_decode_dsv4.cu: FlashInfer's decode-dsv4 launcher and its stock kernel
+  body instantiated for 256-token pages.
+- adapter/v41c_pool.py (opt-in, DSV41_KV_LAYOUT=v41c) allocates SGLang's DeepSeek-V4 ratio-1/2 KV
+  pools in SGLang's own V4.1 FP4 record layout (KVLayout.V41_FP4 and its writers, SGLang dsv4.1
+  branch; Apache License 2.0, LICENSE.sglang) next to the V4 SWA cache and re-prices their pool
+  sizing; it wraps SGLang functions at import and copies no SGLang source.
 - runtime/b12x/b12x/comm/roce_twoshot is a copy of runtime/b12x/b12x/comm/roce with the
   pipelined two-shot all-reduce of flashinfer-ai/flashinfer PR 6915 by Luke Alonso (head
   effeb496, flashinfer/experimental/b12x/comm/roce, itself local-inference-lab/b12x's
@@ -59,18 +70,20 @@ Third-party components and their licences:
   FlashInfer sources at build time
   (dual-cache prefill dispatch opened to 128/256-token extra pages, symbols renamed); origin and
   changes: runtime/flashinfer_pce/PROVENANCE.json.
+- runtime/flashinfer_v41c (DSV41_V41C_READER=native, "v41n", opt-in): the in-kernel V4.1 FP4
+  record readers extend FlashInfer's sparse_mla_sm120 decode and dual-cache prefill kernels
+  (NVIDIA, BSD-3-Clause, headers retained). v41n_prefill_kernel.cuh is generated from the vendored
+  prefill_kernel.cuh by gen_v41n_prefill.py; v41n_convert.cuh is new. Design idea credit:
+  Christopher Owen (christopherowen), spark-ds41f (Apache License 2.0): raw FP4 records copied into
+  shared memory asynchronously while the previous chunk computes, dequantization spread over many
+  warps. No spark-ds41f code is included (its kernel is TileLang and dequantizes to BF16; this
+  reader reproduces the V4 FP8 operand bytes).
 - runtime/flashinfer_fi7676/apply_fi7676.py applies, at image build time, the one-line fix of
   flashinfer-ai/flashinfer PR 7676 by Thireus (issue 7675, commit c1d1214: a proxy fence after
   producer_acquire in the b12x SM120/SM121 dense block-scaled GEMM) to the image's FlashInfer 0.6.18
   (git 69ff11fc) file flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py; Apache License 2.0.
   FlashInfer: Copyright 2025-2026 NVIDIA; Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/).
   Origin and pins: runtime/flashinfer_fi7676/PROVENANCE.json.
-- runtime/flashinfer_v41c contains NVIDIA FlashInfer sparse_mla_sm120 sources (flashinfer 0.6.18,
-  BSD-3-Clause, headers retained) with local changes listed in runtime/flashinfer_v41c/PROVENANCE.json.
-  The DSV41_SWA_NATIVE_DECODE path (production profile since v2.6.4) uses csrc/swan_decode_dsv4.cu:
-  FlashInfer's decode-dsv4 launcher and its stock kernel body instantiated for 256-token pages. The other sources of that
-  directory (the V4.1 FP4 readers of the v41c / v41n work) are compiled into the same module but have
-  no caller in this tree.
 - adapter/history_repair.py, tests/test_history_repair.py and the named loop-abort exit in
   adapter/loop_abort.py / tests/test_loop_abort.py are MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
   PR 55 by Alexander Busse (GanyX19), upstream commit bdf657c (issue 54), contributed there under

@@ -69,12 +69,28 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_backend as install_swa_cone_backend
                 install_swa_cone_backend(module)
+            # DSV41_KV_LAYOUT=v41c (adapter/v41c_pool.py): the writer / reader call sites must be the pinned ones.
+            if os.environ.get('DSV41_KV_LAYOUT', '').strip() not in _V41C_OFF:
+                from v41c_pool import enabled as _v41c_enabled, check_backend as _v41c_check_backend
+                if _v41c_enabled():
+                    _v41c_check_backend(module)
         elif module.__name__ == 'sglang.srt.model_executor.forward_batch_info':
             # Gated on DSV41_SWA_CONE_REPLAY=1: the resident latents / index keys of a replay are copied
             # into the request's fresh pages on the forward stream (adapter/swa_cone.py).
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_forward_batch as install_swa_cone_forward_batch
                 install_swa_cone_forward_batch(module)
+        elif module.__name__ == 'sglang.srt.mem_cache.deepseek_v4_memory_pool':
+            # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records.
+            # enabled() raises on any value but v4 / v41c, so a typo stops the engine instead of serving V4.
+            from v41c_pool import enabled as _v41c_enabled, install_pool as _v41c_install_pool
+            if _v41c_enabled():
+                _v41c_install_pool(module)
+        elif module.__name__ == 'sglang.srt.model_executor.pool_configurator':
+            # The same gate: pool sizing prices the ratio-1/2 records at 288 B.
+            from v41c_pool import enabled as _v41c_enabled, install_configurator as _v41c_install_configurator
+            if _v41c_enabled():
+                _v41c_install_configurator(module)
         elif module.__name__ == 'sglang.srt.entrypoints.openai.encoding_dsv41':
             from encoding_compat import install_encoder
             install_encoder(module)
@@ -336,6 +352,11 @@ class EngramLoader(importlib.abc.Loader):
                 original(self)
             cls.__post_init__ = post_init
 
+# DSV41_KV_LAYOUT unset or v4 (the default): the finder list is unchanged and adapter/v41c_pool.py is never imported.
+_V41C_OFF = ('', 'v4')
+_V41C_MODULES = (() if os.environ.get('DSV41_KV_LAYOUT', '').strip() in _V41C_OFF else
+                 ('sglang.srt.mem_cache.deepseek_v4_memory_pool', 'sglang.srt.model_executor.pool_configurator'))
+
 class EngramFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname not in ('sglang.srt.layers.engram',
@@ -371,7 +392,7 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                             'b12x.comm.roce_ring.roce_oneshot',
                             'b12x.comm.roce_twoshot.roce_oneshot',
                             'sglang.srt.layers.attention.dsv4.metadata',
-                            'sglang.srt.layers.logits_processor'):
+                            'sglang.srt.layers.logits_processor') + _V41C_MODULES:
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is not None:

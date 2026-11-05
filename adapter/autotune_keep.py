@@ -10,6 +10,14 @@ fingerprint of the launch (argv and the SGLANG_/DSV41_/SPARK_/B12X_/NCCL_ enviro
 to the cache after tuning. A cache is kept only when its sidecar matches the current launch, so a
 config change cannot leave one rank with a partial hit (a hit skips a profile, and a skipped
 profile on one rank desynchronises the timing reduction).
+
+Two fingerprints, two sidecars. `<rank>.launch` holds the fingerprint over the raw argv, the form every
+adapter before this one wrote and compares verbatim (an A/B control booting an older release image reads
+it). `<rank>.launch-pool` holds this adapter's fingerprint with the pool-size argv dropped, bound to the
+`.launch` text it was written next to. A cache is kept when `.launch` equals either fingerprint of the
+current launch, or `.launch-pool` names the current pool-free fingerprint AND the `.launch` that is on disk
+now. A kept cache's `.launch` is never rewritten, so an older adapter that tuned it still reuses it on its
+next boot; a re-tune rewrites `.launch`, which unbinds every `.launch-pool` written before it.
 """
 import hashlib
 import json
@@ -44,10 +52,36 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              # planning, a page copy and a write mask in the prefill metadata), after boot; the autotune pass has
              # no cached prefix, so no replay runs while tuning, and no tuned shape or kernel depends on them
              "DSV41_SWA_THIN", "DSV41_SWA_CONE_REPLAY", "DSV41_SWA_CONE_TOKENS", "DSV41_SWA_CONE_MIN_SAVE",
-             "DSV41_SWA_CONE_TEST")
+             "DSV41_SWA_CONE_TEST",
+             # the opt-in V4.1 FP4 compressed-KV layout and its readers (DSV41_KV_LAYOUT=v41c): they change the KV pool
+             # and the attention readers, never a tuned GEMM / MoE shape or kernel; the v41n reader never tunes and
+             # resolves the stock decode tactics from the kept cache, so its A/B boots must reuse the controls' cache
+             "DSV41_KV_LAYOUT", "DSV41_V41C_ARM", "DSV41_V41C_READER", "DSV41_V41C_DEDUP_ROWS",
+             "DSV41_V41C_DEDUP_MIN_ROWS", "DSV41_V41N_TACTICS", "DSV41_V41N_DIAG", "DSV41_V41N_PREFILL",
+             "DSV41_V41N_PAGE_MIN_ROWS", "DSV41_V41N_PAGE_CAP_MB")
+# argv options that size the KV pool only (no tuned shape depends on them): a capacity boot reuses the tactics
+_VOLATILE_ARGS = ("--max-total-tokens",)
 
 
-def launch_fingerprint() -> str:
+def _argv_key(argv):
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a in _VOLATILE_ARGS:
+            skip = True
+            continue
+        if any(a.startswith(v + "=") for v in _VOLATILE_ARGS):
+            continue
+        out.append(a)
+    return out
+
+
+def launch_fingerprint(raw_argv: bool = False) -> str:
+    """raw_argv=False: argv without the pool-size options (this adapter's own key). raw_argv=True: the whole argv,
+    i.e. the fingerprint an adapter without _VOLATILE_ARGS computes for the same launch (env minus the volatile keys
+    either way: a key volatile here and not there is absent from that adapter's boots)."""
     env = {k: v for k, v in os.environ.items()
            if k.startswith(_PREFIXES) and k not in _VOLATILE and not k.startswith("DSV41_AB_")}
     # In-boot A/B (adapter/ab_variant.py, test only) unions some gates into os.environ; fingerprint
@@ -59,12 +93,31 @@ def launch_fingerprint() -> str:
             env.pop(k, None)
         else:
             env[k] = v
-    payload = {"argv": sys.argv, "env": env}
+    payload = {"argv": list(sys.argv) if raw_argv else _argv_key(sys.argv), "env": env}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def sidecar(cache_path: Path) -> Path:
     return cache_path.with_suffix(".launch")
+
+
+def pool_sidecar(cache_path: Path) -> Path:
+    return cache_path.with_suffix(".launch-pool")
+
+
+def same_launch(cache_path: Path, fp: str, fp_raw: str) -> bool:
+    """The cache at cache_path was tuned by this launch, up to volatile keys and the pool size (module docstring)."""
+    try:
+        launch = sidecar(cache_path).read_text().strip()
+    except OSError:
+        return False
+    if launch and launch in (fp, fp_raw):
+        return True
+    try:
+        pool = pool_sidecar(cache_path).read_text().split()
+    except OSError:
+        return False
+    return len(pool) == 2 and pool[0] == fp and pool[1] == launch and bool(launch)
 
 
 def install(mod):
@@ -78,7 +131,7 @@ def install(mod):
         return
     mod._dsv41_autotune_keep = True
     orig_ctx = mod.flashinfer_autotune_context
-    fp = launch_fingerprint()
+    fp, fp_raw = launch_fingerprint(), launch_fingerprint(raw_argv=True)
 
     def _autotune_cache_digest(cache_path, env):
         cache_path = Path(cache_path)
@@ -86,13 +139,14 @@ def install(mod):
             return ""
         try:
             configs = json.loads(cache_path.read_text())
-            same_launch = sidecar(cache_path).read_text().strip() == fp
+            same = same_launch(cache_path, fp, fp_raw)
         except (OSError, ValueError):
-            configs, same_launch = None, False
-        if not isinstance(configs, dict) or not same_launch:
+            configs, same = None, False
+        if not isinstance(configs, dict) or not same:
             # a different launch re-tunes: an empty digest alone would still let the stock code
             # load the old file when every rank reports "" (they agree)
             cache_path.unlink(missing_ok=True)
+            pool_sidecar(cache_path).unlink(missing_ok=True)
             return ""
         stamp = configs.get("_metadata")
         if not isinstance(stamp, dict):
@@ -109,13 +163,21 @@ def install(mod):
         cache_path = Path(mod.flashinfer_autotune_cache_path(model_runner))
         before = _autotune_cache_digest(cache_path, {}) != ""
         with orig_ctx(model_runner, *args, **kwargs):
+            # the stock entry gate has run: a cache another rank's digest made it drop is gone by now
+            kept = before and cache_path.is_file()
             yield
         try:
             if cache_path.is_file():
-                sidecar(cache_path).write_text(fp + "\n")
+                if kept:
+                    # never rewrite a kept cache's .launch: the adapter that tuned it compares it verbatim
+                    launch = sidecar(cache_path).read_text().strip()
+                else:
+                    launch = fp_raw
+                    sidecar(cache_path).write_text(fp_raw + "\n")
+                pool_sidecar(cache_path).write_text(f"{fp} {launch}\n")
         except OSError:
             pass
-        print(f"[autotune_keep] {'reused' if before else 'tuned and saved'} {cache_path.parent.name}/{cache_path.name}",
+        print(f"[autotune_keep] {'reused' if kept else 'tuned and saved'} {cache_path.parent.name}/{cache_path.name}",
               flush=True)
 
     mod._autotune_cache_digest = _autotune_cache_digest

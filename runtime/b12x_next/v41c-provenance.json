@@ -1,0 +1,20 @@
+{
+ "component": "b12x_next (local-inference-lab/b12x)",
+ "licence": "Apache-2.0",
+ "purpose": "DSV41_KV_LAYOUT=v41c: ratio-1/2 compressed latents as V4.1 FP4 records (288 B), SWA unchanged (V4, 584 B)",
+ "changes": [
+  {
+   "file": "b12x_next/_lib/intrinsics.py",
+   "change": "add mul_rn_f32 (mul.rn.f32 inline asm)"
+  },
+  {
+   "file": "b12x_next/attention/_shared/mla/kv_cache.py",
+   "change": "dsv41 indexed writer: scale = e4m3(clamp(amax * f32(1/6), 2^-9, 448)), values div.rn by the decoded scale (was amax / 6.0 and a rounded reciprocal), so the record is the model's own fake_quant_compressed_kv rounding"
+  },
+  {
+   "file": "b12x_next/attention/_shared/mla/compressed_reference.py",
+   "change": "pack_deepseek_v41_cache_reference indexed: the same model arithmetic"
+  }
+ ],
+ "status": "REFERENCE / TEST ONLY (coordinator, 2026-10-27): production v41c writes the compressed records with SGLang's own c1/c2 / fused_store_cache V41_FP4 path in SGLang's page ABI (data rows then a per-page e4m3 footer); b12x_next's deepseek_v41 writer and readers use contiguous token records and are not on the serving path. The aligned writer arithmetic stays as an independent reference of the model's rounding (tests/test_v41_kv_numerics.py) and for any future b12x_next reader work."
+}

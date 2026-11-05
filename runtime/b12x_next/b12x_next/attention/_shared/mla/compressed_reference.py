@@ -321,9 +321,12 @@ def pack_deepseek_v41_cache_reference(
         payload = normalized.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
         payload = payload.reshape(tokens, 512)
     else:
-        scales_fp8 = (maximum.clamp_min(6 * 2**-9) / 6.0).clamp(max=448).to(torch.float8_e4m3fn)
+        # The model's own rounding (SGLang torch_quant.fake_quant_compressed_kv): f32
+        # amax times f32(1/6), clamped to [2^-9, 448], RN-even e4m3; values divided
+        # (IEEE) by the decoded scale. A rounded reciprocal moves exact ties.
+        scales_fp8 = (maximum * (1.0 / 6.0)).clamp(min=2.0**-9, max=448.0).to(torch.float8_e4m3fn)
         scale_f32 = scales_fp8.float().unsqueeze(-1)
-        normalized = grouped * scale_f32.reciprocal()
+        normalized = grouped / scale_f32
         magnitude = normalized.abs().contiguous()
         boundaries = torch.tensor(
             [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],

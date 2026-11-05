@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased (branch perf/v41n-v264-20261105 = the v2.6.4 candidate 469277e + v41n; not in any release)
+
+- **v41n on v2.6.4, off by default** (`DSV41_KV_LAYOUT=v41c DSV41_V41C_READER=native`): the ratio-1 / ratio-2
+  compressed KV pools hold SGLang's own V4.1 FP4 records (288 B instead of the 584-byte V4 slot; `adapter/v41c_pool.py`)
+  and the sparse-MLA readers convert them in place (`runtime/flashinfer_v41c`, DSV41_V41C_READER=native). Port of
+  `perf/v41n-cap-atk-20261103` @ `15c3e33` (the capacity A/B branch: v2.6.3 + `perf/v41n-native-reader-20261029`
+  `8531d87` + the autotune_keep fixes `59c719a` / `15c3e33`): `adapter/v41c_pool.py`, the sitecustomize hooks (pool,
+  configurator, backend pins + layer tags), the canary's two v41c routing blocks, the `b12x_next` reference writer
+  arithmetic (`runtime/b12x_next/v41c-provenance.json`, test only), `adapter/autotune_keep.py` (the v41c / v41n keys
+  volatile; `--max-total-tokens` out of the fingerprint; `.launch` kept in the raw-argv form an older adapter reads,
+  `.launch-pool` beside it) and the v41c / v41n tests. `runtime/flashinfer_v41c` is v2.6.4's directory unchanged
+  (module tag `00505fe850b7`: v2.6.4's swan module already carries the v41c / v41n readers), so the module and .so
+  of a v2.6.4 build serve both. With the keys unset nothing of this is imported or routed: the finder list, the
+  canary (minus its v41c blocks) and sitecustomize (minus its v41c branches) are v2.6.4's (tests below).
+- **Autotune.** The v41c / v41n keys are volatile for `DSV41_AUTOTUNE_KEEP`: they change the KV pool layout and the
+  attention readers, never a tuned GEMM / MoE shape; the native reader never tunes and resolves the stock decode-dsv4
+  tactic for each shape from the kept table (`native_tactic`: the runner keeps the stock class name), so a v41n boot
+  must reuse the cache a V4 boot of the same launch tuned (a re-tune would change the MoE tactics and so the numerics
+  it is compared on: the 2026-11-03 capacity A/B, where every arm re-tuned, was invalid for that reason).
+- **SWA cone replay x v41c.** The cone copies every full-page-addressed pool buffer page for page and redirects the
+  replay rows' compressor writes to the padding slot. Under v41c the ratio-1 / ratio-2 buffers are V4.1 FP4 pages
+  (73,728 / 36,864 B per full page, data and scale rows in one row), and the prefill latent write of those pools is
+  `_low_ratio_write_group`'s V41_FP4 branch with the same `slots`. `tests/test_swa_cone_v41c.py` (real SGLang pool
+  construction with the v41c patch, the real `_low_ratio_compress_torch` / `_low_ratio_write_group` on it, CPU writers
+  of the same page ABI at the CUDA leaves): the cone's buffer list equals SGLang's own `get_contiguous_buf_infos` on
+  v41c and V4; the replay rows' FP4 latent and index-key slots are 0 and the copied pages keep their bytes; without
+  the mask the same writes overwrite them; both adapters pin the same engine text; all hooks install together.
+- Tests: `test_v41c_pool.py` (base sitecustomize = v2.6.4's), `test_v41c_reader.py`, `test_v41n_native.py`,
+  `test_v41n_page.py`, `test_v41c_fast.py`, `test_v41_kv_numerics.py`, `test_autotune_keep.py` (cross-adapter reuse),
+  `test_prefill_native_extra.py`, `test_v41c_offsets_64bit.py` (from `fix/v41n-cap-kill-20261105` `4fa4f70`: FP4
+  record addressing stays 64-bit past 2 GiB), `test_swa_cone_v41c.py`; the last runs in the canary-roce build, as
+  `test_v41c_pool.py` does in both canary builds.
+
 ## Unreleased
 
 A loop-aborted request now ends as a named error instead of a normal stop, and a request whose history holds a
