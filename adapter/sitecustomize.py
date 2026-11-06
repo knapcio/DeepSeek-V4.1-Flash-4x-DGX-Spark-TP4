@@ -416,6 +416,16 @@ if os.environ.get('DSV41_AB_VARIANTS', '').strip() not in ('', '0', '1'):
         print(f'DSV41_AB: refusing to start: {exc!r}', flush=True)
         os._exit(1)
 
+# DSV41_TOKENIZER_HEAP=trim2 (off by default): launch_server only; malloc_trim(0) after >= 256 MiB of new heap, at most
+# once per 120 s, in a tokenizer idle gap or (a stream of back-to-back long prompts) between two prompts
+# (adapter/heap_trim2.py). Allocation only.
+if os.environ.get('DSV41_SOURCE') and os.environ.get('DSV41_TOKENIZER_HEAP', '').strip().lower() == 'trim2':
+    try:
+        import heap_trim2 as _heap_trim2
+        _heap_trim2.install()
+    except Exception as exc:
+        print(f'DSV41_TOKENIZER_HEAP=trim2: not installed ({exc!r})', flush=True)
+
 if os.environ.get('DSV41_SOURCE'):
     try:
         import tp3_pad

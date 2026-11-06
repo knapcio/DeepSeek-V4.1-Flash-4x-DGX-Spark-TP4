@@ -58,7 +58,13 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              # resolves the stock decode tactics from the kept cache, so its A/B boots must reuse the controls' cache
              "DSV41_KV_LAYOUT", "DSV41_V41C_ARM", "DSV41_V41C_READER", "DSV41_V41C_DEDUP_ROWS",
              "DSV41_V41C_DEDUP_MIN_ROWS", "DSV41_V41N_TACTICS", "DSV41_V41N_DIAG", "DSV41_V41N_PREFILL",
-             "DSV41_V41N_PAGE_MIN_ROWS", "DSV41_V41N_PAGE_CAP_MB")
+             "DSV41_V41N_PAGE_MIN_ROWS", "DSV41_V41N_PAGE_CAP_MB",
+             # the tokenizer heap trim runs in launch_server only (the HTTP / tokenizer process): no scheduler, GEMM
+             # shape or kernel sees it
+             "DSV41_TOKENIZER_HEAP", "DSV41_TOKENIZER_TRIM2_IDLE_S", "DSV41_TOKENIZER_TRIM2_POLL_S",
+             "DSV41_TOKENIZER_TRIM2_MIN_MIB", "DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S", "DSV41_TOKENIZER_TRIM2_MAX_BUSY_S",
+             "DSV41_TOKENIZER_TRIM2_BUDGET_MS", "DSV41_TOKENIZER_TRIM2_MAX_DEFER_S", "DSV41_TOKENIZER_TRIM2_LOG_MIN_S",
+             "DSV41_TOKENIZER_TRIM2_SUMMARY_S", "DSV41_TOKENIZER_TRIM2_MS_PER_GIB")
 # argv options that size the KV pool only (no tuned shape depends on them): a capacity boot reuses the tactics
 _VOLATILE_ARGS = ("--max-total-tokens",)
 

@@ -50,6 +50,18 @@
   record addressing stays 64-bit past 2 GiB), `test_swa_cone_v41c.py`; the last runs in the canary-roce build, as
   `test_v41c_pool.py` does in both canary builds.
 
+- **New, off by default: `DSV41_TOKENIZER_HEAP=trim2`** (`adapter/heap_trim2.py`). The head's tokenizer process
+  (`launch_server`) keeps the memory it used for long prompts: with several 200K-900K-token prompts in flight its
+  glibc heap grows by GiBs of free but resident pages (v2.6.4 on the four Sparks: 1.9 -> 5.1 / 7.1 GiB in a 15-minute
+  long-prompt soak, still rising; the schedulers flat). trim2 returns it with `malloc_trim(0)`: after >= 256 MiB of
+  new heap, at most once per 120 s, in a gap of the tokenizer (1.5 s without a prompt being rendered or encoded) or,
+  when prompts arrive back to back, between two prompts after 30 s. The v2.6.3 candidate's `trim` (every 2 s, reverted)
+  released the same pages over and over and cost long prompts 17 % of their throughput; trim2's interval bounds that
+  cost. Outputs are unchanged (allocation only); the key and its knobs are volatile for `DSV41_AUTOTUNE_KEEP`.
+  Not yet measured on the four Sparks. Tests: `tests/test_tokenizer_heap_trim2.py` (CI and the canary-roce image).
+
+## 2026-11-05 v2.6.4 (candidate)
+
 ## Unreleased
 
 A loop-aborted request now ends as a named error instead of a normal stop, and a request whose history holds a

@@ -205,6 +205,9 @@ RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone.py
 # The cone x DSV41_KV_LAYOUT=v41c: the page copy covers the V4.1 FP4 pools, the replay rows' FP4 writes go to slot 0.
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone_v41c.py
+# DSV41_TOKENIZER_HEAP=trim2 (CPU, off by default): the hook targets and every prompt encode on this engine tree, the
+# hooks on the real classes, the trimmer's gates and the real glibc heap.
+RUN CUDA_VISIBLE_DEVICES= DSV41_TRIM2_SGLANG_ROOT=/sgl-workspace/sglang/python/sglang python3 /opt/dsv41/tests/test_tokenizer_heap_trim2.py
 EXPOSE 8888
 HEALTHCHECK --interval=30s --timeout=30s --start-period=30m --retries=3 \
     CMD ["python3", "-S", "/opt/dsv41/boot.py", "health"]
