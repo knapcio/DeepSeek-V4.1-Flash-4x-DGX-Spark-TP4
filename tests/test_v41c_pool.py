@@ -556,9 +556,10 @@ V41N_KEYS = ["DSV41_KV_LAYOUT=v41c", "DSV41_V41C_ARM=1", "DSV41_V41C_READER=nati
 
 @unittest.skipUnless((ROOT / ".env.tp4.example").exists(), "not a repo checkout (in an image)")
 class Profile(unittest.TestCase):
-    """v2.6.4n: the production line of .env.tp4.example ends with the three v41n keys (after v2.6.4's cone keys), no
-    other profile line sets the layout or a reader, no diagnostic v41c / v41n knob is in any profile, every v41n key is
-    volatile for DSV41_AUTOTUNE_KEEP, and the module stays off when the layout is unset."""
+    """v2.6.5: the production line of .env.tp4.example ends with the three v41n keys (after v2.6.4's cone keys) and
+    v2.6.5's tokenizer heap trim, no other profile line sets the layout or a reader, no diagnostic v41c / v41n knob is
+    in any profile, every v41n key is volatile for DSV41_AUTOTUNE_KEEP, the module stays off when the layout is unset,
+    and the production settings pin the v41n pool at 5,130,752 tokens (the memory ladder's SAFE pin)."""
 
     def _lines(self):
         return (ROOT / ".env.tp4.example").read_text().splitlines()
@@ -571,9 +572,22 @@ class Profile(unittest.TestCase):
 
     def test_production_line_ends_with_v41n_once(self):
         items = self._production_line().split('"')[1].split()
-        self.assertEqual(items[-6:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"] + V41N_KEYS)
+        self.assertEqual(items[-7:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"] + V41N_KEYS
+                         + ["DSV41_TOKENIZER_HEAP=trim2"])
         for k in V41N_KEYS:
             self.assertEqual(sum(x.split("=")[0] == k.split("=")[0] for x in items), 1, k)
+
+    def test_production_pool_pin(self):
+        lines = self._lines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        j = next(n for n in range(i, len(lines)) if not lines[n].startswith("#"))
+        pins = [line for line in lines[i:j] if line.startswith("#MAX_TOTAL_TOKENS=")]
+        self.assertEqual(pins, ["#MAX_TOTAL_TOKENS=5130752"])
+        self.assertEqual(5130752 % 256, 0)
+        # the pin is the production block's only pool setting; the active default stays v2.6.4's unpinned 8,000,000
+        self.assertEqual([line for line in lines if line.startswith("MAX_TOTAL_TOKENS=")], ["MAX_TOTAL_TOKENS=8000000"])
+        self.assertEqual([line for line in lines if line.lstrip("#").startswith("MAX_TOTAL_TOKENS=") and "5130752" in line],
+                         ["#MAX_TOTAL_TOKENS=5130752"])
 
     def test_only_the_production_line_sets_the_layout(self):
         on = [line for line in self._lines() if "DSV41_KV_LAYOUT" in line and not line.startswith("# ")]

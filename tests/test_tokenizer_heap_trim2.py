@@ -1211,5 +1211,32 @@ class RealGlibc(unittest.TestCase):
         self.assertLess(float(ms), 200)
 
 
+
+@unittest.skipUnless((HERE.parent / '.env.tp4.example').exists(), 'not a repo checkout (in an image)')
+class Profile(unittest.TestCase):
+    """v2.6.5: the production line of .env.tp4.example ends with DSV41_TOKENIZER_HEAP=trim2 (after the v41n keys), no
+    other profile line sets it, no tuning knob of it is in any profile (the code defaults are the measured ones)."""
+
+    def _lines(self):
+        return (HERE.parent / '.env.tp4.example').read_text().splitlines()
+
+    def _production_line(self):
+        lines = self._lines()
+        i = next(n for n, line in enumerate(lines) if line.startswith('# Production settings, together with the line'))
+        self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
+        return lines[i - 1]
+
+    def test_production_line_ends_with_trim2_once(self):
+        items = self._production_line().split('"')[1].split()
+        self.assertEqual(items[-2:], ['DSV41_V41C_READER=native', 'DSV41_TOKENIZER_HEAP=trim2'])
+        self.assertEqual(sum(x.split('=')[0] == 'DSV41_TOKENIZER_HEAP' for x in items), 1)
+
+    def test_only_the_production_line_sets_it(self):
+        on = [line for line in self._lines() if 'DSV41_TOKENIZER_HEAP=' in line and not line.startswith('# ')]
+        self.assertEqual(on, [self._production_line()])
+        knobs = [line for line in self._lines() if 'DSV41_TOKENIZER_TRIM2_' in line and not line.startswith('# ')]
+        self.assertEqual(knobs, [])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
