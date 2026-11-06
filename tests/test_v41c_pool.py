@@ -41,8 +41,8 @@ ADAPTER = ROOT / "adapter"
 sys.path.insert(0, str(ADAPTER))
 import v41c_pool as P  # noqa: E402
 
-# the base sitecustomize.py: v2.6.4 (release/v2.6.4-20261103 @ 469277e) on this branch
-SITE_F744D83_SHA = "4ccc00ceacdeeea58686511492416618fc931569638b76c84ec790d0709b1ba4"
+# the base sitecustomize.py: v2.6.4 + the issue #66 fix (main @ 540bf07: the history_repair hook) on this branch
+SITE_F744D83_SHA = "ebc976542bf989bbc6f5a77b5032447f639cf72dfa2101de2e2100576d6f8011"
 
 try:
     import torch
@@ -485,7 +485,7 @@ V41C_SITE_BLOCKS = (
     re.compile(r" \+ _V41C_MODULES(?=:\n            return None)"),
 )
 # the tokenizer heap trim's block (perf/v41n-trim-v264-20261106: heap_trim2 on v2.6.4n; off by default, launch_server
-# only, its own tests in tests/test_tokenizer_heap_trim2.py): stripped too, so the rest is still v2.6.4's text
+# only, its own tests in tests/test_tokenizer_heap_trim2.py): stripped too, so the rest is still the base's text
 TRIM2_SITE_BLOCK = re.compile(r"# DSV41_TOKENIZER_HEAP=trim2 \(off by default\).*?"
                               r"print\(f'DSV41_TOKENIZER_HEAP=trim2: not installed \(\{exc!r\}\)', flush=True\)\n\n", re.S)
 
