@@ -399,5 +399,7 @@ if os.environ.get('DSV41_SOURCE'):
     try:
         import tp3_pad
         tp3_pad.install()
+    # FALL-THROUGH: a failed TP pad install leaves the engine unpadded. start.sh always passes
+    # DSV41_TP_PAD (default 1), so a user value cannot be told from the default here: warn.
     except Exception as exc:
-        print(f'DSV41 TP pad not installed: {exc}', flush=True)
+        print(f'WARNING: DSV41 TP pad not installed, the engine runs unpadded: {exc}', flush=True)
