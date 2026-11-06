@@ -417,7 +417,7 @@ if os.environ.get('DSV41_AB_VARIANTS', '').strip() not in ('', '0', '1'):
         os._exit(1)
 
 # DSV41_TOKENIZER_HEAP=trim2 (off by default): launch_server only; malloc_trim(0) after >= 256 MiB of new heap, at most
-# once per 120 s, in a tokenizer idle gap or (a stream of back-to-back long prompts) between two prompts
+# once per 120 s, in a tokenizer idle gap or (a stream of back-to-back long prompts) at the end of a prompt's tokenization
 # (adapter/heap_trim2.py). Allocation only.
 if os.environ.get('DSV41_SOURCE') and os.environ.get('DSV41_TOKENIZER_HEAP', '').strip().lower() == 'trim2':
     try:

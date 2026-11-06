@@ -32,8 +32,9 @@ in 4 minutes) while the peak between trims rises (1.5 / 2.4 / 3.0 / 6.4 GiB). tr
      /generate text). A counter and a monotonic last-activity time under one lock.
   4. Busy fallback: back-to-back long prompts never leave an idle gap, and the heap would grow until the host runs out
      (the 2026-11-05 ladder controls). When RssAnon has grown by MIN_MIB for DSV41_TOKENIZER_TRIM2_MAX_BUSY_S (30) s
-     without an idle gap, the trim runs at the next poll at which no tokenization is in flight at that instant (between
-     two prompts); its receipt says BUSY. 0 = idle gaps only.
+     without an idle gap, the trim is due: it runs at the next gap between two prompts, on the thread that just
+     finished a tokenization (the in-flight count's 1 -> 0 edge; no prompt is being encoded then), or, if no gap comes
+     within another MAX_BUSY_S, from the trimmer thread. Its receipt says BUSY. 0 = idle gaps only.
   5. Hold budget (idle path): a trim predicted to hold the locks longer than DSV41_TOKENIZER_TRIM2_BUDGET_MS (50)
      also waits for an idle request stream (no detokenized output received for IDLE_S); after
      DSV41_TOKENIZER_TRIM2_MAX_DEFER_S (60) it runs anyway (FORCED). The per-GiB cost starts at
@@ -170,6 +171,7 @@ class Activity:
         self.last = clock()
         self.hooks = []
         self._tm = None
+        self.on_gap = None                           # called (outside the lock) when the in-flight count drops to 0
 
     def enter(self):
         with self._lock:
@@ -181,6 +183,13 @@ class Activity:
         with self._lock:
             self.inflight -= 1
             self.last = self._clock()
+            gap = self.inflight == 0
+        cb = self.on_gap
+        if gap and cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001  (never into the request path)
+                pass
 
     def quiet(self, idle_s, now=None) -> bool:
         with self._lock:
@@ -239,6 +248,9 @@ class Trimmer:
         self.last_trim = None                        # monotonic time of the last trim (the rate limit)
         self.deferred_since = None
         self.busy_since = None
+        self.due_since = None                        # a busy trim is due: the next tokenization gap runs it
+        self._lock = threading.Lock()                # one trim at a time (poll thread or a gap)
+        act.on_gap = self.gap
         self.n = dict(trims=0, forced=0, busy=0, over_budget=0, aborted=0, deferred=0, busy_waits=0, suppressed=0)
         self.returned_kb = 0
         self.hold_ms = []                            # last 4096 calls
@@ -268,10 +280,18 @@ class Trimmer:
                 self.n['busy_waits'] += 1
             if in_interval:
                 return 'interval'
-            if now - self.busy_since < cfg.max_busy_s or not act.between():
+            if now - self.busy_since < cfg.max_busy_s:
                 return 'busy'
-            return self._trim(est_ms=None, how='busytrim')
+            # due: the next gap between two prompts runs it, on the thread that just finished a tokenization
+            # (Activity.exit -> gap); a gap that never comes within another MAX_BUSY_S: this thread runs it
+            if self.due_since is None:
+                self.due_since = now
+            if now - self.due_since < cfg.max_busy_s:
+                return 'due'
+            with self._lock:
+                return self._trim(est_ms=None, how='busytrim', wait_gap=False)
         self.busy_since = None
+        self.due_since = None
         if in_interval:
             return 'interval'
         r = self.rss_kb()
@@ -294,9 +314,20 @@ class Trimmer:
         if not act.quiet(cfg.idle_s):                # activity started since the gate: skip this trim
             self.n['aborted'] += 1
             return 'abort'
-        return self._trim(est_ms=est_ms, how=how, r=r, f=f)
+        with self._lock:
+            return self._trim(est_ms=est_ms, how=how, r=r, f=f)
 
-    def _trim(self, est_ms, how, r=None, f=None) -> str:
+    def gap(self):
+        """Activity.exit at the in-flight 1 -> 0 edge: run a due busy trim now, between two prompts."""
+        if self.due_since is None or not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self.due_since is not None:
+                self._trim(est_ms=None, how='busytrim', wait_gap=True)
+        finally:
+            self._lock.release()
+
+    def _trim(self, est_ms, how, r=None, f=None, wait_gap=True) -> str:
         cfg = self.cfg
         if r is None:
             r = self.rss_kb()
@@ -304,9 +335,9 @@ class Trimmer:
             est_ms = self.ms_per_gib * min(f, self._grown(r, f)) / (1 << 30)
         if how == 'busytrim':
             if f < cfg.min_bytes:                        # RSS grew with live data (prompts in flight), not free pages
-                self.busy_since = None
+                self.busy_since = self.due_since = None
                 return 'small'
-            if not self.act.between():                   # a prompt started during the reads: next poll
+            if wait_gap and not self.act.between():      # a prompt started during the reads: the next gap
                 self.n['aborted'] += 1
                 return 'abort'
         t0 = self.perf()
@@ -315,6 +346,7 @@ class Trimmer:
         r1 = self.rss_kb()
         now = self.clock()
         self.r0, self.f0, self.deferred_since, self.busy_since, self.last_trim = r1, self.free_bytes(), None, None, now
+        self.due_since = None
         back_kb = max(0, r - r1)
         self.returned_kb += back_kb
         self.n['trims'] += 1

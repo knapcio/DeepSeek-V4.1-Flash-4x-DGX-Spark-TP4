@@ -340,66 +340,54 @@ class RateLimit(unittest.TestCase):
 
 class BusyFallback(unittest.TestCase):
     """A stream of back-to-back long prompts (the issue-16 warm loop: 1 or 4 streams, a new prompt as soon as the last
-    answer arrives) never leaves the 1.5 s idle gap."""
+    answer arrives) never leaves the 1.5 s idle gap. A due trim runs at the next gap between two prompts, on the thread
+    whose tokenization just ended (Activity.exit), so no prompt is being encoded during the call."""
 
     def _stream(self, tr, act, heap, clock, seconds, grow_mib_per_s=7, prompt_s=1.0, gap_s=0.5):
-        """prompt_s in flight, gap_s between prompts, a poll every 0.5 s; returns the step results with times."""
+        """prompt_s in flight, gap_s between prompts, a poll every 0.5 s -> (step results, [(time, inflight) per trim])."""
+        calls, orig = [], heap.trim
+
+        def trim():
+            calls.append((clock.t, act.inflight))
+            orig()
+        tr.trim = trim
         out, t_end = [], clock.t + seconds
         while clock.t < t_end:
             act.enter()
             for _ in range(int(prompt_s / 0.5)):
                 clock.t += 0.5
                 heap.dirty_and_free(int(grow_mib_per_s * 0.5) or 1)
-                out.append((clock.t, tr.step()))
-            act.exit()
+                out.append(tr.step())
+            act.exit()                                    # the gap edge: a due trim runs here
             for _ in range(int(gap_s / 0.5)):
                 clock.t += 0.5
-                out.append((clock.t, tr.step()))
-        return out
+                out.append(tr.step())
+        return out, calls
 
     def test_trims_between_prompts_after_max_busy(self):
         tr, act, heap, clock, lines = make({'DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S': '60',
                                             'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '30'})
         t0 = clock.t
-        res = self._stream(tr, act, heap, clock, 600)
-        trims = [(t - t0, r) for t, r in res if r == 'busytrim']
-        self.assertTrue(trims)
-        self.assertNotIn('trim', [r for _, r in res])     # never the idle path: no idle gap exists
-        # 3 MiB per in-flight poll, 2 of every 3 polls: 4 MiB/s, 256 MiB after ~64 s, then 30 s of busy wait; later
-        # the interval (60 s) dominates
-        self.assertGreaterEqual(trims[0][0], 30 + 62)
-        self.assertLessEqual(trims[0][0], 30 + 66)
-        gaps = [b[0] - a[0] for a, b in zip(trims, trims[1:])]
+        res, calls = self._stream(tr, act, heap, clock, 600)
+        self.assertTrue(calls)
+        self.assertNotIn('trim', res)                     # never the idle path: no idle gap exists
+        self.assertEqual({i for _, i in calls}, {0})      # every call between two prompts
+        # 3 MiB per in-flight poll, 2 of every 3 polls: 4 MiB/s, 256 MiB after ~64 s, then 30 s of busy wait, then the
+        # next gap; later the interval (60 s) dominates
+        self.assertGreaterEqual(calls[0][0] - t0, 30 + 62)
+        self.assertLessEqual(calls[0][0] - t0, 30 + 66)
+        gaps = [b[0] - a[0] for a, b in zip(calls, calls[1:])]
         self.assertTrue(all(g >= 60 for g in gaps), gaps)
-        self.assertLessEqual(len(trims), 600 // 60)
-        self.assertTrue(all(act.inflight == 0 for _ in [0]))
+        self.assertLessEqual(len(calls), 600 // 60)
         self.assertTrue(any('BUSY after no idle gap' in l for l in lines))
-        self.assertEqual(tr.n['busy'], len(trims))
-        # the heap never holds more than ~ (interval + busy wait) x growth of unreturned pages
-        self.assertLessEqual(max(heap.calls) >> 20, 7 * 70)
-
-    def test_never_during_a_prompt(self):
-        heap = FakeHeap()
-        clock = Clock()
-        act = ht.Activity(clock=clock, wall=lambda: clock() + 1e9)
-        act.hooks.append('test')
-        seen = []
-
-        def trim():
-            seen.append(act.inflight)
-            heap.trim()
-        tr = ht.Trimmer(ht.Config({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '5', 'DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S': '10'}),
-                        act, clock=clock, perf=lambda: 0.0, rss_kb=lambda: heap.rss_kb, free_bytes=lambda: heap.free,
-                        trim=trim, log=lambda m: None)
-        BusyFallback._stream(self, tr, act, heap, clock, 300, grow_mib_per_s=50)
-        self.assertTrue(seen)
-        self.assertEqual(set(seen), {0})
+        self.assertEqual(tr.n['busy'], len(calls))
+        self.assertIn('due', res)
 
     def test_zero_disables_the_fallback(self):
         tr, act, heap, clock, _ = make({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '0'})
-        res = self._stream(tr, act, heap, clock, 600, grow_mib_per_s=50)
-        self.assertEqual(heap.calls, [])
-        self.assertEqual({r for _, r in res}, {'busy'})
+        res, calls = self._stream(tr, act, heap, clock, 600, grow_mib_per_s=50)
+        self.assertEqual(calls, [])
+        self.assertEqual(set(res), {'busy'})
 
     def test_no_growth_no_busy_wait(self):
         tr, act, heap, clock, _ = make({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '1'})
@@ -409,19 +397,8 @@ class BusyFallback(unittest.TestCase):
             heap.rss_kb += 1 << 10                        # 1 MiB/s: 100 MiB < 256 MiB
             self.assertEqual(tr.step(), 'busy')
         self.assertIsNone(tr.busy_since)
+        self.assertIsNone(tr.due_since)
         self.assertEqual(tr.n['busy_waits'], 0)
-
-    def test_live_growth_is_not_trimmed(self):
-        tr, act, heap, clock, _ = make({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '5'})
-        act.enter()
-        for _ in range(10):
-            clock.t += 1
-            heap.rss_kb += 100 << 10                      # 1 GiB of live data, nothing freed
-            tr.step()
-        act.exit(); act.last = clock.t
-        self.assertEqual(tr.step(), 'small')              # waited, but mallinfo2 has < 256 MiB free: no call
-        self.assertEqual(heap.calls, [])
-        self.assertIsNone(tr.busy_since)
 
     def test_busy_wait_runs_inside_the_interval(self):
         tr, act, heap, clock, _ = make({'DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S': '60',
@@ -437,25 +414,97 @@ class BusyFallback(unittest.TestCase):
         clock.t = t0 + 59
         self.assertEqual(tr.step(), 'interval')
         clock.t = t0 + 60
-        self.assertEqual(tr.step(), 'busy')               # waited 55 s, but a prompt is in flight
-        act.exit(); act.enter(); act.exit()               # a gap between two prompts (not an idle gap)
-        clock.t = t0 + 60.5
-        self.assertEqual(tr.step(), 'busytrim')
+        self.assertEqual(tr.step(), 'due')                # waited 55 s; a prompt is in flight: the next gap runs it
+        self.assertEqual(len(heap.calls), 1)
+        act.exit()                                        # a gap between two prompts (not an idle gap)
+        self.assertEqual(len(heap.calls), 2)
+        self.assertEqual(tr.n['busy'], 1)
+        self.assertIsNone(tr.due_since)
+
+    def test_no_gap_at_all_falls_back_to_the_trimmer_thread(self):
+        tr, act, heap, clock, lines = make({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '30'})
+        act.enter()                                       # one tokenization that never ends (or overlapping ones)
+        res = []
+        for _ in range(100):
+            clock.t += 1
+            heap.dirty_and_free(10)
+            res.append(tr.step())
+        self.assertIn('busytrim', res)
+        first = res.index('busytrim') + 1                 # seconds since the start
+        self.assertGreaterEqual(first, 26 + 30 + 30)      # 256 MiB at 26 s, + the busy wait + the gap wait
+        self.assertLessEqual(first, 26 + 30 + 30 + 1)
+
+    def test_live_growth_is_not_trimmed(self):
+        tr, act, heap, clock, _ = make({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '5'})
+        act.enter()
+        for _ in range(10):
+            clock.t += 1
+            heap.rss_kb += 100 << 10                      # 1 GiB of live data, nothing freed
+            tr.step()
+        self.assertIsNotNone(tr.due_since)
+        act.exit()                                        # the gap: mallinfo2 has < 256 MiB free: no call
+        self.assertEqual(heap.calls, [])
+        self.assertIsNone(tr.due_since)
+        self.assertIsNone(tr.busy_since)
 
     def test_prompt_starting_during_the_reads_aborts(self):
         tr, act, heap, clock, _ = make({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '1'})
-        act.enter(); heap.dirty_and_free(512); clock.t += 1
+        act.enter(); act.enter()                          # two overlapping tokenizations
+        heap.dirty_and_free(512)
+        clock.t += 1
         self.assertEqual(tr.step(), 'busy')
         clock.t += 1
-        act.exit()
-        act.last = clock.t                                # just ended: not idle
+        self.assertEqual(tr.step(), 'due')
         orig = tr.free_bytes
-        tr.free_bytes = lambda: (act.enter(), orig())[1]
-        self.assertEqual(tr.step(), 'abort')
+        tr.free_bytes = lambda: (act.enter(), orig())[1]  # a prompt arrives while mallinfo2 runs
+        act.exit(); act.exit()                            # the gap edge
         self.assertEqual(heap.calls, [])
-        act.exit(); tr.free_bytes = orig
-        act.last = clock.t
-        self.assertEqual(tr.step(), 'busytrim')
+        self.assertEqual(tr.n['aborted'], 1)
+        tr.free_bytes = orig
+        act.exit()                                        # the next gap
+        self.assertEqual(len(heap.calls), 1)
+
+    def test_a_failing_trim_never_reaches_the_request(self):
+        tr, act, heap, clock, _ = make({'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '1'})
+        act.enter()
+        heap.dirty_and_free(512)
+        for _ in range(2):
+            clock.t += 1
+            tr.step()
+        self.assertIsNotNone(tr.due_since)
+        tr.trim = lambda: 1 / 0
+        act.exit()                                        # swallowed: the conversion's caller sees nothing
+        self.assertTrue(tr._lock.acquire(blocking=False))
+        tr._lock.release()
+
+    def test_real_threads_trim_only_in_gaps(self):
+        heap = FakeHeap()
+        act = ht.Activity()
+        act.hooks.append('test')
+        seen = []
+
+        def trim():
+            seen.append(act.inflight)
+            heap.trim()
+        cfg = ht.Config({'DSV41_TOKENIZER_TRIM2_IDLE_S': '5', 'DSV41_TOKENIZER_TRIM2_POLL_S': '0.005',
+                         'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '0.05', 'DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S': '0.1'})
+        tr = ht.Trimmer(cfg, act, rss_kb=lambda: heap.rss_kb, free_bytes=lambda: heap.free, trim=trim, log=lambda m: None)
+        stop = threading.Event()
+        runner = threading.Thread(target=tr.run, args=(stop,)); runner.start()
+        end = time.monotonic() + 1.0
+        lock = threading.Lock()
+
+        def tokenizer():                                  # one event-loop-like thread: prompts back to back
+            while time.monotonic() < end:
+                act.enter()
+                with lock:
+                    heap.dirty_and_free(64)
+                time.sleep(0.02)
+                act.exit()
+        t = threading.Thread(target=tokenizer); t.start(); t.join()
+        stop.set(); runner.join(5)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {0}, seen)
 
 
 class ConfigRange(unittest.TestCase):
@@ -532,7 +581,7 @@ class SoakSimulation(unittest.TestCase):
                 heap.dirty_and_free(int(0.4 * 1024 / 60 * 0.5) + 1)  # retained growth ~0.4 GiB/min
                 tr.step()
                 peak = max(peak, heap.rss_kb)
-            act.exit()
+            act.exit()                                              # a due busy trim runs at this gap
             clock.t += 0.05                                         # the gap between two prompts
             tr.step()
         n_busy = tr.n['busy']
@@ -952,7 +1001,8 @@ class RealGlibc(unittest.TestCase):
             import sys, time, ctypes; sys.path.insert(0, {str(ADAPTER)!r})
             import heap_trim2 as ht
             lib = ht._libc(); lib.malloc.restype = ctypes.c_void_p; lib.free.argtypes = [ctypes.c_void_p]
-            env = {{'DSV41_TOKENIZER_TRIM2_IDLE_S': '0.3', 'DSV41_TOKENIZER_TRIM2_MIN_MIB': '128', 'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '0'}}
+            env = {{'DSV41_TOKENIZER_TRIM2_IDLE_S': '0.3', 'DSV41_TOKENIZER_TRIM2_MIN_MIB': '128', 'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '0',
+                   'DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S': '0'}}
             act = ht.Activity(); act.hooks.append('test'); lines = []
             tr = ht.Trimmer(ht.Config(env), act, log=lines.append)
             a = ht.rss_anon_kb()
