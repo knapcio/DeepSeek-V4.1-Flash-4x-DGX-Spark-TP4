@@ -1086,7 +1086,8 @@ class PinnedSglangSource(unittest.TestCase):
         sites = _encode_sites(SGLANG_ROOT)
         self.assertTrue(any(r for *_, r in sites))
         self.assertIn(('serving_chat.py', 'OpenAIServingChat', '_process_messages', True), sites)
-        if Path(SGLANG_ROOT, 'srt/entrypoints/openai/chat_encoding.py').exists():
+        ce = Path(SGLANG_ROOT, 'srt/entrypoints/openai/chat_encoding.py')
+        if ce.exists() and 'def encode_dsv41_prompt(' in ce.read_text():
             # the production canary tree (f80c91a4 + the fetch script's patches): the DSV4.1 render + parallel /
             # plain-text encode run inside the hooked chat methods
             for m in ('_apply_jinja_template', '_render_and_encode_chat_template'):
