@@ -484,6 +484,10 @@ V41C_SITE_BLOCKS = (
     re.compile(r"# DSV41_KV_LAYOUT unset or v4 \(the default\).*?\n\n(?=class EngramFinder)", re.S),
     re.compile(r" \+ _V41C_MODULES(?=:\n            return None)"),
 )
+# the tokenizer heap trim's block (perf/v41n-trim-v264-20261106: heap_trim2 on v2.6.4n; off by default, launch_server
+# only, its own tests in tests/test_tokenizer_heap_trim2.py): stripped too, so the rest is still v2.6.4's text
+TRIM2_SITE_BLOCK = re.compile(r"# DSV41_TOKENIZER_HEAP=trim2 \(off by default\).*?"
+                              r"print\(f'DSV41_TOKENIZER_HEAP=trim2: not installed \(\{exc!r\}\)', flush=True\)\n\n", re.S)
 
 
 class DefaultOff(unittest.TestCase):
@@ -494,6 +498,8 @@ class DefaultOff(unittest.TestCase):
         for rx in V41C_SITE_BLOCKS:
             s, n = rx.subn("", s)
             self.assertEqual(n, 1, rx.pattern[:60])
+        s, n = TRIM2_SITE_BLOCK.subn("", s)
+        self.assertEqual(n, 1, "trim2 block")
         self.assertEqual(hashlib.sha256(s.encode()).hexdigest(), SITE_F744D83_SHA)
 
     def _finder_names(self, value):
