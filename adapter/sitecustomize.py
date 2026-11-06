@@ -385,7 +385,38 @@ class EngramFinder(importlib.abc.MetaPathFinder):
             spec.loader = EngramLoader(spec.loader)
         return spec
 
+def _gate_on(name):
+    return os.environ.get(name, '0').strip().lower() not in ('0', '', 'off', 'false', 'no')
+
+
+def masked_gate_errors():
+    """Gates that a user set but that another gate keeps from installing. start.sh passes none
+    of these variables, so each one reaches the container only from EXTRA_CONTAINER_ENV."""
+    errors = []
+    # OVERRIDE: router_live is installed by verify_cap, so it is dropped without DSV41_VERIFY_CAP.
+    if _gate_on('DSV41_ROUTER_LIVE') and os.environ.get('DSV41_VERIFY_CAP', '').strip() in ('', '0', 'off'):
+        errors.append(f"DSV41_ROUTER_LIVE={os.environ['DSV41_ROUTER_LIVE']!r} needs DSV41_VERIFY_CAP, "
+                      "which is unset or off, so router_live would never install")
+    # OVERRIDE: the MID and DROP options are read only by wo_a_w8, which needs DSV41_WO_A_W8.
+    for name in ('DSV41_WO_A_W8_MID', 'DSV41_WO_A_W8_DROP'):
+        if _gate_on(name) and not _gate_on('DSV41_WO_A_W8'):
+            errors.append(f"{name}={os.environ[name]!r} needs DSV41_WO_A_W8=1, which is unset or off")
+    # OVERRIDE: these gates are compared with == '1', so 'on' or 'true' would read as off.
+    for name in ('DSV41_ROCE_TWOSHOT', 'DSV41_ROCE_IDLE_PARK'):
+        value = os.environ.get(name)
+        if value is not None and value.strip() not in ('', '0', '1'):
+            errors.append(f"{name}={value!r} is read as off; this gate accepts only 0 or 1")
+    return errors
+
+
 if os.environ.get('DSV41_SOURCE'):
+    _masked = masked_gate_errors()
+    if _masked:
+        # site swallows sitecustomize exceptions, so print and stop the process instead of raising.
+        for _line in _masked:
+            print(f'DSV41: refusing to start: {_line}', file=sys.stderr, flush=True)
+            print(f'DSV41: refusing to start: {_line}', flush=True)
+        os._exit(1)
     sys.meta_path.insert(0, EngramFinder())
 
 # TEST ONLY, gated on DSV41_AB_VARIANTS>=2: in-boot A/B, one CUDA graph set per flag variant
@@ -406,7 +437,10 @@ if os.environ.get('DSV41_SOURCE'):
     try:
         import tp3_pad
         tp3_pad.install()
-    # FALL-THROUGH: a failed TP pad install leaves the engine unpadded. start.sh always passes
-    # DSV41_TP_PAD (default 1), so a user value cannot be told from the default here: warn.
+    # OVERRIDE: a failed TP pad install used to leave the engine unpadded with one log line.
+    # tp3_pad.install() returns early when no padding is needed and raises when a needed pad
+    # cannot be applied. site swallows sitecustomize exceptions, so stop the process here.
     except Exception as exc:
-        print(f'WARNING: DSV41 TP pad not installed, the engine runs unpadded: {exc}', flush=True)
+        print(f'DSV41 TP pad: refusing to start: {exc!r}', file=sys.stderr, flush=True)
+        print(f'DSV41 TP pad: refusing to start: {exc!r}', flush=True)
+        os._exit(1)
