@@ -32,14 +32,18 @@ class RequiredArgsTests(unittest.TestCase):
         self.assertEqual(args, original)
         self.assertEqual(warning, '')
 
-    def test_conflicting_backend_warns_and_is_replaced(self):
+    def test_explicit_conflicting_backend_refuses(self):
         for original in (['--fp8-gemm-backend', 'auto'],
                          ['--fp8-gemm-backend=auto'],
                          ['--fp8-gemm-backend', 'flashinfer_cutlass', '--fp8-gemm-backend=auto']):
             with self.subTest(original=original):
-                args, warning = self.resolve(original)
-                self.assertEqual(args, ['--fp8-gemm-backend', 'flashinfer_cutlass'])
-                self.assertIn('auto', warning)
+                with self.assertRaisesRegex(RuntimeError, 'set explicitly'):
+                    self.resolve(original)
+
+    def test_overridden_explicit_conflict_is_kept(self):
+        args, warning = self.resolve(['--fp8-gemm-backend=auto', '--fp8-gemm-backend', 'flashinfer_cutlass'])
+        self.assertEqual(args, ['--fp8-gemm-backend', 'flashinfer_cutlass'])
+        self.assertEqual(warning, '')
 
     def test_disabled_modes_leave_args_unchanged(self):
         original = ['--fp8-gemm-backend=auto']

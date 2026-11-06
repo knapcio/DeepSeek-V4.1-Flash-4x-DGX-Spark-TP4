@@ -280,14 +280,37 @@ def required_sglang_args(args, backend):
         else:
             result.append(arg)
             i += 1
-    effective = values[-1] if values else 'auto (omitted)'
-    if effective != 'flashinfer_cutlass':
+    # OVERRIDE: the MXFP8 dense route needs --fp8-gemm-backend flashinfer_cutlass. An explicit
+    # conflicting value from the extra arguments is refused; an omitted flag is added with a WARNING.
+    if values and values[-1] != 'flashinfer_cutlass':
+        raise RuntimeError(
+            f'{flag} {values[-1]!r} was set explicitly, but DSV41_MXFP8_BACKEND={backend} requires '
+            f'{flag} flashinfer_cutlass. Remove {flag} from the extra arguments or set '
+            'DSV41_MXFP8_BACKEND=cutlass.')
+    if not values:
         print(f'WARNING: DSV41_MXFP8_BACKEND={backend} requires '
-              f'{flag} flashinfer_cutlass; effective value {effective!r} replaced', flush=True)
+              f'{flag} flashinfer_cutlass; the omitted value (auto) is replaced', flush=True)
     return result + [flag, 'flashinfer_cutlass']
 
 
-def sps_table_args(table, env=None):
+# start.sh passes these paths when the operator sets nothing, so only another path proves a user choice.
+SPS_TABLE_DEFAULT = '/state/dspark_sps.json'
+STS_TABLE_DEFAULT = '/state/dspark_sts.json'
+
+
+def sts_table_args(table):
+    """Return the confidence STS flag when the table file exists."""
+    if not table:
+        return []
+    if not Path(table).is_file():
+        # FALL-THROUGH: a missing STS table runs speculative decoding without confidence stopping.
+        if table != STS_TABLE_DEFAULT:
+            raise RuntimeError(f'DSPARK_STS_TABLE={table} was set explicitly, but the file does not exist')
+        return []
+    return ['--speculative-dspark-confidence-sts-path', table]
+
+
+def sps_table_args(table, env=None, default=SPS_TABLE_DEFAULT):
     """Return SPS flags only when the Engram incompatibility is overridden.
 
     A profiled SPS table enables compact ragged verification. DeepSeek V4.1
@@ -299,12 +322,23 @@ def sps_table_args(table, env=None):
     env = os.environ if env is None else env
     if not table:
         return []
+    explicit = table != default
     if not Path(table).is_file():
+        # FALL-THROUGH: a missing SPS table keeps the verify-all schedule.
+        if explicit:
+            raise RuntimeError(f'DSPARK_SPS_TABLE={table} was set explicitly, but the file does not exist')
         print(f'DSPARK_SPS_TABLE={table} not found; '
               'staying on the verify-all schedule', flush=True)
         return []
+    # OVERRIDE: an existing SPS table is dropped unless DSPARK_SPS_ALLOW_ENGRAM=1, because compact
+    # ragged verify crashes on the Engram layers at CUDA-graph capture.
     if env.get('DSPARK_SPS_ALLOW_ENGRAM', '0') != '1':
-        print(f'DSPARK_SPS_TABLE={table} ignored: compact ragged verify is '
+        if explicit:
+            raise RuntimeError(
+                f'DSPARK_SPS_TABLE={table} was set explicitly, but compact ragged verify is incompatible '
+                'with the Engram layers of this model and DSPARK_SPS_ALLOW_ENGRAM is not 1. Unset '
+                'DSPARK_SPS_TABLE or set DSPARK_SPS_ALLOW_ENGRAM=1 after the engine path is fixed.')
+        print(f'WARNING: DSPARK_SPS_TABLE={table} ignored: compact ragged verify is '
               'incompatible with this model\'s Engram layers and crashes at '
               'CUDA-graph capture. Staying on the verify-all schedule. Set '
               'DSPARK_SPS_ALLOW_ENGRAM=1 in EXTRA_CONTAINER_ENV only after the '
@@ -372,9 +406,7 @@ def serve():
         # target-verify path currently requires equal blocks. Keep verify-all
         # unless a later engine fix is explicitly acknowledged.
         args += sps_table_args(os.environ.get('DSPARK_SPS_TABLE', '').strip())
-        sts = os.environ.get('DSPARK_STS_TABLE', '').strip()
-        if sts and Path(sts).is_file():
-            args += ['--speculative-dspark-confidence-sts-path', sts]
+        args += sts_table_args(os.environ.get('DSPARK_STS_TABLE', '').strip())
     if NNODES > 1:
         assert DIST_INIT_ADDR, 'DIST_INIT_ADDR is required when NNODES>1'
         args += [
