@@ -43,7 +43,8 @@ in 4 minutes) while the peak between trims rises (1.5 / 2.4 / 3.0 / 6.4 GiB). tr
      DSV41_TOKENIZER_TRIM2_MS_PER_GIB (40) and is re-learned from every receipt.
   6. Abort: the gate is re-checked immediately before the call; activity that started in between skips the trim.
 
-Receipts: ``DSV41_TOKENIZER_HEAP=trim2: armed ...`` at start, ``... hooks ...`` when the SGLang hooks land, one line per
+Receipts: ``DSV41_TOKENIZER_HEAP=trim2: armed ...`` at start, ``... hooks <cumulative list>`` when the SGLang hooks land
+(after each hooked module and after each OpenAIServingBase subclass wrapped later: the last line names them all), one line per
 trim (at most one per DSV41_TOKENIZER_TRIM2_LOG_MIN_S (10) s, so with the default interval every trim; over-budget,
 forced and busy trims always log; suppressed lines are counted) and a summary every DSV41_TOKENIZER_TRIM2_SUMMARY_S
 (600) s. Allocation only: no token, request, sampling or scheduling decision reads any of it, so outputs are
@@ -411,13 +412,23 @@ class Trimmer:
 # ---------------------------------------------------------------------------------------------------------------------
 # SGLang hooks (installed on import of the two modules, only when trim2 is armed)
 # ---------------------------------------------------------------------------------------------------------------------
-def _wrap_serving(cls, act):
+def _wrap_serving(cls, act) -> int:
+    n = 0
     for name in _SERVING_METHODS:
         fn = cls.__dict__.get(name)
         if fn is None or getattr(fn, '__isabstractmethod__', False) or getattr(fn, _MARK, False):
             continue
         setattr(cls, name, wrap(fn, act))
         act.hooks.append(f'{cls.__name__}.{name}')
+        n += 1
+    return n
+
+
+def hooks_receipt(act):
+    """The cumulative hook list. Printed after each module's install and again whenever a later OpenAIServingBase
+    subclass (serving_chat, serving_completions, ... are imported after serving_base) gets wrapped, so the LAST
+    ``hooks`` line of a boot names every hooked method."""
+    _log(f'DSV41_TOKENIZER_HEAP=trim2: hooks {", ".join(act.hooks)}')
 
 
 def install_serving_base(module, act=None):
@@ -435,7 +446,8 @@ def install_serving_base(module, act=None):
             prev.__func__(cls, **kw)
         else:
             super(base, cls).__init_subclass__(**kw)
-        _wrap_serving(cls, act)
+        if _wrap_serving(cls, act):
+            hooks_receipt(act)
 
     base.__init_subclass__ = classmethod(__init_subclass__)
     todo = list(base.__subclasses__())
@@ -476,7 +488,7 @@ class _Loader(importlib.abc.Loader):
         self.original.exec_module(module)
         try:
             (install_serving_base if module.__name__ == _TARGETS[0] else install_tokenizer_manager)(module)
-            _log(f'DSV41_TOKENIZER_HEAP=trim2: hooks {", ".join(_STATE["activity"].hooks)}')
+            hooks_receipt(_STATE['activity'])
         except Exception as exc:  # noqa: BLE001
             _log(f'DSV41_TOKENIZER_HEAP=trim2: hook on {module.__name__} NOT installed ({exc!r})')
 

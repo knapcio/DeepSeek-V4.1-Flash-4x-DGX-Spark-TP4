@@ -760,6 +760,31 @@ class Hooks(unittest.TestCase):
         Tokenize()._convert_to_internal_request('d')     # the abstract base method is not wrapped
         self.assertEqual(act.entries, 8)
 
+    def test_receipt_after_each_later_subclass(self):
+        act = ht.Activity()
+        m = self._serving_base()
+        logged = []
+        orig, ht._log = ht._log, logged.append
+        try:
+            ht.install_serving_base(m, act)
+            ht.hooks_receipt(act)                         # what the loader prints after serving_base's import
+            self.assertEqual(logged, ['DSV41_TOKENIZER_HEAP=trim2: hooks OpenAIServingBase.__init_subclass__'])
+
+            class OpenAIServingChat(m.OpenAIServingBase):
+                def _process_messages(self, request, is_multimodal):
+                    return request
+
+                def _convert_to_internal_request(self, request, raw_request=None):
+                    return request, request
+
+            class Quiet(OpenAIServingChat):               # nothing of its own: no new line
+                pass
+        finally:
+            ht._log = orig
+        self.assertEqual(len(logged), 2, logged)
+        self.assertEqual(logged[-1], 'DSV41_TOKENIZER_HEAP=trim2: hooks OpenAIServingBase.__init_subclass__, '
+                                     'OpenAIServingChat._convert_to_internal_request, OpenAIServingChat._process_messages')
+
     def test_tokenizer_manager_async_and_cancel(self):
         act = ht.Activity()
         m = types.ModuleType('fake_tm')
@@ -888,6 +913,11 @@ class SitecustomizeEndToEnd(unittest.TestCase):
             return
         self.assertIn('DSV41_TOKENIZER_HEAP=trim2: armed in launch_server', out)
         self.assertIn('DSV41_TOKENIZER_HEAP=trim2: hooks', out)
+        # the judge reads the LAST hooks line (the 11-06 fleet KILL: it was printed before serving_chat's class existed)
+        last = [l for l in out.splitlines() if l.startswith('DSV41_TOKENIZER_HEAP=trim2: hooks ')][-1]
+        for h in ('OpenAIServingBase.__init_subclass__', 'OpenAIServingChat._convert_to_internal_request',
+                  'OpenAIServingChat._process_messages', 'TokenizerManager._tokenize_texts'):
+            self.assertIn(h, last, out)
         self.assertNotIn('DSV41_TOKENIZER_HEAP: malloc_trim(0) when', out)      # mode trim's thread not started
         res = [l for l in out.splitlines() if l.startswith('RESULT')][-1]
         self.assertEqual(res, "RESULT 1 1 0 2 True True ['OpenAIServingBase.__init_subclass__', "
@@ -914,28 +944,86 @@ class SitecustomizeEndToEnd(unittest.TestCase):
 
 
 SGLANG_ROOT = os.environ.get('DSV41_TRIM2_SGLANG_ROOT', '')        # <tree>/python/sglang
-# encode / decode call sites in the pinned tree that the hooks do not cover, and why (short or once per process)
+# tokenizer calls in the pinned tree's srt/entrypoints that the hooks do not cover, and why: none of them encodes a
+# prompt that is then generated from (startup probes, decodes of outputs, the count / tokenize utility endpoints, the
+# endpoints this deploy does not serve: Ollama, gRPC, Whisper; the rerank yes / no token ids)
 UNHOOKED_OK = {('serving_chat.py', 'OpenAIServingChat', '__init__'),                 # startup probe of encode('')
                ('serving_chat.py', 'OpenAIServingChat', '_probe_prompt_text_round_trip'),  # v3 tree: once, in __init__
                ('serving_completions.py', 'OpenAIServingCompletion', '_get_echo_text'),        # echo decode
                ('serving_completions.py', 'OpenAIServingCompletion', '_prepare_echo_prompts'),  # echo decode
                ('serving_responses.py', 'OpenAIServingResponses', 'create_responses'),  # length of a str prompt
                # its render + encode run in the hooked chat _process_messages; this encode is the multimodal str case
-               ('serving.py', 'AnthropicServing', 'handle_count_tokens')}
+               ('serving.py', 'AnthropicServing', 'handle_count_tokens'),
+               # /v1/tokenize and /v1/detokenize: utility endpoints (no generation), handle_request path
+               ('serving_tokenize.py', 'OpenAIServingTokenize', '_handle_non_streaming_request'),
+               ('serving_tokenize.py', 'OpenAIServingTokenize', '_tokenize_chat_request'),
+               ('serving_tokenize.py', 'OpenAIServingDetokenize', '_handle_non_streaming_request'),
+               ('serving.py', 'OllamaServing', 'handle_chat'),                  # Ollama API: not served by this deploy
+               ('grpc_bridge.py', 'RuntimeHandle', 'tokenize'),                 # gRPC bridge: not served by this deploy
+               ('grpc_bridge.py', 'RuntimeHandle', 'detokenize'),
+               ('whisper.py', 'WhisperAdapter', '_parse_segments'),             # transcription output decode
+               ('serving_rerank.py', 'OpenAIServingRerank', '__init__')}        # startup: two fixed words' ids
+
+
+_TOK_ATTRS = ('encode', 'decode', 'apply_chat_template', 'encode_batch', 'batch_decode', 'encode_special', 'encode_text')
+
+
+def _tree_files(root):
+    base = os.path.join(root, 'srt', 'entrypoints')
+    for dp, _, fs in sorted(os.walk(base)):
+        for f in sorted(fs):
+            if f.endswith('.py'):
+                yield os.path.relpath(os.path.join(dp, f), root)
+
+
+def _encoders(root):
+    """Module-level functions of srt/entrypoints that tokenize (directly or through another one), to a fixpoint:
+    parallel_prompt_encode, plain_text_encode.encode_marked_prompt, chat_encoding.encode_dsv41_prompt, ..."""
+    import ast
+    funcs = {}
+    for rel in _tree_files(root):
+        for n in ast.parse(Path(root, rel).read_text()).body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                funcs.setdefault(n.name, []).append(n)
+    enc = {'parallel_prompt_encode', 'encode_prompt_segments'}
+    while True:
+        more = {name for name, defs in funcs.items() if name not in enc
+                and any(_tok_call(c, enc) for d in defs for c in ast.walk(d) if isinstance(c, ast.Call))}
+        if not more:
+            return enc
+        enc |= more
+
+
+def _tok_call(n, enc):
+    """A call that tokenizes: <...tokenizer... / ...backend...>.encode / decode / apply_chat_template / ..., or a call
+    of a tokenizing module function (by name or as module.attr)."""
+    import ast
+    fn = n.func
+    if isinstance(fn, ast.Name):
+        return fn.id in enc
+    if isinstance(fn, ast.Attribute):
+        if fn.attr in enc:
+            return True
+        recv = ast.unparse(fn.value).lower()
+        return fn.attr in _TOK_ATTRS and ('tokenizer' in recv or 'backend' in recv)
+    return False
 
 
 def _encode_sites(root):
-    """(file, class, method, reachable from a hooked method through self.<m>() calls) for every method that calls
-    parallel_prompt_encode / encode_prompt_segments / <...tokenizer...>.encode / .decode."""
+    """(file, class, method, reachable from a hooked method through self.<m>() calls) for every class method (and
+    every module function outside the tokenizing helpers themselves) of srt/entrypoints that tokenizes."""
     import ast
+    enc = _encoders(root)
     out = []
-    for rel in ('srt/entrypoints/openai/serving_chat.py', 'srt/entrypoints/openai/serving_completions.py',
-                'srt/entrypoints/openai/serving_responses.py', 'srt/entrypoints/anthropic/serving.py'):
-        path = os.path.join(root, rel)
-        if not os.path.exists(path):
-            continue
-        for cls in [n for n in ast.parse(Path(path).read_text()).body if isinstance(n, ast.ClassDef)]:
-            meths = {f.name: f for f in cls.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for rel in _tree_files(root):
+        tree = ast.parse(Path(root, rel).read_text())
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name not in enc:
+                if any(_tok_call(c, enc) for c in ast.walk(node) if isinstance(c, ast.Call)):
+                    out.append((os.path.basename(rel), '<module>', node.name, False))
+            if not isinstance(node, ast.ClassDef):
+                continue
+            meths = {f.name: f for f in node.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
             edges = {k: {n.func.attr for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                          and isinstance(n.func.value, ast.Name) and n.func.value.id == 'self'} for k, f in meths.items()}
             seen, todo = set(), [m for m in ht._SERVING_METHODS if m in meths]
@@ -945,18 +1033,32 @@ def _encode_sites(root):
                     seen.add(m)
                     todo.extend(edges[m])
             for k, f in meths.items():
-                hit = False
-                for n in ast.walk(f):
-                    if isinstance(n, ast.Call):
-                        fn = n.func
-                        if isinstance(fn, ast.Name) and fn.id in ('parallel_prompt_encode', 'encode_prompt_segments'):
-                            hit = True
-                        elif (isinstance(fn, ast.Attribute) and fn.attr in ('encode', 'decode')
-                              and 'tokenizer' in ast.unparse(fn.value)):
-                            hit = True
-                if hit:
-                    out.append((os.path.basename(rel), cls.name, k, k in seen))
+                if any(_tok_call(c, enc) for c in ast.walk(f) if isinstance(c, ast.Call)):
+                    out.append((os.path.basename(rel), node.name, k, k in seen))
     return out
+
+
+def _serving_classes(root):
+    """(module, class, bases, own hooked method names) for every class of srt/entrypoints that derives from
+    OpenAIServingBase (through the tree's own classes), in file order."""
+    import ast
+    rows = []
+    for rel in _tree_files(root):
+        mod = 'sglang.' + rel[:-3].replace(os.sep, '.')
+        for n in ast.parse(Path(root, rel).read_text()).body:
+            if isinstance(n, ast.ClassDef):
+                bases = [ast.unparse(b).split('.')[-1] for b in n.bases]
+                own = [f.name for f in n.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and f.name in ht._SERVING_METHODS]
+                rows.append((mod, n.name, bases, own))
+    serving, grew = {'OpenAIServingBase'}, True
+    while grew:
+        grew = False
+        for _, name, bases, _ in rows:
+            if name not in serving and any(b in serving for b in bases):
+                serving.add(name)
+                grew = True
+    return [r for r in rows if r[1] in serving and r[1] != 'OpenAIServingBase']
 
 
 @unittest.skipUnless(SGLANG_ROOT and os.path.isdir(SGLANG_ROOT), 'needs DSV41_TRIM2_SGLANG_ROOT=<tree>/python/sglang')
@@ -983,8 +1085,69 @@ class PinnedSglangSource(unittest.TestCase):
     def test_every_prompt_encode_is_hooked(self):
         sites = _encode_sites(SGLANG_ROOT)
         self.assertTrue(any(r for *_, r in sites))
+        # the DSV4.1 chat path of this tree: render + parallel / plain-text encode inside the hooked chat methods
+        for m in ('_process_messages', '_apply_jinja_template', '_render_and_encode_chat_template'):
+            self.assertIn(('serving_chat.py', 'OpenAIServingChat', m, True), sites)
+        self.assertIn('encode_dsv41_prompt', _encoders(SGLANG_ROOT))
         missing = [s[:3] for s in sites if not s[3] and s[:3] not in UNHOOKED_OK]
         self.assertEqual(missing, [], sites)
+        stale = sorted(UNHOOKED_OK - {s[:3] for s in sites} - {('serving_chat.py', 'OpenAIServingChat',
+                                                                   '_probe_prompt_text_round_trip')})
+        self.assertEqual(stale, [])                      # every exception still names a real site of this tree
+
+    def test_last_hooks_receipt_names_every_hooked_encode_site(self):
+        """The 2026-11-06 fleet A/B judged 'hooks missing OpenAIServingChat._convert_to_internal_request' because the
+        receipt was printed when serving_base was imported, before serving_chat defined (and the hook wrapped) the
+        class. Stand-ins of this tree's own serving classes (names, bases, hooked methods, one module each, imported
+        through the trim2 Finder as the image imports them): the LAST hooks line names every class.method that
+        reaches a prompt encode, and every hooked method of the tree."""
+        rows = _serving_classes(SGLANG_ROOT)
+        where = {name: mod for mod, name, _, _ in rows}
+        where['OpenAIServingBase'] = 'sglang.srt.entrypoints.openai.serving_base'
+        files = {'sglang.srt.entrypoints.openai.serving_base': [
+            'from abc import ABC, abstractmethod',
+            'class OpenAIServingBase(ABC):',
+            '    @abstractmethod',
+            '    def _convert_to_internal_request(self, request, raw_request=None):',
+            '        pass']}
+        for mod, name, bases, own in rows:
+            lines = files.setdefault(mod, [])
+            for b in bases:
+                if b in where and where[b] != mod:
+                    lines.insert(0, f'from {where[b]} import {b}')
+            lines.append(f'class {name}({", ".join(b for b in bases if b in where) or "object"}):')
+            lines += [f'    def {m}(self, *a, **k):\n        return None' for m in own] or ['    pass']
+        with tempfile.TemporaryDirectory() as tmp:
+            for mod, lines in files.items():
+                path = Path(tmp, *mod.split('.')).with_suffix('.py')
+                for d in [path.parent] + list(path.parent.parents):
+                    if d == Path(tmp):
+                        break
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / '__init__.py').touch()
+                path.write_text('\n'.join(lines) + '\n')
+            code = textwrap.dedent(f'''
+                import sys; sys.path[:0] = [{tmp!r}, {str(ADAPTER)!r}]
+                import heap_trim2 as ht
+                ht._STATE['activity'] = ht.Activity()
+                sys.meta_path.insert(0, ht.Finder())
+                import importlib
+                for m in {sorted(m for m in files if m != 'sglang.srt.entrypoints.openai.serving_base')!r}:
+                    importlib.import_module(m)
+            ''')
+            r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        lines = [l for l in r.stdout.splitlines() if l.startswith('DSV41_TOKENIZER_HEAP=trim2: hooks ')]
+        self.assertTrue(lines, r.stdout)
+        last = set(lines[-1].split(' hooks ', 1)[1].split(', '))
+        want = {f'{name}.{m}' for _, name, _, own in rows for m in own} | {'OpenAIServingBase.__init_subclass__'}
+        self.assertEqual(sorted(want - last), [], lines[-1])
+        for f, cls, meth, reach in _encode_sites(SGLANG_ROOT):
+            if reach:
+                own = next(o for _, n, _, o in rows if n == cls)
+                self.assertTrue(any(f'{cls}.{m}' in last for m in own), (f, cls, meth))
+        self.assertIn('OpenAIServingChat._convert_to_internal_request', last)
+        self.assertIn('OpenAIServingChat._process_messages', last)
 
 
 HAVE_SGLANG = importlib.util.find_spec('sglang') is not None

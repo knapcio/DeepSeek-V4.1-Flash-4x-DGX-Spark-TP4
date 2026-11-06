@@ -58,8 +58,14 @@
   when prompts arrive back to back, 30 s later at the next end of a prompt's tokenization (on that thread, so no prompt
   is being encoded during the call). The v2.6.3 candidate's `trim` (every 2 s, reverted) released the same pages over
   and over and cost long prompts 17 % of their throughput; trim2's interval bounds that cost. Outputs are unchanged
-  (allocation only); the key and its knobs are volatile for `DSV41_AUTOTUNE_KEEP`. Not yet measured on the four
-  Sparks. Tests: `tests/test_tokenizer_heap_trim2.py` (CI and the canary-roce image).
+  (allocation only); the key and its knobs are volatile for `DSV41_AUTOTUNE_KEEP`. Tests:
+  `tests/test_tokenizer_heap_trim2.py` (CI and the canary-roce image). On the four Sparks (2026-11-06, one A / X / A'
+  window, 30-minute soak): launch_server 1.0-3.1 GiB with trim2 against 3.9-4.3 GiB at the controls' soak end, 19
+  trims returning 28 GiB, long-prompt count, companion tok/s and c1 / c4 speed within 1 % of the controls, 0 of 74
+  stable qeval tasks changed; the longest trim held the HTTP event loop 0.79 s (busy trims run between two prompts on
+  the thread that just finished a tokenization). The `hooks` receipt is now cumulative and printed again whenever a
+  later OpenAI serving class is hooked, so the last line names every hooked method (the first one was printed before
+  `serving_chat` was imported and named only the base).
 
 ## 2026-11-05 v2.6.4 (candidate)
 
