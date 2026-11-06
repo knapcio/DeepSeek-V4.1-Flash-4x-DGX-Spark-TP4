@@ -206,9 +206,28 @@ class GrowthTrigger(unittest.TestCase):
             self.assertEqual(tr.step(), 'small')
         heap.free += 600 * MIB; heap.resident_free += 600 * MIB   # it ends
         clock.t += 2
+        self.assertEqual(tr.step(), 'small')              # no RSS growth: mallinfo2 is read every INFO_EVERY_S only
+        clock.t += 30
         self.assertEqual(tr.step(), 'trim')
         self.assertEqual(heap.calls[-1], 600 * MIB)
         self.assertEqual(len(heap.calls), 3)
+
+    def test_mallinfo2_read_only_on_growth_or_every_info_every_s(self):
+        reads = []
+        tr, act, heap, clock, _ = make()
+        orig = tr.free_bytes
+        tr.free_bytes = lambda: (reads.append(clock.t), orig())[1]
+        clock.t += 1                                      # past the idle gate's 1.5 s (with the first +1 below)
+        for _ in range(60):                               # idle, nothing grows: one read, then one per 30 s
+            clock.t += 1
+            self.assertEqual(tr.step(), 'small')
+        self.assertEqual(len(reads), 2)
+        heap.rss_kb += 300 << 10                          # RSS growth: read at once
+        heap.free += 300 * MIB; heap.resident_free += 300 * MIB
+        clock.t += 1
+        self.assertEqual(tr.step(), 'trim')
+        self.assertEqual(len(reads), 3)                   # and no second walk after the call (f0 = the pre-trim count)
+        self.assertEqual(tr.f0, 300 * MIB)
 
     def test_rss_growth_reuse(self):
         """Released pages reused and freed again: free bytes unchanged, RSS grew."""
@@ -539,8 +558,8 @@ class AutotuneFingerprint(unittest.TestCase):
         sys.path.insert(0, str(ADAPTER))
         ak = importlib.import_module('autotune_keep')
         keys = ['DSV41_TOKENIZER_HEAP'] + ['DSV41_TOKENIZER_TRIM2_' + k for k in (
-            'IDLE_S', 'POLL_S', 'MIN_MIB', 'MIN_INTERVAL_S', 'MAX_BUSY_S', 'BUDGET_MS', 'MAX_DEFER_S', 'LOG_MIN_S',
-            'SUMMARY_S', 'MS_PER_GIB')]
+            'IDLE_S', 'POLL_S', 'MIN_MIB', 'MIN_INTERVAL_S', 'MAX_BUSY_S', 'INFO_EVERY_S', 'BUDGET_MS', 'MAX_DEFER_S',
+            'LOG_MIN_S', 'SUMMARY_S', 'MS_PER_GIB')]
         for k in keys:
             self.assertIn(k, ak._VOLATILE, k)
         src = (ADAPTER / 'heap_trim2.py').read_text()

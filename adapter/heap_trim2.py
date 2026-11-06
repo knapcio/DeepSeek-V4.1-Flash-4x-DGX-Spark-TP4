@@ -22,7 +22,9 @@ GiB released). Offline, the volume released falls steeply with the interval (2 /
 in 4 minutes) while the peak between trims rises (1.5 / 2.4 / 3.0 / 6.4 GiB). trim2 therefore trims seldom:
 
   1. Growth trigger: only when the heap holds >= DSV41_TOKENIZER_TRIM2_MIN_MIB (256) free AND, since the last trim,
-     RssAnon grew by >= that much or the free bytes grew by >= that much (no re-trim of released pages).
+     RssAnon grew by >= that much or the free bytes grew by >= that much (no re-trim of released pages). mallinfo2
+     (a walk of every bin under the arena locks: up to ~95 ms on a fragmented 6 GiB heap offline) is read only when
+     RssAnon grew by MIN_MIB or every DSV41_TOKENIZER_TRIM2_INFO_EVERY_S (30) s, and once per trim.
   2. Rate limit: at most one trim per DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S (120) s, whatever the gates say: a steady
      long-prompt stream pays one release + refault per interval.
   3. Idle gate: normally a trim waits until no tokenization is in flight and none ended in the last
@@ -141,13 +143,14 @@ class Config:
         self.min_bytes = int(f('MIN_MIB', '256')) << 20
         self.min_interval_s = f('MIN_INTERVAL_S', '120')
         self.max_busy_s = f('MAX_BUSY_S', '30')
+        self.info_every_s = f('INFO_EVERY_S', '30')
         self.budget_ms = f('BUDGET_MS', '50')
         self.max_defer_s = f('MAX_DEFER_S', '60')
         self.log_min_s = f('LOG_MIN_S', '10')
         self.summary_s = f('SUMMARY_S', '600')
         self.ms_per_gib = f('MS_PER_GIB', '40')       # initial cost model; re-learned from each trim
         bad = [k for k, v in (('IDLE_S', self.idle_s), ('POLL_S', self.poll_s), ('MIN_INTERVAL_S', self.min_interval_s),
-                              ('MAX_BUSY_S', self.max_busy_s), ('BUDGET_MS', self.budget_ms),
+                              ('MAX_BUSY_S', self.max_busy_s), ('INFO_EVERY_S', self.info_every_s), ('BUDGET_MS', self.budget_ms),
                               ('MAX_DEFER_S', self.max_defer_s), ('MS_PER_GIB', self.ms_per_gib))
                if not (v == v and 0 <= v < float('inf'))]
         if bad or self.poll_s <= 0 or self.min_bytes <= 0:
@@ -246,6 +249,7 @@ class Trimmer:
         self.ms_per_gib = cfg.ms_per_gib
         self.r0, self.f0 = self.rss_kb(), 0          # RssAnon kB / mallinfo2 free bytes after the last trim
         self.last_trim = None                        # monotonic time of the last trim (the rate limit)
+        self.last_info = None                        # monotonic time of the last mallinfo2 read on the idle path
         self.deferred_since = None
         self.busy_since = None
         self.due_since = None                        # a busy trim is due: the next tokenization gap runs it
@@ -295,8 +299,15 @@ class Trimmer:
         if in_interval:
             return 'interval'
         r = self.rss_kb()
+        # mallinfo2 walks every bin under each arena lock: ~0.2 ms on a small heap, ~95 ms on a fragmented 6 GiB one
+        # (offline). Read it only when RSS grew by MIN_MIB, or every INFO_EVERY_S to catch free bytes growing without
+        # RSS (a live request that ended); otherwise this poll costs one /proc read.
+        if (r - self.r0) << 10 < cfg.min_bytes and self.last_info is not None and now - self.last_info < cfg.info_every_s:
+            self.deferred_since = None
+            return 'small'
+        self.last_info = now
         t0 = self.perf()
-        f = self.free_bytes()                        # mallinfo2: walks the bins under each arena lock
+        f = self.free_bytes()
         self.info_ms_max = max(self.info_ms_max, (self.perf() - t0) * 1e3)
         grown = self._grown(r, f)
         if f < cfg.min_bytes or grown < cfg.min_bytes:
@@ -345,7 +356,8 @@ class Trimmer:
         ms = (self.perf() - t0) * 1e3
         r1 = self.rss_kb()
         now = self.clock()
-        self.r0, self.f0, self.deferred_since, self.busy_since, self.last_trim = r1, self.free_bytes(), None, None, now
+        # a trim leaves mallinfo2's free count as it was (released chunks stay in their bins): f, no second walk
+        self.r0, self.f0, self.deferred_since, self.busy_since, self.last_trim = r1, f, None, None, now
         self.due_since = None
         back_kb = max(0, r - r1)
         self.returned_kb += back_kb
