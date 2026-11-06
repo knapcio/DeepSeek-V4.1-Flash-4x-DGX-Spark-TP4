@@ -506,6 +506,34 @@ def _load_modules(model_mod):
         _M.update(fmoe=fmoe, fp8q=fp8q, mxi=mxi, std=std)
 
 
+_ON = ("1", "on", "true")
+_OFF = ("", "0", "off", "false")
+
+
+def _check_env():
+    """Refuse a DSV41_PREFILL_SP* value that the module-level parsing above would silently read as off
+    or as the default, and a stage-2 / exact gate that cannot take effect because DSV41_PREFILL_SP is not 1."""
+    # Override site: DSV41_PREFILL_SP with a value other than 0/off/false, 1/on/true/shard or comm was
+    # read as "off" (sitecustomize still called install, which then returned without a message).
+    if _RAW not in _OFF + _ON + ("shard", "comm"):
+        raise RuntimeError(f"DSV41_PREFILL_SP={_RAW!r} is not one of 0/off/1/on/shard/comm; refusing to boot")
+    # Override site: DSV41_PREFILL_SP_EXACT / _FP8 / _FP8_MOE with a value other than 0/off/false or
+    # 1/on/true were read as off. A value the user set must take effect as written.
+    for name in ("DSV41_PREFILL_SP_EXACT", "DSV41_PREFILL_SP_FP8", "DSV41_PREFILL_SP_FP8_MOE"):
+        raw = os.environ.get(name, "0").strip().lower()
+        if raw not in _OFF + _ON:
+            raise RuntimeError(f"{name}={raw!r} is not one of 0/off/1/on; refusing to boot")
+        # Override site: these 3 stages exist only in the shard mode (DSV41_PREFILL_SP=1); with
+        # DSV41_PREFILL_SP off or comm the gate was silently ignored.
+        if raw in _ON and MODE != "shard":
+            raise RuntimeError(f"{name}={raw!r} needs DSV41_PREFILL_SP=1 (shard), but DSV41_PREFILL_SP={_RAW!r} "
+                               f"(mode {MODE}); refusing to boot")
+    # Override site: DSV41_PREFILL_SP_WKV with any value other than "full" was read as "shard".
+    wkv = os.environ.get("DSV41_PREFILL_SP_WKV", "shard").strip().lower()
+    if wkv not in ("shard", "full"):
+        raise RuntimeError(f"DSV41_PREFILL_SP_WKV={wkv!r} is not one of shard/full; refusing to boot")
+
+
 def _check_hc_prefill_fused():
     if os.environ.get("DSV41_HC_PREFILL_FUSED", "0").strip() in ("0", "off", "false", ""):
         return
@@ -580,13 +608,26 @@ def _static_check(model, world):
     if errs:
         raise RuntimeError("DSV41_PREFILL_SP: unsupported configuration, refusing to run: " + "; ".join(errs))
     if FP8_MOE and MODE == "shard" and world > 1:
-        why = sorted({moe8_static_reason(model.layers[i].mlp) for i in range(model.start_layer, last)})
+        reasons = [moe8_static_reason(model.layers[i].mlp) for i in range(model.start_layer, last)]
+        why = sorted(set(reasons))
+        # Override site: DSV41_PREFILL_SP_FP8_MOE=1 when no full-row layer can take the MXFP8 MoE
+        # input (for example DSV41_MOE_B12X_NEXT_DETERMINISTIC unset) left every layer on the bf16
+        # gather with one info line. The gate the user set has no effect at all, so the boot stops.
+        if "" not in reasons:
+            raise RuntimeError(f"DSV41_PREFILL_SP_FP8_MOE=1: no full-row layer can take the MXFP8 MoE input "
+                               f"({why}); refusing to boot")
         if _M["v4"].get_tp_group().rank_in_group == 0:
             print(f"DSV41_PREFILL_SP fp8 MoE gather: {'eligible on every full-row layer' if why == [''] else why}"
                   f" (checked per chunk size before use)", flush=True)
     if FP8 and MODE == "shard" and world > 1:
         fp8_layers = [i for i in range(model.start_layer, last)
                       if fp8_eligible_attn(model.layers[i].self_attn)]
+        # Override site: DSV41_PREFILL_SP_FP8=1 when no layer's attention accepts the MXFP8 input
+        # (for example accepts_mxfp8_swizzled_input() False) left every layer on the bf16 gather.
+        # The gate the user set has no effect at all, so the boot stops.
+        if not fp8_layers:
+            raise RuntimeError("DSV41_PREFILL_SP_FP8=1: no layer's attention accepts the MXFP8 swizzled input; "
+                               "refusing to boot")
         if _M["v4"].get_tp_group().rank_in_group == 0:
             print(f"DSV41_PREFILL_SP fp8 attention gather on layers {fp8_layers} "
                   f"({len(fp8_layers)} of {last - model.start_layer}; the rest gather bf16)", flush=True)
@@ -872,8 +913,11 @@ def _fp8_input(p, attn, x):
                 local = bool(torch.equal(attn.wqkv_a(xb)[0], attn.wqkv_a(xq)[0]))
         ok = _agree_min(p, local)
         _FP8_M[p.rows] = state = (ok, tuple(rs.shape), rs.dtype)
+        # Fall-through site: DSV41_PREFILL_SP_FP8=1, and the first-chunk check of this row count
+        # found the MXFP8 input differs from the stock bf16 path: this size keeps the bf16 gather
+        # (exactness by design). Kept; the line starts with WARNING, once per row count.
         if p.rank == 0 and (len(_FP8_M) <= 8 or not ok):
-            print(f"DSV41_PREFILL_SP fp8 attention input (M={p.rows}): MXFP8 bytes + scales and wqkv_a "
+            print(f"{'' if ok else 'WARNING '}DSV41_PREFILL_SP fp8 attention input (M={p.rows}): MXFP8 bytes + scales and wqkv_a "
                   f"output {'equal the stock bf16 path on every rank -> ON' if ok else 'differ -> bf16 gather'}"
                   f" (rank 0 local {local})", flush=True)
         if not ok:
@@ -1101,9 +1145,12 @@ def _moe8_call(moe, p, orig, args, kwargs, xf, topk_out, pre):
 
 
 def _moe8_log(key, msg):
+    # Fall-through site: DSV41_PREFILL_SP_FP8_MOE=1, and this layer or row count takes the bf16
+    # gather (static reason, no b12x pre-quantized plan for the row count, or a scale-byte-0 block).
+    # Kept; each such line starts with WARNING, once per key (at most 16 keys).
     if key not in _MOE8_LOG and len(_MOE8_LOG) < 16:
         _MOE8_LOG.add(key)
-        print(msg, flush=True)
+        print("WARNING " + msg, flush=True)
 
 
 def _stock_moe(moe, p, orig, args, kwargs, xb):
@@ -1258,8 +1305,10 @@ def _moe8_first(moe, p, x, orig, args, kwargs, a, tgt):
     ok = _agree_min(p, local)
     st["ok"] = ok
     _MOE8[p.rows] = st
+    # Fall-through site: DSV41_PREFILL_SP_FP8_MOE=1, and the first-chunk check of this row count
+    # failed: this size keeps the bf16 gather (exactness by design). Kept; WARNING prefix when OFF.
     if p.rank == 0:
-        print(f"DSV41_PREFILL_SP fp8 MoE input (M={p.rows}): router on the {router or 'none'}, "
+        print(f"{'' if ok else 'WARNING '}DSV41_PREFILL_SP fp8 MoE input (M={p.rows}): router on the {router or 'none'}, "
               f"rank 0 {detail} -> {'ON' if ok else 'OFF (bf16 gather for this size)'}", flush=True)
     if _ctx.dbg is not None:
         _rec("min", xb, True)
@@ -1540,6 +1589,7 @@ def _make_hc_mix_stats(orig):
 def install(model_mod):
     """sglang.srt.models.deepseek_v4. Must run BEFORE hc_prefill_fused.install, so that its
     'stock' _hc_combine / hc_post are these logical-row-aware ones."""
+    _check_env()
     if MODE == "off" and not DEBUG:
         return
     if getattr(model_mod, "_dsv41_prefill_sp", False):

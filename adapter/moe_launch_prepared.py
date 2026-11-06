@@ -99,6 +99,12 @@ def parse_mode(value):
     v = str(value or "0").strip().lower().replace(" ", "")
     if v in _OFF:
         return "off"
+    # Override site: DSV41_MOE_LAUNCH_PREPARED with a value other than an off value, 1, on, true,
+    # yes, plan, direct or plan,direct was silently read as "plan" (a typo of "plan,direct" lost the
+    # direct op). A value the user set must take effect as written, so an unknown value now raises.
+    if v not in ("1", "on", "true", "yes", "plan", "direct", "plan,direct", "direct,plan"):
+        raise RuntimeError(f"{_TAG} DSV41_MOE_LAUNCH_PREPARED={value!r} is not one of 0/off/1/on/plan/plan,direct; "
+                           f"refusing to boot")
     return "plan,direct" if "direct" in v else "plan"
 
 

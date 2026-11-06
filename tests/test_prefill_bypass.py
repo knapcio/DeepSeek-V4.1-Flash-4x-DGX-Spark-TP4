@@ -394,17 +394,23 @@ class PrefillBypassTests(unittest.TestCase):
         self.assertIn('install_prefill_bypass(module)', source)
 
     def test_invalid_limit_refuses_all_mutations(self):
+        # '0' is the off value; a set value that cannot arm stops the boot without mutating anything
         for value in ('0', '-1', 'bad'):
             module, scheduler, running, memory = mocked_engine()
             original = module.PrefillAdder.add_one_req
-            self.assertFalse(self.arm(module, value))
+            if value == '0':
+                self.assertFalse(self.arm(module, value))
+            else:
+                with self.assertRaises(RuntimeError):
+                    self.arm(module, value)
             self.assertIs(module.PrefillAdder.add_one_req, original)
 
     def test_invalid_scan_limit_refuses_all_mutations(self):
         for value in ('', '0', '-1', 'bad'):
             module, scheduler, running, memory = mocked_engine()
             original = module.PrefillAdder.add_one_req
-            self.assertFalse(self.arm(module, scan=value))
+            with self.assertRaises(RuntimeError):
+                self.arm(module, scan=value)
             self.assertIs(module.PrefillAdder.add_one_req, original)
 
 
@@ -432,9 +438,9 @@ if EXPECT == 'unsupported':
 
             with patch.dict(os.environ, {'DSV41_PREFILL_BYPASS': '4',
                                          'DSV41_PREFILL_BYPASS_SCAN': '32'}):
-                with self.assertLogs('prefill_bypass', level='WARNING') as logs:
-                    self.assertFalse(adapter.install(module))
-            refusal = '\n'.join(logs.output)
+                with self.assertRaises(RuntimeError) as raised:
+                    adapter.install(module)
+            refusal = str(raised.exception)
             self.assertIn('refusing to arm', refusal)
             self.assertRegex(refusal, r'(source drift|has no attribute)')
             self.assertEqual(self.snapshot(module.Scheduler), scheduler_before)

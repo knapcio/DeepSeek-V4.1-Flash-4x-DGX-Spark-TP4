@@ -49,14 +49,15 @@ import logging
 import os
 
 logger = logging.getLogger(__name__)
+_WARNED = []
 
 ENV = "DSV41_SWA_THIN"
 _MARK = "_dsv41_swa_thin"
 _REQ_SEEN = "_dsv41_swa_thin_seen"   # set on a Req after its first hooked insert (chunked or not)
 
 # sha256 of inspect.getsource() of the engine pieces this hook relies on, on the pinned
-# SGLang dsv4.1 tree (f80c91a4b + the recipe's patches). On drift the hook refuses to install
-# (stock behaviour) and says so in the log.
+# SGLang dsv4.1 tree (f80c91a4b + the recipe's patches). On drift the hook raises RuntimeError at
+# install (it used to fall back to stock behaviour with a log line).
 PINS = {
     "UnifiedRadixCache.cache_unfinished_req":
         "d64c72cfc5f6b129b08a6a59f072946e2c923c541f3be1e2262379b1721121c1",
@@ -89,6 +90,11 @@ def mode(env=None):
     v = str(env.get(ENV, "0")).strip().lower()
     if v in ("", "0", "off", "false", "no"):
         return None
+    # Override site: any value other than "chunk" was read as "all", so a mistyped mode silently
+    # ran the wider mode. A value the user set must take effect, so an unknown value now raises.
+    if v not in ("chunk", "all", "1", "on", "true", "yes"):
+        raise RuntimeError(f"{ENV}={v!r}: unknown mode (use 0, chunk or all); it would be read as all; "
+                           f"refusing to boot")
     return "chunk" if v == "chunk" else "all"
 
 
@@ -184,9 +190,11 @@ def install(module, env=None):
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedLRUList
 
     drift = pin_drift(cls, UnifiedLRUList)
+    # Override site: engine source drift left a set DSV41_SWA_THIN silently not installed. A gate the
+    # user set must take effect, so drift now stops the boot.
     if drift:
-        logger.warning("DSV41_SWA_THIN not installed: engine source drift in %s", ", ".join(drift))
-        return False
+        raise RuntimeError(f"{ENV}={m!r}: engine source drift in {', '.join(drift)}; the hook would not be "
+                           f"installed; refusing to boot")
     original = cls.cache_unfinished_req
     swa_type = ComponentType.SWA
 
@@ -199,10 +207,15 @@ def install(module, env=None):
                 old = req.last_node   # the prefix-match node: no chunked step moved past it
         result = original(self, req, chunked=chunked, **kwargs)
         if STATS.active:
+            # Fall-through site: a request that cannot carry the seen-mark is treated as not seen
+            # (its next insert may demote once more). Kept; one WARNING line per process.
             try:
                 setattr(req, _REQ_SEEN, True)
-            except Exception:  # never fail a prefill over bookkeeping
-                pass
+            except Exception as exc:  # never fail a prefill over bookkeeping
+                if not _WARNED:
+                    _WARNED.append(True)
+                    logger.warning("WARNING DSV41_SWA_THIN: cannot mark request seen (%r); prompt-end "
+                                   "tracking skipped for such requests (logged once)", exc)
         if old is not None and STATS.active:
             if chunked:
                 STATS.calls += 1
@@ -210,10 +223,14 @@ def install(module, env=None):
                 STATS.prompt_calls += 1
             try:
                 STATS.demoted += demote_superseded(self, old, req.last_node, swa_type)
-            except Exception as exc:  # LRU order is advisory; never fail a prefill over it
+            # Override site: an error in demote_superseded turned a set DSV41_SWA_THIN off for the rest
+            # of the process. A gate the user set must not stop taking effect silently, so the error
+            # now raises where it happens.
+            except Exception as exc:
                 STATS.errors += 1
                 STATS.active = False
-                logger.warning("DSV41_SWA_THIN disabled after an error: %r", exc)
+                raise RuntimeError(f"{ENV}: error in demote_superseded ({exc!r}); the hook would be disabled "
+                                   f"for the rest of the process; refusing to continue") from exc
             n = STATS.calls + STATS.prompt_calls
             if n == 1 or n % RECEIPT_EVERY == 0:
                 logger.warning("DSV41_SWA_THIN receipt: mode=%s chunk_steps=%d prompt_steps=%d demoted=%d errors=%d",

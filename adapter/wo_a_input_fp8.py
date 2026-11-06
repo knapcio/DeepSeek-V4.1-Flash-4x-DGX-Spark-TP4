@@ -47,6 +47,7 @@ except ImportError:          # the CPU tests run without Triton; the image alway
 
 ENABLED = os.environ.get("DSV41_WO_A_INPUT_FP8", "0").strip().lower() not in ("0", "", "off", "false")
 BLOCK = 32
+_WARNED = []
 _FP8_MAX = 448.0
 _AMAX_FLOOR = 1e-4
 
@@ -137,7 +138,13 @@ def round_o_(o: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"DSV41_WO_A_INPUT_FP8: unexpected o {tuple(o.shape)} {o.dtype} {o.stride()}")
     if o.numel() == 0:
         return o
+    # Fall-through site (GB10 / sm_121 relevant): a CUDA tensor without Triton is rounded by the torch
+    # reference instead of the Triton kernel. Same values; kept, one WARNING line per process.
     if not o.is_cuda or triton is None:
+        if o.is_cuda and not _WARNED:
+            _WARNED.append(True)
+            print("[wo_a_input_fp8] WARNING DSV41_WO_A_INPUT_FP8: Triton unavailable; kernel chosen: torch "
+                  "reference_qdq on the GPU (logged once)", flush=True)
         o.copy_(reference_qdq(o))
         return o
     t, g, d = o.shape
@@ -183,6 +190,10 @@ def install_dspark(dspark_module):
         raise RuntimeError("DSV41_WO_A_INPUT_FP8: the draft does not call deepseek_v4's wrapped wo_a dispatch")
     envs = getattr(dspark_module, "envs", None)
     fast = getattr(envs, "SGLANG_DSPARK_FAST_KERNEL", None)
+    # Override site: SGLANG_DSPARK_FAST_KERNEL=0 sends the draft through an fp32 einsum wo_a that is not
+    # rounded, so DSV41_WO_A_INPUT_FP8 did not take effect on the draft (only a log line). Both are user
+    # settings in conflict, so this now stops the boot.
     if fast is not None and not fast.get():
-        print("[wo_a_input_fp8] WARNING: SGLANG_DSPARK_FAST_KERNEL=0, the draft's fp32 einsum wo_a is "
-              "not rounded", flush=True)
+        raise RuntimeError(f"DSV41_WO_A_INPUT_FP8={os.environ.get('DSV41_WO_A_INPUT_FP8', '')!r} conflicts with "
+                           f"SGLANG_DSPARK_FAST_KERNEL=0: the draft's fp32 einsum wo_a would not be rounded; "
+                           f"refusing to boot")

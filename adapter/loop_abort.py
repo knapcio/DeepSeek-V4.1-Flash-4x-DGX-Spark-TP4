@@ -47,11 +47,13 @@ def _env_int(name, default):
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
         return default
+    # Override site: a set DSV41_LOOP_* value that is not an int was replaced by the default with a
+    # warning. A value the user set must take effect, so a bad value now stops the boot.
     try:
         return int(str(raw).strip())
     except ValueError:
-        logger.warning('%s=%r is not an int; using %s', name, raw, default)
-        return default
+        raise RuntimeError(f'{name}={raw!r}: not an int; the default {default} would replace it; '
+                           f'refusing to boot') from None
 
 
 def load_config():
@@ -63,7 +65,16 @@ def load_config():
     line_repeats = _env_int('DSV41_LOOP_LINE_REPEATS', DEFAULT_LINE_REPEATS)
     line_min = _env_int('DSV41_LOOP_LINE_MIN', DEFAULT_LINE_MIN)
     named_exit = _env_int('DSV41_LOOP_NAMED_EXIT', DEFAULT_NAMED_EXIT)
+    # Override site: DSV41_LOOP_NGRAM_MAX below DSV41_LOOP_NGRAM is raised to DSV41_LOOP_NGRAM. A
+    # user-set DSV41_LOOP_NGRAM_MAX must not be replaced, so it now stops the boot; when only the
+    # default is below the user's DSV41_LOOP_NGRAM, the raise of the default is kept and logged.
     if ngram_max < ngram:
+        raw_max = os.environ.get('DSV41_LOOP_NGRAM_MAX')
+        if raw_max is not None and str(raw_max).strip():
+            raise RuntimeError(f'DSV41_LOOP_NGRAM_MAX={raw_max!r} is below DSV41_LOOP_NGRAM={ngram}; it would '
+                               f'be raised to {ngram}; refusing to boot')
+        logger.warning('WARNING DSV41_LOOP_NGRAM_MAX: default %s is below DSV41_LOOP_NGRAM=%s; using %s',
+                       ngram_max, ngram, ngram)
         ngram_max = ngram
     ngram_on = ngram > 0 and repeats > 0
     enabled = abort > 0 and (ngram_on or identical > 0 or line_repeats > 0)
@@ -150,25 +161,50 @@ def _decode_tail(req, ids):
     if tok is None or not ids:
         return None
     tail = ids[-LINE_WINDOW_TOKENS:]
+    # Fall-through site: a failed tokenizer.decode skips the repeated-line check
+    # (DSV41_LOOP_LINE_REPEATS) for this request only; the n-gram checks still run. Kept per request,
+    # logged with WARNING once per process because this runs on every decode step.
     try:
         return tok.decode(list(tail), skip_special_tokens=False)
     except Exception as exc:
-        logger.warning('DSV41 loop abort: tokenizer.decode failed: %s', exc)
+        if not _DECODE_WARNED:
+            _DECODE_WARNED.append(True)
+            logger.warning('WARNING DSV41_LOOP_LINE_REPEATS: tokenizer.decode failed (%s); the repeated-line '
+                           'check is skipped for such requests (logged once)', exc)
         return None
+
+
+_DECODE_WARNED = []
 
 
 def install(module):
     """Wrap ``Req.update_finish_state`` with a repetition stop."""
     cfg = load_config()
+    # Override site: DSV41_LOOP_ABORT > 0 with every detector off (DSV41_LOOP_NGRAM or
+    # DSV41_LOOP_REPEATS, DSV41_LOOP_IDENTICAL and DSV41_LOOP_LINE_REPEATS all <= 0) used to log
+    # "disabled" and serve without the abort. A user-set DSV41_LOOP_ABORT must take effect, so this
+    # now stops the boot. DSV41_LOOP_ABORT=0 still disables the feature.
     if not cfg.enabled:
+        if cfg.abort > 0 and 'DSV41_LOOP_ABORT' in os.environ:
+            raise RuntimeError(
+                f'DSV41_LOOP_ABORT={os.environ["DSV41_LOOP_ABORT"]!r}: every detector is off (DSV41_LOOP_NGRAM='
+                f'{cfg.ngram}, DSV41_LOOP_REPEATS={cfg.repeats}, DSV41_LOOP_IDENTICAL={cfg.identical}, '
+                f'DSV41_LOOP_LINE_REPEATS={cfg.line_repeats}), so the abort would not run; refusing to boot')
         logger.warning('DSV41 loop abort disabled (DSV41_LOOP_ABORT=%s)', cfg.abort)
         return
 
     cls = module.Req
     finish_cls = module.FINISH_MATCHED_STR
     abort_cls = getattr(module, 'FINISH_ABORT', None) if cfg.named_exit else None
+    # Override site: DSV41_LOOP_NAMED_EXIT=1 without FINISH_ABORT in the engine fell back to the plain
+    # stop exit. start.sh always passes DSV41_LOOP_NAMED_EXIT, so a set value now stops the boot;
+    # an unset value keeps the fallback with a WARNING line.
     if cfg.named_exit and abort_cls is None:
-        logger.warning('DSV41 loop abort: FINISH_ABORT not found; falling back to the stop exit')
+        if 'DSV41_LOOP_NAMED_EXIT' in os.environ:
+            raise RuntimeError(
+                f'DSV41_LOOP_NAMED_EXIT={os.environ["DSV41_LOOP_NAMED_EXIT"]!r}: the engine has no FINISH_ABORT, '
+                f'so the named loop_abort exit would fall back to the stop exit; refusing to boot')
+        logger.warning('WARNING DSV41_LOOP_NAMED_EXIT: FINISH_ABORT not found; falling back to the stop exit')
     original = cls.update_finish_state
 
     def update_finish_state(self, new_accepted_len=1):

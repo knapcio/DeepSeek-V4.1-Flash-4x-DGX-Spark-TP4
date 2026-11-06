@@ -22,11 +22,20 @@ def _enabled(name, default="0"):
 
 def budget_bytes():
     raw = os.environ.get("DSV41_INDEXER_LOGITS_BUDGET_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_BUDGET_BYTES
+    # Override site: a set DSV41_INDEXER_LOGITS_BUDGET_BYTES that is not an int, or is <= 0, was
+    # silently replaced by DEFAULT_BUDGET_BYTES. A value the user set must take effect, so a bad
+    # value now stops the boot instead of being replaced.
     try:
-        value = int(raw) if raw else DEFAULT_BUDGET_BYTES
+        value = int(raw)
     except ValueError:
-        value = DEFAULT_BUDGET_BYTES
-    return value if value > 0 else DEFAULT_BUDGET_BYTES
+        raise RuntimeError(f"DSV41_INDEXER_LOGITS_BUDGET_BYTES={raw!r}: not an int; the default "
+                           f"{DEFAULT_BUDGET_BYTES} would replace it; refusing to boot") from None
+    if value <= 0:
+        raise RuntimeError(f"DSV41_INDEXER_LOGITS_BUDGET_BYTES={raw!r}: must be > 0; the default "
+                           f"{DEFAULT_BUDGET_BYTES} would replace it; refusing to boot")
+    return value
 
 
 def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
@@ -216,9 +225,14 @@ def install(module):
     stock_src = inspect.getsource(cls._low_ratio_index_topk_dense)
     if "candidate_metadata" not in stock_src or "self.candidate_masks" in stock_src:
         raise RuntimeError("DSV41 indexer chunked v2: stock indexer is not the candidate_metadata variant; use indexer_chunked (v1) -- refusing to boot")
+    # Override site: when the stock indexer already carries sglang#39187, the adapter used to log
+    # "leaving it alone" and return, so DSV41_INDEXER_CHUNKED=1 and DSV41_INDEXER_LOGITS_BUDGET_BYTES
+    # took no effect. A gate the user set must take effect, so this now stops the boot.
     if "_DENSE_INDEXER_LOGITS_BUDGET_BYTES" in stock_src:
-        logger.warning("DSV41 indexer chunked v2: stock already carries #39187; leaving it alone")
-        return
+        raise RuntimeError(
+            f"DSV41_INDEXER_CHUNKED={os.environ.get('DSV41_INDEXER_CHUNKED', '')!r}: the stock indexer already "
+            f"carries sglang#39187, so the v2 replacement would not be installed and "
+            f"DSV41_INDEXER_LOGITS_BUDGET_BYTES would be ignored; unset DSV41_INDEXER_CHUNKED -- refusing to boot")
     from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
     budget = budget_bytes()
     cls._low_ratio_index_topk_dense = make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget)

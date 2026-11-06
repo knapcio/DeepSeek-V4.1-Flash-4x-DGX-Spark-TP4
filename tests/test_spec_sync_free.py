@@ -86,8 +86,12 @@ def test_parse():
     assert not (m.SKIP_DRAFT or m.SKIP_ACCEPT or m.SKIP_VCAP) and m.AUDIT and m.NOISE
     m = load("draft,merge")
     assert m.SKIP_DRAFT and m.MERGE and not m.SKIP_ACCEPT
-    m = load("accept,merge")
-    assert m.SKIP_ACCEPT and not m.MERGE
+    try:
+        load("accept,merge")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("accept,merge must refuse to boot")
     try:
         load("drafts")
     except ValueError:

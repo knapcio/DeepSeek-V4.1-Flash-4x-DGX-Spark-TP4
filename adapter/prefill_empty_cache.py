@@ -24,6 +24,7 @@ import os
 import torch
 
 logger = logging.getLogger(__name__)
+_WARNED = []
 
 
 def install(module):
@@ -41,8 +42,14 @@ def install(module):
                 longest = int(lens.max()) if lens is not None and lens.numel() else 0
                 if longest >= threshold:
                     torch.cuda.empty_cache()
+        # Fall-through site: an error in the hook skips torch.cuda.empty_cache() for this forward
+        # (DSV41_PREFILL_EMPTY_CACHE_TOKENS stays armed for the next one). Kept; one WARNING line per
+        # process, because this runs on every forward.
         except Exception as exc:  # bookkeeping must never break a forward
-            logger.warning('DSV41 prefill empty_cache hook: %s', exc)
+            if not _WARNED:
+                _WARNED.append(True)
+                logger.warning('WARNING DSV41_PREFILL_EMPTY_CACHE_TOKENS=%d: hook error %r; empty_cache skipped '
+                               'for such forwards (logged once)', threshold, exc)
         return output
 
     cls.forward = forward

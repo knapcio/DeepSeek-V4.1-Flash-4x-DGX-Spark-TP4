@@ -50,6 +50,8 @@ COMPACT_ROCE = _COMPACT in ("1", "on", "true", "roce")
 TILE = 128
 PACK = 16
 _LOG = {"built": 0, "on": 0, "window": 0, "cg": {}}
+_WARNED_ROCE = []
+_COMPACT_VALUES = ("", "0", "off", "false", "1", "on", "true", "roce", "minimal")
 
 
 def _scale_params(layer):
@@ -144,9 +146,16 @@ def _roce_columns(group, local, widths):
     if (roce is None or getattr(roce, "max_gather_bytes", 0) <= 0
             or not hasattr(roce, "should_all_gather_columns")):
         return None
+    # Fall-through site: a RuntimeError from should_all_gather_columns makes
+    # DSV41_SPLIT_COMPACT_GATHER use the "minimal" variant instead of "roce" for this call. Kept;
+    # one WARNING line per process, because this runs on every split forward.
     try:
         return (pc, roce) if roce.should_all_gather_columns(local, widths) else None
-    except RuntimeError:
+    except RuntimeError as exc:
+        if not _WARNED_ROCE:
+            _WARNED_ROCE.append(True)
+            print(f"[replicated_split] WARNING DSV41_SPLIT_COMPACT_GATHER={_COMPACT!r}: RoCE columns gather "
+                  f"refused ({exc!r}); variant chosen: minimal for such calls (logged once)", flush=True)
         return None
 
 
@@ -199,9 +208,13 @@ def _check_compact(layer, kind, group, rt, local, ranges, width, offs):
         try:
             rt[1].prepare_columns(widths, local.dtype)
             ok = _local_ok(local, widths, offs[rank], rank)
+        # Fall-through site: a rank that cannot prepare or align the RoCE columns gather makes every
+        # rank keep the old padded gather for this layer and M (agreed below). Kept; WARNING line,
+        # once per layer and M (first-call check only).
         except Exception as exc:  # noqa: BLE001 - reported, then agreed below
-            print(f"[replicated_split] {layer._dsv41_prefix}: RoCE columns gather unavailable on rank "
-                  f"{rank}: {exc!r}", flush=True)
+            print(f"[replicated_split] WARNING DSV41_SPLIT_COMPACT_GATHER={_COMPACT!r} {layer._dsv41_prefix}: "
+                  f"RoCE columns gather unavailable on rank {rank}: {exc!r}; path chosen: old padded "
+                  f"gather for this layer", flush=True)
         if not _agree(ok, group, dev):
             return False
     new = _run_compact(kind, group, rt, local, ranges, width, offs)
@@ -211,8 +224,11 @@ def _check_compact(layer, kind, group, rt, local, ranges, width, offs):
     c = _LOG["cg"].setdefault(kind, [0, 0])
     c[0] += 1
     c[1] += int(agreed)
+    # Fall-through site: a compact gather that differs from the old gather on any rank keeps the old
+    # gather for this layer and M. Kept; the line starts with WARNING when that happens.
     if rank == 0 and (c[0] <= 1 or not agreed):
-        print(f"[replicated_split] {layer._dsv41_prefix}: compact gather ({kind}) "
+        print(f"[replicated_split] {'' if agreed else 'WARNING DSV41_SPLIT_COMPACT_GATHER '}"
+              f"{layer._dsv41_prefix}: compact gather ({kind}) "
               f"{'bit-identical, ON' if agreed else 'DIFFERS on some rank, OFF for this layer'} "
               f"(rank 0 equal {same}; {c[1]}/{c[0]} layers on so far)", flush=True)
     return agreed
@@ -288,10 +304,13 @@ def decide(layer, orig_forward, rank, world, x_real):
 def _build(layer, orig_forward, group, x_real):
     world, rank = group.world_size, group.rank_in_group
     cand = {"window": None, "slice": None}
+    # Fall-through site: an error while building or checking the slice keeps the stock
+    # ReplicatedLinear for this layer on every rank (agreed below). Kept; WARNING line, once per layer.
     try:
         cand = decide(layer, orig_forward, rank, world, x_real)
     except Exception as exc:
-        print(f"[replicated_split] {layer._dsv41_prefix}: slice failed on rank {rank}: {exc!r}", flush=True)
+        print(f"[replicated_split] WARNING DSV41_REPLICATED_SPLIT {layer._dsv41_prefix}: slice failed on rank "
+              f"{rank}: {exc!r}; path chosen: stock layer", flush=True)
     n, k = layer.weight.shape
     flag = torch.tensor([1 if cand["window"] is not None else 0, 1 if cand["slice"] is not None else 0],
                         dtype=torch.int32, device=layer.weight.device)
@@ -302,9 +321,13 @@ def _build(layer, orig_forward, group, x_real):
     _LOG["built"] += 1
     _LOG["on"] += int(agreed)
     _LOG["window"] += int(win)
+    # Fall-through site: a split that is not bit-identical keeps the stock layer, and a window GEMM
+    # that is not bit-identical falls back to exact slices + pad (DSV41_REPLICATED_SPLIT_WINDOW).
+    # Kept; the line starts with WARNING when either happens.
     if rank == 0 and (_LOG["built"] <= 2 or not agreed or (WINDOW and not win)):
         how = "window GEMMs (no pad)" if win else "exact slices + pad"
-        print(f"[replicated_split] {layer._dsv41_prefix} {n}x{k}: split {'ON, ' + how if agreed else 'OFF'} "
+        warn = "WARNING DSV41_REPLICATED_SPLIT " if (not agreed or (WINDOW and not win)) else ""
+        print(f"[replicated_split] {warn}{layer._dsv41_prefix} {n}x{k}: split {'ON, ' + how if agreed else 'OFF'} "
               f"(rank 0 window {cand['window'] is not None}, slice {cand['slice'] is not None}; "
               f"{_LOG['on']}/{_LOG['built']} layers on so far)", flush=True)
     return state if agreed else False
@@ -312,6 +335,15 @@ def _build(layer, orig_forward, group, x_real):
 
 def install(linear_module):
     """sglang.srt.layers.linear: ReplicatedLinear, per-instance by prefix."""
+    # Override site: an unknown DSV41_SPLIT_COMPACT_GATHER value was silently read as off, and a
+    # compact gate set without DSV41_REPLICATED_SPLIT did nothing. A gate the user set must take
+    # effect, so both now stop the boot.
+    if _COMPACT not in _COMPACT_VALUES:
+        raise RuntimeError(f"DSV41_SPLIT_COMPACT_GATHER={_COMPACT!r}: unknown value (use 0, 1, roce or "
+                           f"minimal); it would be read as off; refusing to boot")
+    if COMPACT and not SPEC:
+        raise RuntimeError(f"DSV41_SPLIT_COMPACT_GATHER={_COMPACT!r} is set but DSV41_REPLICATED_SPLIT is "
+                           f"empty, so the compact gather would never run; refusing to boot")
     if not SPEC:
         return
     cls = linear_module.ReplicatedLinear
