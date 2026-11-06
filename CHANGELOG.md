@@ -4,20 +4,23 @@
 
 v2.6.4 plus three changes. The production profile in `.env.tp4.example` adds `DSV41_KV_LAYOUT=v41c
 DSV41_V41C_ARM=1 DSV41_V41C_READER=native` ("v41n": the compressed KV records in SGLang's V4.1 FP4 layout, read in
-place) with the KV pool pinned at `MAX_TOTAL_TOKENS=5130752`, and `DSV41_TOKENIZER_HEAP=trim2` (the head's tokenizer
+place) with the KV pool pinned at `MAX_TOTAL_TOKENS=8541952` at `MEM_FRACTION_STATIC=HEAD_MEM_FRACTION_STATIC=0.85`, and `DSV41_TOKENIZER_HEAP=trim2` (the head's tokenizer
 process returns its free heap). The fix for [#66](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/66)
 (named loop-abort exit, broken tool calls in the history) is on by default. All new keys are volatile for
 `DSV41_AUTOTUNE_KEEP` (no re-tune when toggled; the pool size is out of the fingerprint too).
 
-- **KV pool 3.44-3.70M -> 5,130,752 tokens (+39 %), measured.** Memory ladder on the four Sparks,
+- **KV pool 3.44-3.70M -> 8,541,952 tokens (x2.3), measured.** Memory ladder on the four Sparks, first
   `~/ds-gate/mlad-v264np-20261106/run-20261106-090824-539338` (2026-11-06; production's fraction 0.78, tails 384,
   trim2 in every boot): two v2.6.4 control boots (pools 3,700,480 / 3,447,040) and two boots of this release's code at
   the pin (5,130,752 granted on both). With four 1M-token prompts resident at once (controls: three) and the long-prompt
   soak, the head's lowest MemAvailable was 9.32 / 8.87 GiB (controls 9.28 / 10.25), NVRM 0, swap 0, every 1M needle
-  retrieved. The next rung, `~/ds-gate/mlad-v264nx-20261106/run-20261106-145300-2620425` (8,000,000 at fraction
-  0.85), tripped the head memory guard on pressure at 6.01 GiB, so the pin stays at 5,130,752. Unpinned, v41n would
-  take its whole budget at load (6,098,432 / 6,194,944 tokens at 0.78), which no boot qualified. That ladder's verdict
-  was INCONCLUSIVE on control-vs-control drift only (a slow control, a different control pool); the candidate rules
+  retrieved. Then the bigger rungs at fraction 0.85 (at 0.78 v41n's budget is 6,098,432 / 6,194,944 tokens, so a larger
+  pin would not bind), `~/ds-gate/mlad-v264nx-20261106/run-20261106-173315-3341279`: 8,000,000 SAFE (head low-water
+  5.96 GiB, 7 / 7 1M needles at once, NVRM 0) and **8,541,952 SAFE** (head low-water 5.72 GiB, 8 / 8 1M needles resident
+  at once, a cold 1M prefill and the soak, NVRM 2: one line each on two workers during the 8 x 1M cell; speed against
+  the faster reference control c1 0.998 / c4 0.998 / c16 0.994 / stress 1.018 / cold 1M 1.008): verdict X-SAFE-POOL
+  8,541,952. The fraction 0.85 leaves the 8192-token prefill chunk less spare memory than 0.78 did; that run's 1M
+  prefills passed at it. The first window's verdict was INCONCLUSIVE on control-vs-control drift only (a slow control, a different control pool); the candidate rules
   all passed and the review accepted it (`diagnostics/ds-mem-audit-20261029/v264nx-20261106/REVIEW-DECISION-v264np-20261106.md`
   in the workspace).
 - **Speed, measured** (same run, c1 / c4 / c16 tok/s): candidates 77.09 / 131.89 / 211.6 and 77.17 / 133.88 /
@@ -37,7 +40,7 @@ process returns its free heap). The fix for [#66](https://github.com/knapcio/Dee
   17.7-20.1 GiB returned. Cost: a busy trim runs on the HTTP event loop, so under back-to-back long prompts token
   delivery pauses up to 0.69-0.90 s about once per 2 minutes (the GPUs keep decoding).
 - **Rollback, config only:** unset `DSV41_KV_LAYOUT`, `DSV41_V41C_ARM`, `DSV41_V41C_READER` and set
-  `MAX_TOTAL_TOKENS=8000000` (v2.6.4); unset `DSV41_TOKENIZER_HEAP` on its own; `DSV41_LOOP_NAMED_EXIT=0` /
+  `MAX_TOTAL_TOKENS=8000000` and the fraction 0.78 (v2.6.4); unset `DSV41_TOKENIZER_HEAP` on its own; `DSV41_LOOP_NAMED_EXIT=0` /
   `DSV41_HISTORY_REPAIR=0` restore v2.6.4's loop exit / the HTTP 400.
 - **Credits:** v41n's in-place readers extend FlashInfer's SM120 sparse-MLA kernels (NVIDIA, BSD-3-Clause) and write
   through SGLang's own V41_FP4 layout (Apache-2.0); the design idea of copying raw FP4 records asynchronously and
