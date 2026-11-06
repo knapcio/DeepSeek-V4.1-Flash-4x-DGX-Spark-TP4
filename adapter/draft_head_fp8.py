@@ -21,9 +21,14 @@ ENABLED = os.environ.get("DSV41_DRAFT_HEAD_FP8", "0").strip() not in ("0", "", "
 # Rows above 64 (bs 14 and 16) stay on the bf16 head as before: moving them to the fp8 copy changes the
 # draft proposals there, and a fleet A/B showed no gain at c16 (the gain is at c4-c12, where the retiled
 # kernel is bit-identical to the old one). DSV41_DRAFT_HEAD_FP8_MAX_M raises it (<= 128).
-MAX_M = min(128, int(os.environ.get("DSV41_DRAFT_HEAD_FP8_MAX_M", "64")))
+MAX_M = int(os.environ.get("DSV41_DRAFT_HEAD_FP8_MAX_M", "64"))
+# Override site: DSV41_DRAFT_HEAD_FP8_MAX_M above 128 (the largest tile in _TILES) used to be
+# clamped to 128 silently. A user-set value above 128 now raises.
+if MAX_M > 128:
+    raise RuntimeError(f"DSV41_DRAFT_HEAD_FP8_MAX_M={MAX_M} exceeds 128, the largest tile of the fp8 head kernel")
 _TILES = ((16, 16, 256, 4, 3), (64, 64, 128, 4, 3), (128, 128, 64, 8, 3))   # max M, BM, BK, warps, stages
 _TWIN = {}          # lm_head weight data_ptr -> (e4m3, exponent)
+_WARNED = set()     # once-per-site guard for the WARNING lines of the fall-throughs
 
 
 @triton.jit
@@ -86,15 +91,29 @@ def install(dspark_module):
     def attach_shared_modules(self, *a, **kw):
         out = orig_attach(self, *a, **kw)
         w = getattr(self.lm_head, "weight", None)
-        if w is not None and w.dtype == torch.bfloat16 and w.dim() == 2 and w.shape[1] % 32 == 0:
-            _TWIN[w.data_ptr()] = make_twin(w.data)
-            torch.cuda.empty_cache()          # the fp32 temporaries must not shrink the KV pool
-            print(f"[draft_head_fp8] fp8 twin of the draft LM head {tuple(w.shape)}", flush=True)
+        # Override site: a draft lm_head weight that is not a 2-D bf16 matrix with K % 32 == 0 used
+        # to get no fp8 twin, so every call ran the stock bf16 head silently. DSV41_DRAFT_HEAD_FP8
+        # is set on whenever this runs, so the gate that does not take effect now raises.
+        if w is None or w.dtype != torch.bfloat16 or w.dim() != 2 or w.shape[1] % 32 != 0:
+            raise RuntimeError(
+                f"DSV41_DRAFT_HEAD_FP8={os.environ.get('DSV41_DRAFT_HEAD_FP8', '')!r} is set but the draft lm_head "
+                f"weight is not a 2-D bf16 matrix with K % 32 == 0 "
+                f"({None if w is None else (w.dtype, tuple(w.shape))})")
+        _TWIN[w.data_ptr()] = make_twin(w.data)
+        torch.cuda.empty_cache()          # the fp32 temporaries must not shrink the KV pool
+        print(f"[draft_head_fp8] fp8 twin of the draft LM head {tuple(w.shape)}", flush=True)
         return out
 
     def _logits_from_x_post_hc(self, x_post_hc):
         w = getattr(self.lm_head, "weight", None)
         twin = None if w is None else _TWIN.get(w.data_ptr())
+        # Override site: a draft lm_head weight without an fp8 twin (moved or replaced after
+        # attach_shared_modules) runs the stock bf16 head. The fall-through is kept and logged
+        # once. Rows above DSV41_DRAFT_HEAD_FP8_MAX_M are the configured bf16 range: no line.
+        if twin is None and x_post_hc.shape[0] and "no_twin" not in _WARNED:
+            _WARNED.add("no_twin")
+            print("WARNING [draft_head_fp8] kernel _head_fp8_kernel falls back to the stock bf16 draft head: "
+                  "no fp8 twin for the current lm_head weight", flush=True)
         if twin is None or x_post_hc.shape[0] > MAX_M or x_post_hc.shape[0] == 0:
             return orig_logits(self, x_post_hc)
         x = self.stages[-1].norm(x_post_hc)

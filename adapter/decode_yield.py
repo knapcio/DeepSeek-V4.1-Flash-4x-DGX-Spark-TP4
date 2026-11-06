@@ -218,30 +218,38 @@ def defer_step(scheduler, running_batch):
 def install(module, env=None):
     """Wrap Scheduler.get_next_batch_to_run and Scheduler._should_defer_prefill (module = managers.scheduler)."""
     env = os.environ if env is None else env
+    # Override site: a DSV41_DECODE_YIELD value outside 1..MAX_PCT used to log "refusing to arm"
+    # and keep the stock scheduler. A user-set invalid value now raises.
     try:
         pct = parse_pct(env.get(ENV))
     except ValueError as exc:
-        logger.warning("DSV41_DECODE_YIELD: refusing to arm; %s", exc)
-        return False
+        raise RuntimeError(f"DSV41_DECODE_YIELD: {ENV}={env.get(ENV)!r} cannot arm: {exc}") from None
     if pct is None:
         return False
     rid_raw = (env.get(ENV_RID_ARMS) or "").strip().lower()
+    # Override site: an invalid DSV41_DECODE_YIELD rid-arms value used to refuse to arm silently
+    # for the whole feature. A user-set invalid value now raises.
     if rid_raw not in ("", "0", "1", "off", "on"):
-        logger.warning("DSV41_DECODE_YIELD: refusing to arm; %s must be 0 or 1", ENV_RID_ARMS)
-        return False
+        raise RuntimeError(
+            f"DSV41_DECODE_YIELD: {ENV_RID_ARMS}={env.get(ENV_RID_ARMS)!r} must be 0 or 1 "
+            f"({ENV}={env.get(ENV)!r} is set)")
     cls = getattr(module, "Scheduler", None)
+    # Override site: a missing Scheduler class used to refuse to arm with a log line. The gate
+    # DSV41_DECODE_YIELD is set when this runs, so the gate that does not take effect now raises.
     if cls is None:
-        logger.warning("DSV41_DECODE_YIELD: refusing to arm; no Scheduler class")
-        return False
+        raise RuntimeError(f"DSV41_DECODE_YIELD: {ENV}={env.get(ENV)!r} is set but the module has no Scheduler class")
     if getattr(cls.get_next_batch_to_run, _MARK, False):
         return True
     try:
         drift = pin_drift(cls)
     except (AttributeError, TypeError, OSError) as exc:
         drift = [repr(exc)]
+    # Override site: engine source drift used to refuse to arm with a log line. The gate
+    # DSV41_DECODE_YIELD is set when this runs, so the gate that does not take effect now raises.
     if drift:
-        logger.warning("DSV41_DECODE_YIELD: refusing to arm; engine source drift in %s", ", ".join(drift))
-        return False
+        raise RuntimeError(
+            f"DSV41_DECODE_YIELD: {ENV}={env.get(ENV)!r} is set but the engine source drifted in "
+            f"{', '.join(drift)}")
     original_next = cls.get_next_batch_to_run
     original_defer = cls._should_defer_prefill
 

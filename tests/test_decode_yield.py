@@ -300,12 +300,16 @@ class PolicyTests(unittest.TestCase):
                              '_should_defer_prefill': lambda self, rb: False,
                              '_arm_prefill_decode_interval': lambda self, b: None})
         before = dict(vars(cls))
+        # a user-set value that cannot take effect is refused with an error
         for v in ('abc', '95', '50%'):
-            self.assertFalse(dy.install(types.SimpleNamespace(Scheduler=cls), env={dy.ENV: v}))
-        self.assertFalse(dy.install(types.SimpleNamespace(Scheduler=cls), env={dy.ENV: '50', dy.ENV_RID_ARMS: '2'}))
+            with self.assertRaisesRegex(RuntimeError, 'cannot arm'):
+                dy.install(types.SimpleNamespace(Scheduler=cls), env={dy.ENV: v})
+        with self.assertRaisesRegex(RuntimeError, 'must be 0 or 1'):
+            dy.install(types.SimpleNamespace(Scheduler=cls), env={dy.ENV: '50', dy.ENV_RID_ARMS: '2'})
         self.assertFalse(dy.install(types.SimpleNamespace(Scheduler=cls), env={}))
         # source drift: the toy methods are not the pinned engine
-        self.assertFalse(dy.install(types.SimpleNamespace(Scheduler=cls), env={dy.ENV: '50'}))
+        with self.assertRaises(RuntimeError):
+            dy.install(types.SimpleNamespace(Scheduler=cls), env={dy.ENV: '50'})
         self.assertEqual(dict(vars(cls)), before)
 
     def test_budget_is_integer_and_bounded(self):

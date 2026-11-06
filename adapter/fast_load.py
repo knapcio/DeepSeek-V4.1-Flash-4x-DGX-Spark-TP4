@@ -135,9 +135,18 @@ def _ep_info():
                 tp_rank, tp_size = ps.get_tensor_model_parallel_rank(), ps.get_tensor_model_parallel_world_size()
                 return tp_rank // (tp_size // ep_size), ep_size
             except Exception as exc3:
+                # Override site: every EP lookup failed, so the routed experts stay on the stock mmap
+                # path. A user-set DSV41_FAST_LOAD_EP_SIZE that cannot be applied raises; without it
+                # the fall-through to non-expert eager reads is kept and logged once as WARNING.
+                ep_env = os.environ.get("DSV41_FAST_LOAD_EP_SIZE", "").strip()
+                if ep_env:
+                    raise RuntimeError(
+                        f"DSV41 fast load: DSV41_FAST_LOAD_EP_SIZE={ep_env!r} is set but the EP layout "
+                        f"cannot be derived from it ({exc3!r}; runtime_context: {exc!r}; parallel_state: {exc2!r})")
                 if not _state["ep_warned"]:
                     _state["ep_warned"] = True
-                    logger.warning("DSV41 fast load: EP layout unknown (%r / %r / %r); eager reads for non-expert tensors only",
+                    logger.warning("WARNING DSV41 fast load: EP layout unknown (%r / %r / %r); routed experts "
+                                   "fall back to the stock mmap path, eager reads for non-expert tensors only",
                                    exc, exc2, exc3)
                 return None
 
@@ -164,7 +173,19 @@ def _moe_tp_info():
                 tp_rank, tp_size = ps.get_tensor_model_parallel_rank(), ps.get_tensor_model_parallel_world_size()
                 moe_tp = tp_size // ep_size
                 return tp_rank % moe_tp, moe_tp
-            except Exception:
+            except Exception as exc3:
+                # Override site: every MoE-TP lookup failed, so routed experts are read whole (no TP
+                # slicing). A user-set DSV41_FAST_LOAD_EP_SIZE that cannot be applied raises; without
+                # it the whole-expert fall-through is kept and logged once as WARNING.
+                ep_env = os.environ.get("DSV41_FAST_LOAD_EP_SIZE", "").strip()
+                if ep_env:
+                    raise RuntimeError(
+                        f"DSV41 fast load: DSV41_FAST_LOAD_EP_SIZE={ep_env!r} is set but the MoE-TP layout "
+                        f"cannot be derived from it ({exc3!r})")
+                if not _state.get("moe_tp_warned"):
+                    _state["moe_tp_warned"] = True
+                    logger.warning("WARNING DSV41 fast load: MoE-TP layout unknown (%r); routed experts are "
+                                   "read whole, no TP slicing", exc3)
                 return None
 
 
@@ -174,6 +195,11 @@ def _tp_slice_mode():
         return "off"
     if v in ("1", "on", "true", "force"):
         return "on"
+    # Override site: a DSV41_FAST_LOAD_TP_SLICE value outside the known set used to be read as
+    # "auto" silently. A user-set unknown value now raises; unset or empty keeps "auto".
+    if v not in ("auto", ""):
+        raise RuntimeError(
+            f"DSV41 fast load: DSV41_FAST_LOAD_TP_SLICE={v!r} is not one of 0/off/false, 1/on/true/force, auto")
     return "auto"
 
 
@@ -184,6 +210,13 @@ def tp_slicing(ep, tp, mode=None):
     keeps today's whole-expert reads; ``on`` also slices the owned experts under EP>1.
     """
     mode = mode or _tp_slice_mode()
+    # Override site: with DSV41_FAST_LOAD_TP_SLICE forced on, an unknown MoE-TP layout used to
+    # read the routed experts whole without a message. The forced gate that cannot take effect
+    # now raises.
+    if mode == "on" and tp is None:
+        raise RuntimeError(
+            "DSV41 fast load: DSV41_FAST_LOAD_TP_SLICE is set on but the MoE-TP layout is unknown, so "
+            "routed experts cannot be TP-sliced")
     if mode == "off" or tp is None or tp[1] <= 1:
         return None
     if mode == "auto" and (ep is None or ep[1] != 1):
@@ -205,14 +238,20 @@ def _find_key(obj, key):
 def _n_routed_experts(path):
     """Routed expert count from config.json next to the shards (nested under text_config for V4.1)."""
     cfg = os.path.join(os.path.dirname(path), "config.json")
+    env = os.environ.get("DSV41_FAST_LOAD_N_EXPERTS", "").strip()
     try:
         with open(cfg) as f:
             hit = _find_key(json.load(f), "n_routed_experts")
-        if hit is not None:
-            return int(hit)
     except Exception:
-        pass
-    env = os.environ.get("DSV41_FAST_LOAD_N_EXPERTS")
+        hit = None
+    if hit is not None:
+        # Override site: config.json n_routed_experts wins over DSV41_FAST_LOAD_N_EXPERTS. A
+        # user-set value that disagrees with config.json used to be ignored silently; it now raises.
+        if env and int(env) != int(hit):
+            raise RuntimeError(
+                f"DSV41 fast load: DSV41_FAST_LOAD_N_EXPERTS={env!r} conflicts with n_routed_experts={hit} "
+                f"in {cfg}")
+        return int(hit)
     return int(env) if env else None
 
 
@@ -339,14 +378,30 @@ def plan_ranges(path, plan):
 def slab_bytes():
     """Slab size from ``DSV41_FAST_LOAD_SLAB_MB`` (default 256), rounded down to a power of two
     (torch's caching host allocator rounds every block up to one); 0 = one buffer per tensor."""
+    raw = os.environ.get("DSV41_FAST_LOAD_SLAB_MB", "").strip()
+    # Override site: a non-numeric DSV41_FAST_LOAD_SLAB_MB used to fall back to 256 silently. A
+    # user-set value that does not parse now raises; unset or empty keeps the default 256.
     try:
-        mb = float(os.environ.get("DSV41_FAST_LOAD_SLAB_MB", "256"))
+        mb = float(raw) if raw else 256.0
     except ValueError:
-        mb = 256.0
-    if mb <= 0:
+        raise RuntimeError(f"DSV41 fast load: DSV41_FAST_LOAD_SLAB_MB={raw!r} is not a number") from None
+    if mb == 0:
         return 0
+    # Override site: a negative DSV41_FAST_LOAD_SLAB_MB used to mean 0 (one buffer per tensor)
+    # silently. A user-set negative value now raises.
+    if mb < 0:
+        raise RuntimeError(f"DSV41 fast load: DSV41_FAST_LOAD_SLAB_MB={raw!r} is negative; use 0 for one "
+                           f"buffer per tensor")
     n = max(1 << 20, int(mb * 2**20))
-    return 1 << (n.bit_length() - 1)
+    slab = 1 << (n.bit_length() - 1)
+    # Override site: the slab size is rounded down to a power of two of at least 1 MB, because
+    # torch's caching host allocator rounds every block up to one. A user-set value that the
+    # rounding changes now raises instead of being replaced silently.
+    if raw and slab != mb * 2**20:
+        raise RuntimeError(
+            f"DSV41 fast load: DSV41_FAST_LOAD_SLAB_MB={raw!r} would be rounded to {slab >> 20} MB; set a "
+            f"power of two of at least 1 MB")
+    return slab
 
 
 def _align(n, a=_SLAB_ALIGN):
@@ -621,14 +676,32 @@ def _read_slice(fd, base, info, spec, dst=None):
 def _pinned_ok():
     hit = _state.get("pinned")
     if hit is None:
+        raw = os.environ.get("DSV41_FAST_LOAD_PINNED", "").strip()
+        # Override site: a DSV41_FAST_LOAD_PINNED value other than 0 or 1 used to mean "not pinned"
+        # silently. A user-set unknown value now raises.
+        if raw not in ("", "0", "1"):
+            raise RuntimeError(f"DSV41 fast load: DSV41_FAST_LOAD_PINNED={raw!r} is not 0 or 1")
+        err = None
         try:
             import torch
 
-            hit = bool(torch.cuda.is_available()) and os.environ.get("DSV41_FAST_LOAD_PINNED", "1") == "1"
+            hit = bool(torch.cuda.is_available()) and raw != "0"
             if hit:
                 torch.empty(1, dtype=torch.uint8, pin_memory=True)
-        except Exception:
+            elif raw != "0":
+                err = "torch.cuda.is_available() is False"
+        except Exception as exc:
             hit = False
+            err = repr(exc)
+        # Override site: without CUDA, or when the pinned allocation fails, the eager buffers fall
+        # back to anonymous mmaps. A user-set DSV41_FAST_LOAD_PINNED=1 that cannot take effect now
+        # raises; with the variable unset the fall-back is kept and logged as WARNING.
+        if err is not None:
+            if raw == "1":
+                raise RuntimeError(f"DSV41 fast load: DSV41_FAST_LOAD_PINNED=1 is set but pinned host memory "
+                                   f"is unavailable ({err})")
+            logger.warning("WARNING DSV41 fast load: pinned host memory unavailable (%s); eager buffers fall "
+                           "back to anonymous mmaps", err)
         _state["pinned"] = hit
         logger.warning("DSV41 fast load: eager buffers are %s", "pinned host memory" if hit else "anonymous mmaps")
     return hit
@@ -743,10 +816,12 @@ class _EagerShard:
             with _lock:
                 _state["read_failures"] += 1
                 n = _state["read_failures"]
-            if n <= 8 or n & (n - 1) == 0:
-                logger.warning("DSV41 fast load: eager read of %s failed (%r); falling back to mmap "
-                               "(%d eager-read failures so far)", name, exc, n)
-            return self._inner.get_tensor(name)
+            # Override site: a failed eager read used to fall back to the stock mmap tensor with a
+            # rate-limited log line. DSV41_FAST_LOAD is set on whenever this handle exists, so the
+            # gate that does not take effect for this tensor now raises.
+            raise RuntimeError(
+                f"DSV41 fast load: DSV41_FAST_LOAD={os.environ.get('DSV41_FAST_LOAD', '')!r} is set but the "
+                f"eager read of {name} in {self._path} failed ({exc!r}; {n} eager-read failures so far)") from exc
 
 
 def _wrap_open(orig, filename, args, kwargs):
@@ -776,7 +851,15 @@ def _wrap_open(orig, filename, args, kwargs):
         return _EmptyShard()
     inner = orig(filename, *args, **kwargs)
     plan = read_plan(path, phase, ep, n_routed, tp, experts) if (tp is not None or not experts) else names
-    if not plan or kwargs.get("device", "cpu") not in ("cpu", None) or (len(args) > 1 and args[1] != "cpu"):
+    if not plan:
+        return inner
+    # Override site: a safe_open call with a non-CPU device gets the stock handle without eager
+    # reads. The fall-through is kept and logged once as WARNING.
+    if kwargs.get("device", "cpu") not in ("cpu", None) or (len(args) > 1 and args[1] != "cpu"):
+        if not _state.get("device_warned"):
+            _state["device_warned"] = True
+            logger.warning("WARNING DSV41 fast load: safe_open(%s) asks for device %r; the shard uses the "
+                           "stock loader without eager reads", path, kwargs.get("device", args[1:2]))
         return inner
     return _EagerShard(inner, path, plan)
 
@@ -792,12 +875,16 @@ def install_weight_utils(module):
     def safe_open(filename, *args, **kwargs):
         try:
             return _wrap_open(orig, filename, args, kwargs)
-        except Exception as exc:  # never let the fast path break the load, but say so for every shard
+        except Exception as exc:
             with _lock:
                 _state["open_failures"] += 1
-            logger.warning("DSV41 fast load: shard %s falls back to the stock loader after error %r "
-                           "(%d shards so far this phase)", filename, exc, _state["open_failures"])
-            return orig(filename, *args, **kwargs)
+            # Override site: an error in the fast path used to hand the shard to the stock loader
+            # with a log line. DSV41_FAST_LOAD is set on whenever this wrapper is installed, so the
+            # gate that does not take effect for this shard now raises (this also lets the
+            # RuntimeErrors of the checks above reach the engine start).
+            raise RuntimeError(
+                f"DSV41 fast load: DSV41_FAST_LOAD={os.environ.get('DSV41_FAST_LOAD', '')!r} is set but shard "
+                f"{filename} cannot use the fast path ({exc!r})") from exc
 
     safetensors.safe_open = safe_open
     if getattr(module, "safetensors", None) is not None:
@@ -1235,7 +1322,14 @@ def _wrap_target_load(module):
     """Release everything the moment the target's copies are done, before the engine measures
     its memory: SGLang derives the KV pool from what is free after the weights landed."""
     cls = getattr(module, "DeepseekV4ForCausalLM", None)
-    if cls is None or getattr(cls.load_weights, "_dsv41_fast_load", False):
+    # Override site: without DeepseekV4ForCausalLM the release before KV-pool sizing used to be
+    # skipped silently, so the eager buffers would sit in the KV budget. DSV41_FAST_LOAD is set on
+    # whenever this runs, so the missing hook now raises.
+    if cls is None:
+        raise RuntimeError(
+            f"DSV41 fast load: DSV41_FAST_LOAD={os.environ.get('DSV41_FAST_LOAD', '')!r} is set but "
+            f"{getattr(module, '__name__', module)} has no DeepseekV4ForCausalLM to wrap")
+    if getattr(cls.load_weights, "_dsv41_fast_load", False):
         return
     orig = cls.load_weights
 

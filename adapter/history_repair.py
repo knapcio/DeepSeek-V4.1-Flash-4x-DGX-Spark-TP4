@@ -46,8 +46,15 @@ def install(module):
         logger.warning('DSV41 history repair disabled (DSV41_HISTORY_REPAIR=0)')
         return
     original = getattr(module, 'parse_tool_call_arguments', None)
+    # Override site: without parse_tool_call_arguments the repair is not installed. A user-set
+    # DSV41_HISTORY_REPAIR that cannot take effect raises; with the variable unset (default on)
+    # the fall-through is kept and logged as WARNING.
     if original is None:
-        logger.warning('DSV41 history repair: parse_tool_call_arguments not found; not installed')
+        if os.environ.get('DSV41_HISTORY_REPAIR', '').strip():
+            raise RuntimeError(
+                f"DSV41_HISTORY_REPAIR={os.environ['DSV41_HISTORY_REPAIR']!r} is set but "
+                f"parse_tool_call_arguments is not in {getattr(module, '__name__', module)!r}")
+        logger.warning('WARNING DSV41 history repair: parse_tool_call_arguments not found; not installed')
         return
     if getattr(original, '__wrapped__', None) is not None:
         return

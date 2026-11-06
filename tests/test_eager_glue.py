@@ -40,10 +40,15 @@ def load(spec, vcap_spec="conf:0.1"):
 def test_parse():
     eg, _ = load("all")
     assert eg.installed() == {"fence", "stage", "vcap", "vcapk"}          # tvglue / dglue dropped
-    eg, _ = load("vcapk,dglue")
-    assert eg.installed() == {"vcapk"}
-    eg, _ = load("tvglue,dglue")
-    assert eg.installed() == frozenset()
+    # naming a dropped part explicitly is refused: the named part would install nothing
+    for spec in ("vcapk,dglue", "tvglue,dglue"):
+        eg, _ = load(spec)
+        try:
+            eg.installed()
+        except RuntimeError as exc:
+            assert "dropped" in str(exc), exc
+        else:
+            raise AssertionError(f"dropped part accepted in {spec!r}")
     eg, _ = load("fence,stage")
     assert eg.installed() == {"fence", "stage"} and eg.on("fence") and not eg.on("vcap")
     eg, _ = load("")
@@ -322,7 +327,13 @@ def test_vcap():
 def test_vcap_needs_conf_policy():
     eg, vc = load("vcap", vcap_spec="3")
     smod, _ = make_vcap_modules(eg, vc, [1, 2])
-    eg.install_sampler(smod)
+    # vcap requested without a conf:T verify-cap policy cannot take effect: refused, class untouched
+    try:
+        eg.install_sampler(smod)
+    except RuntimeError as exc:
+        assert "conf:T" in str(exc), exc
+    else:
+        raise AssertionError("vcap without a conf:T policy accepted")
     assert not getattr(smod.DsparkDraftSampler, "_dsv41_eager_glue_vcap", False)
 
 

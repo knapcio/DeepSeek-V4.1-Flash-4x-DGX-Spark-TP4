@@ -10,7 +10,12 @@ def orig(*, executor, futures, use_async, func, func_args=(), func_kwargs=None):
     else:
         func(*func_args, **(func_kwargs or {}))
 
-mod = types.SimpleNamespace(maybe_executor_submit=orig)
+def toy_model():
+    # install_deepseek_v4 refuses a module without DeepseekV4ForCausalLM, because the release
+    # before KV-pool sizing would then be skipped
+    return type("DeepseekV4ForCausalLM", (), {"load_weights": lambda self, weights, *a, **k: None})
+
+mod = types.SimpleNamespace(maybe_executor_submit=orig, DeepseekV4ForCausalLM=toy_model())
 fast_load.install_deepseek_v4(mod)
 assert mod.maybe_executor_submit is not orig
 inflight = [0]; peak = [0]; done = [0]; lock = threading.Lock()
@@ -33,7 +38,7 @@ mod.maybe_executor_submit(executor=None, futures=futures, use_async=False, func=
 assert done[0] == 2001
 # an exception in the wrapped submit must not leak a permit
 def boom(**kw): raise RuntimeError("x")
-mod2 = types.SimpleNamespace(maybe_executor_submit=boom); fast_load.install_deepseek_v4(mod2)
+mod2 = types.SimpleNamespace(maybe_executor_submit=boom, DeepseekV4ForCausalLM=toy_model()); fast_load.install_deepseek_v4(mod2)
 for _ in range(20):
     try: mod2.maybe_executor_submit(executor=None, futures=[], use_async=True, func=work)
     except RuntimeError: pass

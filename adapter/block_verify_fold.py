@@ -156,7 +156,14 @@ try:
         rn = tl.where(mass > 0, tl.math.div_rn(r, tl.maximum(mass, 1e-30, propagate_nan=_NAN_ALL)), p)
         gum = tl.load(GUM + b.to(tl.int64) * V + offs, mask=m, other=1.0)
         tl.store(KEYS + b.to(tl.int64) * V + offs, tl.math.div_rn(rn, gum), mask=m)
-except Exception:                                    # pragma: no cover - no triton on the host
+except Exception as _triton_exc:                     # pragma: no cover - no triton on the host
+    # Override site: without Triton (or when the fold kernels fail to define on GB10 sm_121) the
+    # fold kernels are absent and fold() raises only at the first sampled verify. A user-set
+    # DSV41_BLOCK_VERIFY_FOLD now raises at import, so the engine start fails instead.
+    if ENABLED:
+        raise RuntimeError(
+            f"DSV41_BLOCK_VERIFY_FOLD={MODE!r} is set but the Triton fold kernels are unavailable "
+            f"({_triton_exc!r})") from _triton_exc
     triton = None
 
 

@@ -70,7 +70,13 @@ import time
 ENABLED = os.environ.get("DSV41_DRAFT_CAPTURE", "0").strip() not in ("0", "", "off", "false")
 TRIGGER = os.environ.get("DSV41_DRAFT_CAPTURE_TRIGGER", "/state/CAPTURE_DRAFT")
 OUT_DIR = os.environ.get("DSV41_DRAFT_CAPTURE_OUT", "/state/draft-capture")
-EVERY = max(1, int(os.environ.get("DSV41_DRAFT_CAPTURE_EVERY", "1")))
+EVERY = int(os.environ.get("DSV41_DRAFT_CAPTURE_EVERY", "1"))
+# Override site: DSV41_DRAFT_CAPTURE_EVERY below 1 used to be clamped to 1 silently. A user-set
+# value below 1 now raises when the capture is enabled.
+if EVERY < 1:
+    if ENABLED:
+        raise RuntimeError(f"DSV41_DRAFT_CAPTURE_EVERY={EVERY} must be >= 1 (DSV41_DRAFT_CAPTURE is set)")
+    EVERY = 1
 TOPK = int(os.environ.get("DSV41_DRAFT_CAPTURE_TOPK", "64"))
 USE_FP8 = os.environ.get("DSV41_DRAFT_CAPTURE_FP8", "1").strip() not in ("0", "", "off", "false")
 MAX_BYTES = int(float(os.environ.get("DSV41_DRAFT_CAPTURE_MAX_GIB", "200")) * (1 << 30))
@@ -147,7 +153,11 @@ def _writer_loop(torch):
                 _S["stopped"] = True
                 print(f"[draft_capture] reached {MAX_BYTES/(1<<30):.1f} GiB, stopping", flush=True)
         except Exception as exc:
+            # Override site: a writer-thread error used to stop the capture for the rest of the
+            # run with one print. The error is now parked in _S["writer_error"] and the next
+            # commit_hidden call raises it, because DSV41_DRAFT_CAPTURE no longer takes effect.
             print(f"[draft_capture] writer error, stopping: {exc!r}", flush=True)
+            _S["writer_error"] = repr(exc)
             _S["stopped"] = True
 
 
@@ -166,9 +176,11 @@ def _drain(torch, force=False):
             _S["queued"] += 1
         except queue.Full:
             # Disk cannot keep up. Dropping a shard is strictly better than stalling decode.
+            # Override site: a full writer queue drops the shard. The fall-through is kept and
+            # logged as WARNING on the 1st, 101st, 201st ... drop.
             _S["dropped"] = _S.get("dropped", 0) + 1
             if _S["dropped"] % 100 == 1:
-                print(f"[draft_capture] writer queue full, dropped {_S['dropped']} shards", flush=True)
+                print(f"WARNING [draft_capture] writer queue full, dropped {_S['dropped']} shards", flush=True)
     _S["pending"] = keep
 
 
@@ -176,8 +188,12 @@ def _capture(torch, batch, logits_output, commit_lens, bs, verify_num_draft_toke
              verify_ids=None, draft_logits=None, draft_temps=None):
     t0 = time.perf_counter_ns() if BENCH else 0
     hidden = logits_output.hidden_states
+    # Override site: a verify step whose logits_output carries no hidden states is not captured.
+    # The fall-through is kept and logged once.
     if hidden is None:
         _S["skip_hidden"] += 1
+        if _S["skip_hidden"] == 1:
+            print("WARNING [draft_capture] logits_output.hidden_states is None; verify step not captured", flush=True)
         return
     if _S["stream"] is None:
         _S["stream"] = torch.cuda.Stream()
@@ -281,7 +297,13 @@ def install(module):
         return
     import torch
     cls = getattr(module, "TargetVerifyExecutor", None)
-    if cls is None or getattr(cls, "_dsv41_draft_capture", False):
+    # Override site: a missing TargetVerifyExecutor used to skip the install silently. The gate
+    # DSV41_DRAFT_CAPTURE is set when this runs, so the gate that does not take effect now raises.
+    if cls is None:
+        raise RuntimeError(
+            f"DSV41_DRAFT_CAPTURE={os.environ.get('DSV41_DRAFT_CAPTURE', '')!r} is set but "
+            f"{getattr(module, '__name__', module)} has no TargetVerifyExecutor")
+    if getattr(cls, "_dsv41_draft_capture", False):
         return
     cls._dsv41_draft_capture = True
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -312,6 +334,10 @@ def install(module):
 
     def wrapped(self, *a, **kw):
         _S["calls"] += 1
+        if _S.get("writer_error"):
+            raise RuntimeError(
+                f"DSV41_DRAFT_CAPTURE={os.environ.get('DSV41_DRAFT_CAPTURE', '')!r} is set but the capture "
+                f"writer thread failed ({_S['writer_error']})")
         try:
             if _S["stopped"]:
                 _S["skip_stopped"] += 1
@@ -327,10 +353,17 @@ def install(module):
                 bs = kw.get("bs")
                 lo = kw.get("logits_output")
                 cl = kw.get("commit_lens")
+                # Override sites: a commit_hidden call without bs / logits_output / commit_lens, or
+                # a compact verify run, is not captured. Each fall-through is kept and logged once.
                 if bs is None or lo is None or cl is None:
                     _S["skip_kwargs"] += 1
+                    if _S["skip_kwargs"] == 1:
+                        print("WARNING [draft_capture] commit_hidden call without bs/logits_output/commit_lens "
+                              "is not captured", flush=True)
                 elif kw.get("run_compact"):
                     _S["skip_compact"] += 1
+                    if _S["skip_compact"] == 1:
+                        print("WARNING [draft_capture] compact verify run (run_compact) is not captured", flush=True)
                 else:
                     _capture(torch, kw.get("batch"), lo, cl, int(bs),
                              int(self.verify_num_draft_tokens),
@@ -345,9 +378,14 @@ def install(module):
                     _S["skip_compact"], _S["skip_hidden"], _S["skip_stopped"]), flush=True)
             if _S["pending"]:
                 _drain(torch)
-        except Exception as exc:                     # never take the engine down for telemetry
-            print(f"[draft_capture] disabled after error: {exc!r}", flush=True)
+        except Exception as exc:
+            # Override site: an error in the capture path used to stop the capture for the rest of
+            # the run with one print. The gate DSV41_DRAFT_CAPTURE is set when this runs, so the
+            # gate that does not take effect now raises.
             _S["stopped"] = True
+            raise RuntimeError(
+                f"DSV41_DRAFT_CAPTURE={os.environ.get('DSV41_DRAFT_CAPTURE', '')!r} is set but the capture "
+                f"failed ({exc!r})") from exc
         return orig(self, *a, **kw)
 
     cls.commit_hidden = wrapped
