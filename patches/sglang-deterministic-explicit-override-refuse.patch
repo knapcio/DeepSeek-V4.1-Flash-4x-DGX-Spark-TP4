@@ -1,0 +1,96 @@
+diff --git a/python/sglang/srt/arg_groups/overrides.py b/python/sglang/srt/arg_groups/overrides.py
+--- a/python/sglang/srt/arg_groups/overrides.py	2026-11-07 00:37:25
++++ b/python/sglang/srt/arg_groups/overrides.py	2026-11-07 00:37:53
+@@ -1075,9 +1075,32 @@
+     return {}
+ 
+ 
++def _user_value(view: Any, name: str) -> Any:
++    """The raw field under the view: the value the user passed on the command
++    line or to Engine(...), or the dataclass default. Passes declare into the
++    stash and never write the field, so a default filled by an earlier pass
++    does not show here."""
++    try:
++        server_args = object.__getattribute__(view, "_server_args")
++    except AttributeError:
++        return None
++    return getattr(server_args, name, None)
++
++
+ @register_post_process
+ def _deterministic_sampling_backend(view: Any) -> dict:
++    # OVERRIDE: deterministic inference replaces the sampling backend with
++    # pytorch. sampling_backend has no CLI flag (no_cli=True), so a non-None
++    # raw value was passed to Engine(...) explicitly: refuse it. The default
++    # filled by _sampling_backend_default ("flashinfer" on CUDA) is replaced
++    # with a warning, which happens on every CUDA run, GB10 included.
+     if view.enable_deterministic_inference and view.sampling_backend != "ascend":
++        user = _user_value(view, "sampling_backend")
++        if user is not None and user != "pytorch":
++            raise ValueError(
++                f"sampling_backend={user!r} was set explicitly, but "
++                "--enable-deterministic-inference requires sampling_backend='pytorch'."
++            )
+         logger.warning(
+             "Sampling backend is set to pytorch for deterministic inference."
+         )
+@@ -1110,10 +1133,21 @@
+ 
+ @register_post_process
+ def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
++    # OVERRIDE: deterministic inference disables FlashInfer allreduce fusion.
++    # An explicit --flashinfer-allreduce-fusion-backend is refused; a backend
++    # that an earlier pass filled in (the auto-enable on SM90/SM100, which
++    # does not fire on GB10) is dropped with a warning.
+     if (
+         view.enable_deterministic_inference
+         and view.flashinfer_allreduce_fusion_backend is not None
+     ):
++        user = _user_value(view, "flashinfer_allreduce_fusion_backend")
++        if user is not None:
++            raise ValueError(
++                f"--flashinfer-allreduce-fusion-backend {user} was set explicitly, but "
++                "--enable-deterministic-inference disables FlashInfer allreduce fusion. "
++                "Remove one of the two arguments."
++            )
+         logger.warning(
+             "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."
+         )
+@@ -1127,6 +1161,11 @@
+         return {}
+     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+ 
++    # OVERRIDE: with no attention backend, deterministic inference picks one
++    # by GPU (warning below); an explicit incompatible backend already raises.
++    # get_platform().is_sm120 matches every SM12x, so GB10 (SM121) takes the
++    # Blackwell branch. DeepseekV4ForCausalLM is not in the arch list of
++    # _deterministic_is_deepseek_model, so DeepSeek V4 falls to "flashinfer".
+     if view.attention_backend is None:
+         # User didn't specify attention backend, fallback based on GPU architecture
+         if get_platform().is_sm100 or get_platform().is_sm120:
+diff --git a/python/sglang/srt/arg_groups/serving_hook.py b/python/sglang/srt/arg_groups/serving_hook.py
+--- a/python/sglang/srt/arg_groups/serving_hook.py	2026-11-07 00:37:25
++++ b/python/sglang/srt/arg_groups/serving_hook.py	2026-11-07 00:37:58
+@@ -402,6 +402,22 @@
+         "1" if cfg.enable_deterministic_inference else "0"
+     )
+     if cfg.enable_deterministic_inference:
++        # OVERRIDE: deterministic inference turns off the FlashInfer MoE fused
++        # finalize. A user-set SGLANG_FLASHINFER_MOE_FUSED_FINALIZE that asks
++        # for it is refused; the default (on) is replaced with a warning.
++        if (
++            envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.is_set()
++            and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
++        ):
++            raise ValueError(
++                "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE="
++                f"{os.environ['SGLANG_FLASHINFER_MOE_FUSED_FINALIZE']} was set explicitly, "
++                "but --enable-deterministic-inference requires it off."
++            )
++        if not envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.is_set():
++            logger.warning(
++                "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE is set to 0 for deterministic inference."
++            )
+         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+     if cfg.debug_cuda_graph:
+         if not (get_platform().is_cuda or get_platform().is_hip):
