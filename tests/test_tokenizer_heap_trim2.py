@@ -1021,8 +1021,9 @@ def _encode_sites(root):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name not in enc:
                 if any(_tok_call(c, enc) for c in ast.walk(node) if isinstance(c, ast.Call)):
                     out.append((os.path.basename(rel), '<module>', node.name, False))
-            if not isinstance(node, ast.ClassDef):
-                continue
+            if not isinstance(node, ast.ClassDef) or node.name.startswith('_'):
+                continue                                  # private classes: a helper's internals, reached through
+            # it (v3 tree: parallel_prompt_encode._SegmentEncoder)
             meths = {f.name: f for f in node.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
             edges = {k: {n.func.attr for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                          and isinstance(n.func.value, ast.Name) and n.func.value.id == 'self'} for k, f in meths.items()}
