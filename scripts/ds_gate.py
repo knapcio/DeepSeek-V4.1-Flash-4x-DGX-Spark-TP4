@@ -31,7 +31,8 @@ Run on the head (Spark_01) against the SGLang server (default --url http://127.0
       T=1 and T=0 requests. Thinking via chat_template_kwargs {"thinking": bool}; with thinking on, the GLM effort of
       each prompt maps to the top-level reasoning_effort (low -> low, high/max -> high). Flags: SALAD (>= 5 CJK
       characters or >= 3 U+FFFD), LOOP (tail is one unit of <= 200 chars repeated >= 6 times, or the server loop
-      abort: finish "stop" with matched_stop "repetition"), BADJSON (json tasks, warning only).
+      abort: an HTTP error whose message starts "loop_abort:", or with DSV41_LOOP_NAMED_EXIT=0 finish "stop" with
+      matched_stop "repetition"), BADJSON (json tasks, warning only).
       Prints "TSCAN: <n> salad of <m> outputs ..."; rows go to DIR/tscan.jsonl (default ~/ds-gate/LABEL/).
 """
 import argparse
@@ -43,6 +44,7 @@ import random
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 
 BASE = "http://127.0.0.1:8888"
@@ -390,7 +392,16 @@ def one_chat(kind, effort, prompt, temp, top_p, seed, max_tokens, thinking=True)
     if kind == "schema":
         body["response_format"] = SCHEMA
     t0 = time.time()
-    r = post("/v1/chat/completions", body, timeout=900)
+    try:
+        r = post("/v1/chat/completions", body, timeout=900)
+    except urllib.error.HTTPError as exc:
+        # The server's loop abort ends the request as an error named "loop_abort: ..." (HTTP 500).
+        text = exc.read().decode(errors="replace")
+        if "loop_abort:" not in text:
+            raise
+        return {"kind": kind, "temp": temp, "top_p": top_p, "seed": seed, "finish": "loop_abort",
+                "matched_stop": None, "tokens": None, "wall_s": round(time.time() - t0, 2), "content": "",
+                "reasoning": "", "loop_abort": text[:300]}
     ch = r["choices"][0]
     msg = ch.get("message") or {}
     usage = r.get("usage") or {}
@@ -403,7 +414,7 @@ def one_chat(kind, effort, prompt, temp, top_p, seed, max_tokens, thinking=True)
 def flag_row(r):
     """Adds flags / cjk / fffd to a result row; returns (salad_or_loop, badjson)."""
     flags, cjk, bad = scan_text((r.get("reasoning") or "") + "\n" + (r.get("content") or ""))
-    if r.get("matched_stop") == "repetition" and "LOOP" not in flags:
+    if (r.get("matched_stop") == "repetition" or r.get("finish") == "loop_abort") and "LOOP" not in flags:
         flags.append("LOOP")
     badjson = r["kind"] in ("json", "schema") and r.get("finish") == "stop" and r.get("matched_stop") != "repetition" \
         and not json_ok(r.get("content") or "")
@@ -450,7 +461,8 @@ def tscan(a):
             fo.write(json.dumps(r, ensure_ascii=False) + "\n")
             print(f"{r.get('phase', '?'):3s} {r.get('kind', '?'):7s} T={r.get('temp')} seed={r.get('seed')} "
                   f"tokens {r.get('tokens')} finish {r.get('finish')}"
-                  f"{' (' + str(r['matched_stop']) + ')' if r.get('matched_stop') == 'repetition' else ''} "
+                  f"{' (' + str(r['matched_stop']) + ')' if r.get('matched_stop') == 'repetition' else ''}"
+                  f"{' (loop_abort)' if r.get('finish') == 'loop_abort' else ''} "
                   f"{' '.join(r.get('flags', []))}", flush=True)
     print(f"TSCAN: {salad} salad of {len(rows)} outputs (errors {errors}, bad json {badjson}) -> {path}")
     return 0 if salad == 0 and errors == 0 else 1

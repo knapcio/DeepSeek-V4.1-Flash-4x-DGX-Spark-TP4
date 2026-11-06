@@ -4,7 +4,8 @@
 DeepSeek-V4.1 / SGLang port (2026-09-29) of the GLM-5.3 gate. DS differences: SGLang's UnifiedRadixCache
 (full + sliding-window components) with compressed attention and Engram; cache hits are read from
 usage.prompt_tokens_details.cached_tokens (--enable-cache-report) or the sglang:cached_tokens_total counter;
-cache_salt namespaces the radix tree; loop-aborted requests (matched_stop "repetition") count as degenerate.
+cache_salt namespaces the radix tree; loop-aborted requests (an HTTP error named "loop_abort: ...", or matched_stop
+"repetition" with DSV41_LOOP_NAMED_EXIT=0) count as degenerate.
 There is no recurrent-state block, so instead of one block phase the drift test spreads its repetitions over
 prompt lengths (P mod 256 differs per repetition), and a second drift kind checks a PARTIAL hit: the warm request
 shares only the long prefix with an earlier request (next question on the same document), so the hit ends
@@ -150,7 +151,13 @@ class Client:
         try:
             r = self.post("/v1/chat/completions", body)
         except urllib.error.HTTPError as exc:
-            return {"error": f"HTTP {exc.code}: {exc.read()[:300]!r}", "s": round(time.time() - t0, 2)}
+            text = exc.read()[:300]
+            if b"loop_abort:" in text:
+                # The server's loop abort: a degenerate output, not a request error.
+                return {"finish": "loop_abort", "matched_stop": None, "usage": {}, "s": round(time.time() - t0, 2),
+                        "reasoning": "", "content": "", "token_ids": [], "cached": None,
+                        "loop_abort": text.decode(errors="replace")}
+            return {"error": f"HTTP {exc.code}: {text!r}", "s": round(time.time() - t0, 2)}
         except Exception as exc:  # noqa: BLE001
             return {"error": repr(exc)[:300], "s": round(time.time() - t0, 2)}
         ch = r["choices"][0]
@@ -239,7 +246,7 @@ def score(pfx, kind, target, rec):
     for n, code in parse_lookup(content).items():
         if n < pfx.n and code != pfx.codes[n]:
             mis.append(f"Record {n:05d}: {code} (truth {pfx.codes[n]})")
-    aborted = rec.get("matched_stop") == "repetition"
+    aborted = rec.get("matched_stop") == "repetition" or rec.get("finish") == "loop_abort"
     out = {"ntok": len(ids), "run": run, "loop": loop, "loop_abort": aborted,
            "degenerate": run >= RUN_FLAG or loop >= LOOP_FLAG or bool(rec.get("lp_bad")) or aborted,
            "lp_bad": rec.get("lp_bad"), "finish": rec.get("finish"), "misquotes": mis[:8], "false_anomaly": None}
