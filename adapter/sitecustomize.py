@@ -328,10 +328,17 @@ class EngramLoader(importlib.abc.Loader):
             # indexer uses the torch path. The upstream guard misses this case.
             cls = module.PagedIndexerMetadata
             original = cls.__post_init__
+            warned = []
             def post_init(self):
                 sm12 = bool(getattr(module, '_IS_SM120', False) or
                             getattr(module, '_IS_SM121', False))
+                # OVERRIDE (GB10 / SM12x): ratio-1/2 indexer metadata is forced onto the DeepGEMM
+                # split-128 planner, whatever path the FP8 indexer selected.
                 if sm12 and self.compress_ratio in (1, 2):
+                    if not self.force_deep_gemm_metadata and not warned:
+                        warned.append(True)
+                        print('WARNING: SM12x: ratio-1/2 indexer metadata forced to the DeepGEMM '
+                              'split-128 planner (force_deep_gemm_metadata=True)', flush=True)
                     self.force_deep_gemm_metadata = True
                 original(self)
             cls.__post_init__ = post_init
