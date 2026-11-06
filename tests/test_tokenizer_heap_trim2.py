@@ -1085,10 +1085,13 @@ class PinnedSglangSource(unittest.TestCase):
     def test_every_prompt_encode_is_hooked(self):
         sites = _encode_sites(SGLANG_ROOT)
         self.assertTrue(any(r for *_, r in sites))
-        # the DSV4.1 chat path of this tree: render + parallel / plain-text encode inside the hooked chat methods
-        for m in ('_process_messages', '_apply_jinja_template', '_render_and_encode_chat_template'):
-            self.assertIn(('serving_chat.py', 'OpenAIServingChat', m, True), sites)
-        self.assertIn('encode_dsv41_prompt', _encoders(SGLANG_ROOT))
+        self.assertIn(('serving_chat.py', 'OpenAIServingChat', '_process_messages', True), sites)
+        if Path(SGLANG_ROOT, 'srt/entrypoints/openai/chat_encoding.py').exists():
+            # the production canary tree (f80c91a4 + the fetch script's patches): the DSV4.1 render + parallel /
+            # plain-text encode run inside the hooked chat methods
+            for m in ('_apply_jinja_template', '_render_and_encode_chat_template'):
+                self.assertIn(('serving_chat.py', 'OpenAIServingChat', m, True), sites)
+            self.assertIn('encode_dsv41_prompt', _encoders(SGLANG_ROOT))
         missing = [s[:3] for s in sites if not s[3] and s[:3] not in UNHOOKED_OK]
         self.assertEqual(missing, [], sites)
         stale = sorted(UNHOOKED_OK - {s[:3] for s in sites} - {('serving_chat.py', 'OpenAIServingChat',
