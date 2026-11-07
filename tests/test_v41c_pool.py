@@ -578,8 +578,8 @@ class Profile(unittest.TestCase):
 
     def test_production_line_ends_with_v41n_once(self):
         items = self._production_line().split('"')[1].split()
-        self.assertEqual(items[-7:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"] + V41N_KEYS
-                         + ["DSV41_TOKENIZER_HEAP=trim2"])
+        self.assertEqual(items[-8:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"] + V41N_KEYS
+                         + ["DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
         for k in V41N_KEYS:
             self.assertEqual(sum(x.split("=")[0] == k.split("=")[0] for x in items), 1, k)
 

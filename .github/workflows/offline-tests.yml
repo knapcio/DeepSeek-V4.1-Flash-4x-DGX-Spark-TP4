@@ -64,7 +64,6 @@ jobs:
             tests/test_swa_thin.py \
             tests/test_swa_cone.py \
             tests/test_swa_prompt_tail.py \
-            tests/test_prefill_trim.py \
             tests/test_tokenizer_heap_trim2.py \
             tests/test_roce_ring.py \
             tests/test_remote_dotenv.py \
@@ -136,7 +135,6 @@ jobs:
             tests/test_swa_thin.py \
             tests/test_swa_cone.py \
             tests/test_swa_prompt_tail.py \
-            tests/test_prefill_trim.py \
             tests/test_tokenizer_heap_trim2.py \
             tests/test_v41_tool_constraint.py
           bash -n start.sh stop.sh scripts/fetch-sglang-canary.sh

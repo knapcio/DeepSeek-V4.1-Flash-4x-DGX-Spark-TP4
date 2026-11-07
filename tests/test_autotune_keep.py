@@ -63,10 +63,6 @@ def main():
     assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_SWA_PROMPT_TAIL_KEEP"] = "1024"    # decode-time SWA free timing: volatile
     os.environ["DSV41_SWA_PROMPT_TAIL_HOLD"] = "8192"
-    os.environ["DSV41_PREFILL_TRIM"] = "1"               # allocator cache trimming: volatile
-    os.environ["DSV41_PREFILL_TRIM_GIB"] = "1"
-    os.environ["DSV41_PREFILL_TRIM_EVERY_S"] = "10"
-    os.environ["DSV41_PREFILL_MEM_PROBE"] = "1"
     assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_VERIFY_CAP"] = "conf:0.1"          # A/B-neutral switch: same fingerprint
     assert ak.launch_fingerprint() == ak.launch_fingerprint()

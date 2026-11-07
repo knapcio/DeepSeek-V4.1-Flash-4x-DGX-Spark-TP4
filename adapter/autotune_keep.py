@@ -53,11 +53,10 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              # no cached prefix, so no replay runs while tuning, and no tuned shape or kernel depends on them
              "DSV41_SWA_THIN", "DSV41_SWA_CONE_REPLAY", "DSV41_SWA_CONE_TOKENS", "DSV41_SWA_CONE_MIN_SAVE",
              "DSV41_SWA_CONE_TEST",
-             # the SWA prompt-tail floor only delays decode-time frees of request-owned SWA slots (scheduler side,
-             # after boot), and the prefill trim only changes when cached allocator blocks go back to the driver:
-             # no GEMM shape, kernel or tuning pass depends on either
+             # the SWA prompt-tail floor (in the production profile since v2.6.6) only changes when request-owned SWA
+             # slots are freed (scheduler side, after boot): no GEMM shape, kernel or tuning pass depends on it, so
+             # the v2.6.5 tactic table stays valid
              "DSV41_SWA_PROMPT_TAIL_KEEP", "DSV41_SWA_PROMPT_TAIL_HOLD",
-             "DSV41_PREFILL_TRIM", "DSV41_PREFILL_TRIM_GIB", "DSV41_PREFILL_TRIM_EVERY_S", "DSV41_PREFILL_MEM_PROBE",
              # the opt-in V4.1 FP4 compressed-KV layout and its readers (DSV41_KV_LAYOUT=v41c): they change the KV pool
              # and the attention readers, never a tuned GEMM / MoE shape or kernel; the v41n reader never tunes and
              # resolves the stock decode tactics from the kept cache, so its A/B boots must reuse the controls' cache

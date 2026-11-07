@@ -133,12 +133,22 @@ class Wiring(unittest.TestCase):
         self.assertEqual(src.count("from swa_prompt_tail import"), 1)
         ast.parse(src)
 
-    def test_off_in_every_profile_line_and_volatile(self):
-        env_text = (ROOT / ".env.tp4.example").read_text()
-        for line in env_text.splitlines():
-            if line.lstrip("#").startswith("EXTRA_CONTAINER_ENV="):
-                self.assertNotIn("DSV41_SWA_PROMPT_TAIL", line)
-        self.assertIn("DSV41_SWA_PROMPT_TAIL_KEEP", env_text)                   # documented
+    def test_only_the_production_line_sets_it_and_volatile(self):
+        # v2.6.6: the production line ends with DSV41_SWA_PROMPT_TAIL_KEEP=1024 (once); the hold stays at its code
+        # default (no profile line sets it); no other profile line sets either key
+        if not (ROOT / ".env.tp4.example").exists():
+            self.skipTest("no .env.tp4.example in this tree")
+        lines = (ROOT / ".env.tp4.example").read_text().splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("# Production settings, together with the line"))
+        prod = lines[i - 1]
+        self.assertTrue(prod.startswith('#EXTRA_CONTAINER_ENV="'), prod[:60])
+        items = prod.split('"')[1].split()
+        self.assertEqual(items[-1], "DSV41_SWA_PROMPT_TAIL_KEEP=1024")
+        self.assertEqual(sum(x.startswith("DSV41_SWA_PROMPT_TAIL") for x in items), 1)
+        on = [line for line in lines if "DSV41_SWA_PROMPT_TAIL" in line and not line.startswith("# ")]
+        self.assertEqual(on, [prod])
+        self.assertEqual(T.config({T.ENV_KEEP: "1024"}), (1024, T.DEFAULT_HOLD))
+        self.assertEqual(T.DEFAULT_HOLD, 8192)
         ak = (ROOT / "adapter" / "autotune_keep.py").read_text()
         for k in ("DSV41_SWA_PROMPT_TAIL_KEEP", "DSV41_SWA_PROMPT_TAIL_HOLD"):
             self.assertIn(f'"{k}"', ak)
