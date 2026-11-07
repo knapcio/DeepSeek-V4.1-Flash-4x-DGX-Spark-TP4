@@ -13,6 +13,16 @@ cache), accepted by the owner on the condition that the v2.7 gate passes. The th
 FlashInfer #5197 / #6616 (lucifer1004), #7676 (Thireus), luz-deepseek-flash-all-in-one (luxingcom). Measurements: pending
 (W1 one-GB10 parity / microbench, W2 TP4 boot smoke, then the A / X / A' screen and the release gate).
 
+- **No in-process sparse-MLA calibration.** FlashInfer 0.7 calibrates its SM120 sparse-MLA kernels whenever an autotune
+  pass meets a request with no profile on disk, also in SGLang's draft autotune pass, after the target-verify CUDA
+  graphs are captured. Every cold boot on the four Sparks then faulted at the first decode: a captured graph wrote to
+  unmapped memory on every rank (Xid 31 / 13; the faulting kernel a cuBLAS bf16 batched GEMM; debug runs
+  `run-20261107-105507-2650424` and `run-20261107-134634-3060892`), while every boot that found the calibration on disk
+  served. `boot.py` now adds `sparse_mla_sm120` to `--flashinfer-autotune-skip-ops` and points `FLASHINFER_AUTOTUNE_DIR`
+  at the calibration shipped in the image (`files/fi-autotune/sparse_mla_sm120_cpb.json`: FlashInfer 0.7.2's own
+  calibration of the four V4.1 TP4 request shapes on a GB10, read-only, the same plans on every rank). A missing
+  calibration refuses the boot; `DSV41_V41_CALIBRATION=inprocess` restores FlashInfer's behaviour for diagnostics.
+
 ## 2026-11-07 v2.6.5
 
 v2.6.4 plus three changes. The production profile in `.env.tp4.example` adds `DSV41_KV_LAYOUT=v41c

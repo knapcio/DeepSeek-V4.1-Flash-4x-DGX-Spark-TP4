@@ -348,6 +348,69 @@ def retired_fi0618_knobs(env=None, fi_version=None):
     return sorted(f'{k}={env[k]}' for k, bad in FI0618_ONLY_KNOBS.items() if env.get(k, '').strip() in bad)
 
 
+# v2.7: FlashInfer >= 0.7 calibrates its SM120 sparse-MLA kernels in-process whenever an autotune pass meets a request
+# with no profile on disk -- also in SGLang's draft autotune pass, which runs AFTER the target-verify CUDA graphs were
+# captured. On 4x GB10 every boot that calibrated there faulted at the first decode: a captured graph wrote to unmapped
+# memory on every rank (Xid 31 / 13; the faulting kernel a cuBLAS bf16 batched GEMM; runs 20261107-105507-2650424 and
+# 20261107-134634-3060892), while the boots that found the calibration on disk served. So the V4.1 route never
+# calibrates in-process: the autotuner skips the sparse-MLA op and FlashInfer reads the calibration shipped in the image
+# (files/fi-autotune, read-only, the same plans on every rank). DSV41_V41_CALIBRATION=inprocess restores FlashInfer's
+# own behaviour (diagnostics only).
+V41_CALIBRATION_DIR = '/opt/dsv41/files/fi-autotune'
+V41_CALIBRATION_FILE = 'sparse_mla_sm120_cpb.json'
+SKIP_OPS_FLAG = '--flashinfer-autotune-skip-ops'
+
+
+def v41_frozen_calibration(args, env=None, fi_version=None):
+    """(args, env additions, receipt line) for DSV41_KV_LAYOUT=v41 on FlashInfer >= 0.7, else (args, {}, None).
+
+    Adds sparse_mla_sm120 to --flashinfer-autotune-skip-ops (merging the operator's ops into one flag) and points
+    FLASHINFER_AUTOTUNE_DIR at the shipped calibration unless the operator set it; refuses to start when that directory
+    holds no calibration (FlashInfer would fall back to its heuristic plans, not the calibrated ones the gate measured).
+    """
+    env = os.environ if env is None else env
+    if env.get('DSV41_KV_LAYOUT', '').strip() != 'v41':
+        return args, {}, None
+    fi_version = flashinfer_version() if fi_version is None else fi_version
+    try:
+        if tuple(int(x) for x in fi_version.split('.')[:2]) < (0, 7):
+            return args, {}, None
+    except ValueError:
+        pass                                    # unknown version: the V4.1 route needs >= 0.7 anyway
+    mode = env.get('DSV41_V41_CALIBRATION', 'frozen').strip().lower() or 'frozen'
+    if mode not in ('frozen', 'inprocess'):
+        raise ValueError(f'DSV41_V41_CALIBRATION={mode!r}: expected frozen or inprocess')
+    if mode == 'inprocess':
+        return args, {}, ('DSV41 v2.7 sparse-MLA calibration: IN-PROCESS (DSV41_V41_CALIBRATION=inprocess, '
+                          'diagnostics only: a calibration after graph capture faulted on GB10)')
+    own = env.get('FLASHINFER_AUTOTUNE_DIR', '').strip()
+    cal = Path(own or V41_CALIBRATION_DIR) / V41_CALIBRATION_FILE
+    if not cal.is_file():
+        raise RuntimeError(f'DSV41_KV_LAYOUT=v41: no sparse-MLA calibration at {cal}; refusing to calibrate in-process '
+                           '(DSV41_V41_CALIBRATION=inprocess overrides, diagnostics only)')
+    digest = hashlib.sha256(cal.read_bytes()).hexdigest()
+    out, ops, i = [], [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == SKIP_OPS_FLAG:
+            i += 1
+            while i < len(args) and not args[i].startswith('--'):
+                ops.append(args[i])
+                i += 1
+        elif arg.startswith(SKIP_OPS_FLAG + '='):
+            ops += arg.split('=', 1)[1].replace(',', ' ').split()
+            i += 1
+        else:
+            out.append(arg)
+            i += 1
+    if 'sparse_mla_sm120' not in ops:
+        ops.append('sparse_mla_sm120')
+    out += [SKIP_OPS_FLAG, *ops]
+    receipt = (f'DSV41 v2.7 sparse-MLA calibration frozen: {SKIP_OPS_FLAG} {" ".join(ops)}, '
+               f'FLASHINFER_AUTOTUNE_DIR={cal.parent}, {V41_CALIBRATION_FILE} sha256={digest[:16]}')
+    return out, ({} if own else {'FLASHINFER_AUTOTUNE_DIR': str(cal.parent)}), receipt
+
+
 def serve():
     mode = os.environ.get('OFFLOAD_MODE', 'nvme')
     assert mode in ('nvme', 'ram'), 'OFFLOAD_MODE must be nvme or ram'
@@ -429,13 +492,16 @@ def serve():
     if extra:
         args += extra.split()
     args = required_sglang_args(args, os.environ.get('DSV41_MXFP8_BACKEND', 'b12x'))
+    args, calibration_env, calibration_receipt = v41_frozen_calibration(args)
+    if calibration_receipt:
+        print(calibration_receipt, flush=True)
 
     save('launch.json', {
         'revision': REVISION, 'offload_mode': mode, 'args': args, 'gpus': gpu,
         'nnodes': NNODES, 'node_rank': NODE_RANK, 'tp': TP_SIZE, 'ep': EP_SIZE,
     })
     secret = key()
-    env = dict(os.environ, DSV41_SOURCE=str(MODEL))
+    env = dict(os.environ, DSV41_SOURCE=str(MODEL), **calibration_env)
     # compact ragged-verify only pays off with a profiled cost table; without one
     # it degenerates to the same verify-all schedule as static, for more work.
     if '--speculative-dspark-sps-table-path' in args:
