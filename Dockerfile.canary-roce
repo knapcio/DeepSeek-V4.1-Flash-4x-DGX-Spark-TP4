@@ -55,8 +55,12 @@ COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kerne
 # retired here. Both were generated from or checked against FlashInfer 0.6.18's approved sparse_mla_sm120 closure and
 # the v41c glue calls five 0.6.18 privates that 0.7.x removed (_get_sparse_mla_decode_dsv4_module, ...). FlashInfer
 # 0.7.x itself reads the V4.1 records (DSV41 v41n's job), takes runtime page sizes (swan's and K8's job).
-# TODO(v2.7 M2): delete the sources and their tests once the native-V41 profile passes its gate; until then a profile
+# TODO(v2.7): delete the module sources and their tests once the native-V41 profile passes its gate. A profile
 # that still sets DSV41_KV_LAYOUT=v41c, DSV41_SWA_NATIVE_DECODE=1 or DSV41_PREFILL_NATIVE_EXTRA=1 must refuse at boot.
+# Their Python fronts stay importable (stdlib-only at import, every entry gated off): the V4 SM120 bridge imports
+# them on its 256-page decode / extra-page prefill paths and falls back to the stock split when they are off.
+COPY runtime/flashinfer_pce/dsv41_pce.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_pce.py
+COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py
 # FlashInfer PR #7676 (issue #7675, Thireus): one proxy fence after producer_acquire in the b12x SM120/SM121 dense GEMM
 # that every MXFP8 dense linear runs (adapter/mxfp8_b12x.py). The patcher only edits a pinned file (sha256 before
 # and after: 0.6.18's, or the 0.7.2 / 0.7.3 file = the PR's base blob); any other FlashInfer fails the build. CuTe DSL compiles the kernel in-process at first use.

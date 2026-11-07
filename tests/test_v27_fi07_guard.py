@@ -103,6 +103,9 @@ class Recipes(unittest.TestCase):
             self.assertIn("-r /tmp/flashinfer-0.7.2.requirements", text, name)
             self.assertNotIn("dsv41_pce build", text, name)
             self.assertNotIn("dsv41_v41c build", text, name)
+            # the gated Python fronts stay importable: the V4 SM120 bridge imports them on its 256-page paths
+            self.assertIn("COPY runtime/flashinfer_pce/dsv41_pce.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_pce.py", text, name)
+            self.assertIn("COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py", text, name)
         self.assertIn("apply_fi7676.py --check", (ROOT / "Dockerfile.canary-roce").read_text())
 
     @unittest.skipUnless((ROOT / "files" / "flashinfer-0.7.2.requirements").exists(), "not a repo checkout (in an image)")
