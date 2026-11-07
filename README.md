@@ -149,6 +149,7 @@ cp .env.tp4.example .env.tp4          # fill in HEAD_IP / WORKER_* / MODEL_DIR /
 # base/canary images); the "Conservative fallback profile" block is the v2.1 feature set
 ./start-tp4.sh download               # 476 GiB at the pinned revision, needs the hf CLI; skips when complete
 scripts/fetch-sglang-canary.sh        # stages the pinned dsv4.1 branch tree
+scripts/fetch-nccl.sh                 # stages NVIDIA/nccl v2.30.7-1 for the canary-roce nccl-builder stage
 ./start-tp4.sh doctor
 ./start-tp4.sh build                  # builds on every node, bakes the adapters, runs the in-image tests
 ./start-tp4.sh share && ./start-tp4.sh pack   # first time only, see upstream README

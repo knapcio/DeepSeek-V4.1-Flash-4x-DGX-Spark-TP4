@@ -13,10 +13,40 @@
 # the branch's kernel file. Everything else is the production Dockerfile.
 # Tag: dsv41-4x-spark:canary
 ARG BASE_IMAGE=lmsysorg/sglang:dev-dsv41
+
+# v2.6.6: NCCL 2.30.7 (NVIDIA/nccl v2.30.7-1 = 73cf112, the version of the base image's nvidia-nccl-cu13 wheel, NOT
+# bumped) rebuilt from source with NVIDIA/nccl #2393's AArch64 CTS fence (patches/nccl-2393-aarch64-cts-fence.patch,
+# Stanislav Bardyuk's backport; one acquire fence in ncclIbIsend) for sm_121 only, as christopherowen/spark-ds41f's
+# recipe builds it. The runtime stage replaces the wheel's libnccl.so.2 with it. Stage the source first:
+# scripts/fetch-nccl.sh (runtime/nccl-src, tree pinned). Measured on 4 Sparks (11-07, run-20261107-080134-2137538):
+# all-reduce busbw x0.9998..1.0002 of stock at 8-256 MiB, bit-equal reduction results, cold prefill at parity, qeval
+# output = production's. ~2 min of nvcc; no GPU needed.
+FROM ${BASE_IMAGE} AS nccl-builder
+ARG NCCL_COMPILE_JOBS=16
+COPY runtime/nccl-src /work/nccl
+COPY patches/nccl-2393-aarch64-cts-fence.patch /work/nccl-2393-aarch64-cts-fence.patch
+COPY scripts/nccl_receipt.py /work/nccl_receipt.py
+RUN set -eu; cd /work/nccl \
+ && test "$(cat REF)" = 73cf112295c33aee2b895f329f592f2a9b4b0f97 \
+ && echo "8088c3a898028ef4c926cbad51a36000a6d7dfc7fd5bda566420b9701bc61e2c  /work/nccl-2393-aarch64-cts-fence.patch" | sha256sum -c - \
+ && echo "7379081678564a0065c60073a6ae3b7a7b259f632805ddc1a6dbac58e47df362  src/transport/net_ib/p2p.cc" | sha256sum -c - \
+ && patch -p1 --forward --batch --no-backup-if-mismatch < /work/nccl-2393-aarch64-cts-fence.patch \
+ && echo "a0cc4e706d649d0582ff431bba252e4eb98a8d15e9f48c15a0e59e54ec73764a  src/transport/net_ib/p2p.cc" | sha256sum -c - \
+ && { make -j"$NCCL_COMPILE_JOBS" src.build CUDA_HOME=/usr/local/cuda NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" \
+        > /work/nccl-build.log 2>&1 || { tail -40 /work/nccl-build.log; exit 1; }; } \
+ && mkdir -p /opt/nccl && cp -L build/lib/libnccl.so.2 /opt/nccl/libnccl.so.2 \
+ && python3 /work/nccl_receipt.py write /opt/nccl/libnccl.so.2 /opt/nccl/nccl-2393.json
+
 FROM ${BASE_IMAGE}
 # Same mirror knob as Dockerfile.canary (Saolence, #6): --build-arg PIP_INDEX=<mirror>/simple
 ARG PIP_INDEX=https://pypi.org/simple
 RUN pip install --no-deps --no-cache-dir -i "$PIP_INDEX" "sglang-kernel==0.4.7" "sgl-deep-gemm==0.2.0"
+# The nccl-builder library over the wheel's (torch resolves libnccl.so.2 through its RPATH to exactly this path);
+# its receipt (/opt/dsv41/files/nccl-2393.json) is re-checked below against the file torch loads.
+COPY --from=nccl-builder /opt/nccl /tmp/nccl-2393
+RUN set -eu; target=/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2; test -f "$target" \
+ && install -m 0644 -o root -g root /tmp/nccl-2393/libnccl.so.2 "$target" \
+ && install -D -m 0644 /tmp/nccl-2393/nccl-2393.json /opt/dsv41/files/nccl-2393.json && rm -rf /tmp/nccl-2393
 RUN rm -rf /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/python /sgl-workspace/sglang/python
 RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark; print('import ok')"
@@ -205,6 +235,9 @@ RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone.py
 # The cone x DSV41_KV_LAYOUT=v41c: the page copy covers the V4.1 FP4 pools, the replay rows' FP4 writes go to slot 0.
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone_v41c.py
+# NCCL 2.30.7 + #2393 (v2.6.6): the library torch loads is the nccl-builder receipt's, version 23007, fence present.
+RUN python3 /opt/dsv41/scripts/nccl_receipt.py check /opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2 /opt/dsv41/files/nccl-2393.json \
+ && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_nccl_2393.py
 # DSV41_SWA_PROMPT_TAIL_KEEP (CPU; module off when unset, 1024 in the production profile since v2.6.6): engine pins,
 # the stock path is a no-op, a request-owned prompt end is kept through decode on the real UnifiedRadixCache +
 # ScheduleBatch.maybe_evict_swa, the hook install.
