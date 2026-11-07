@@ -145,7 +145,10 @@ class Wiring(unittest.TestCase):
 
     def test_dockerfile_and_ci_run_this_test(self):
         self.assertIn("tests/test_swa_prompt_tail.py", (ROOT / "Dockerfile.canary-roce").read_text())
-        self.assertIn("tests/test_swa_prompt_tail.py", (ROOT / ".github/workflows/offline-tests.yml").read_text())
+        ci = ROOT / ".github/workflows/offline-tests.yml"
+        if not ci.exists():  # the image ships /opt/dsv41 without .github
+            self.skipTest("no .github in this tree (image)")
+        self.assertIn("tests/test_swa_prompt_tail.py", ci.read_text())
 
     def test_pins_are_hex(self):
         self.assertEqual(len(T.PINS), 9)
