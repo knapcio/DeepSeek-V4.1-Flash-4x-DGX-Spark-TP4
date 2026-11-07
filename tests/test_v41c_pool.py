@@ -488,6 +488,10 @@ V41C_SITE_BLOCKS = (
 # only, its own tests in tests/test_tokenizer_heap_trim2.py): stripped too, so the rest is still the base's text
 TRIM2_SITE_BLOCK = re.compile(r"# DSV41_TOKENIZER_HEAP=trim2 \(off by default\).*?"
                               r"print\(f'DSV41_TOKENIZER_HEAP=trim2: not installed \(\{exc!r\}\)', flush=True\)\n\n", re.S)
+# the SWA prompt-tail keep's block (perf/v266-jjang-20261107: off by default, its own tests in
+# tests/test_swa_prompt_tail.py): stripped too
+PROMPT_TAIL_SITE_BLOCK = re.compile(r"            # Gated on DSV41_SWA_PROMPT_TAIL_KEEP=<tokens>:.*?"
+                                    r"install_swa_prompt_tail\(module\)\n", re.S)
 
 
 class DefaultOff(unittest.TestCase):
@@ -500,6 +504,8 @@ class DefaultOff(unittest.TestCase):
             self.assertEqual(n, 1, rx.pattern[:60])
         s, n = TRIM2_SITE_BLOCK.subn("", s)
         self.assertEqual(n, 1, "trim2 block")
+        s, n = PROMPT_TAIL_SITE_BLOCK.subn("", s)
+        self.assertEqual(n, 1, "prompt-tail block")
         self.assertEqual(hashlib.sha256(s.encode()).hexdigest(), SITE_F744D83_SHA)
 
     def _finder_names(self, value):
