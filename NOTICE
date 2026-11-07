@@ -43,14 +43,14 @@ Third-party components and their licences:
   shared-memory reuse race on ctrl[7]); b12x development continues in
   flashinfer-ai/flashinfer (flashinfer/experimental/b12x, Apache License 2.0).
   The changes are distributed under the same licence.
-  Local changes for the opt-in mixed KV layout (DSV41_KV_LAYOUT=v41c) are listed in
+  Local changes for the mixed KV layout (DSV41_KV_LAYOUT=v41c, production profile since v2.6.5) are listed in
   runtime/b12x_next/v41c-provenance.json.
 - runtime/flashinfer_v41c contains NVIDIA FlashInfer sparse_mla_sm120 sources (flashinfer 0.6.18,
   BSD-3-Clause, headers retained) with local changes listed in runtime/flashinfer_v41c/PROVENANCE.json:
-  the opt-in V4.1 FP4 record readers (DSV41_KV_LAYOUT=v41c) and, for DSV41_SWA_NATIVE_DECODE (production
+  the V4.1 FP4 record readers (DSV41_KV_LAYOUT=v41c, production profile since v2.6.5) and, for DSV41_SWA_NATIVE_DECODE (production
   profile since v2.6.4), csrc/swan_decode_dsv4.cu: FlashInfer's decode-dsv4 launcher and its stock kernel
   body instantiated for 256-token pages.
-- adapter/v41c_pool.py (opt-in, DSV41_KV_LAYOUT=v41c) allocates SGLang's DeepSeek-V4 ratio-1/2 KV
+- adapter/v41c_pool.py (DSV41_KV_LAYOUT=v41c, production profile since v2.6.5) allocates SGLang's DeepSeek-V4 ratio-1/2 KV
   pools in SGLang's own V4.1 FP4 record layout (KVLayout.V41_FP4 and its writers, SGLang dsv4.1
   branch; Apache License 2.0, LICENSE.sglang) next to the V4 SWA cache and re-prices their pool
   sizing; it wraps SGLang functions at import and copies no SGLang source.
@@ -70,7 +70,7 @@ Third-party components and their licences:
   FlashInfer sources at build time
   (dual-cache prefill dispatch opened to 128/256-token extra pages, symbols renamed); origin and
   changes: runtime/flashinfer_pce/PROVENANCE.json.
-- runtime/flashinfer_v41c (DSV41_V41C_READER=native, "v41n", opt-in): the in-kernel V4.1 FP4
+- runtime/flashinfer_v41c (DSV41_V41C_READER=native, "v41n", production profile since v2.6.5): the in-kernel V4.1 FP4
   record readers extend FlashInfer's sparse_mla_sm120 decode and dual-cache prefill kernels
   (NVIDIA, BSD-3-Clause, headers retained). v41n_prefill_kernel.cuh is generated from the vendored
   prefill_kernel.cuh by gen_v41n_prefill.py; v41n_convert.cuh is new. Design idea credit:

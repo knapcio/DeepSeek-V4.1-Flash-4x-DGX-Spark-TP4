@@ -1,13 +1,17 @@
 # Changelog
 
-## 2026-11-06 v2.6.5 (candidate; release gate pending)
+## 2026-11-07 v2.6.5
 
 v2.6.4 plus three changes. The production profile in `.env.tp4.example` adds `DSV41_KV_LAYOUT=v41c
 DSV41_V41C_ARM=1 DSV41_V41C_READER=native` ("v41n": the compressed KV records in SGLang's V4.1 FP4 layout, read in
 place) with the KV pool pinned at `MAX_TOTAL_TOKENS=8541952` at `MEM_FRACTION_STATIC=HEAD_MEM_FRACTION_STATIC=0.85`, and `DSV41_TOKENIZER_HEAP=trim2` (the head's tokenizer
 process returns its free heap). The fix for [#66](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/66)
 (named loop-abort exit, broken tool calls in the history) is on by default. All new keys are volatile for
-`DSV41_AUTOTUNE_KEEP` (no re-tune when toggled; the pool size is out of the fingerprint too).
+`DSV41_AUTOTUNE_KEEP` (no re-tune when toggled; the pool size is out of the fingerprint too). The full KV pool is
+8,541,952 tokens: +69 % against v2.6.2's ~5.06M and x2.3-2.5 against v2.6.4's 3.44-3.70M, eight 1M-token contexts
+instead of three. The price is host memory on the head: its lowest MemAvailable was 5.72 GiB in the memory ladder's
+stress cells (eight 1M-token prompts resident at once) against 8.87-9.32 GiB at 5,130,752 / fraction 0.78. Rollback
+is config only (the v2.6.4 values, below).
 
 - **KV pool 3.44-3.70M -> 8,541,952 tokens (x2.3), measured.** Memory ladder on the four Sparks, first
   `~/ds-gate/mlad-v264np-20261106/run-20261106-090824-539338` (2026-11-06; production's fraction 0.78, tails 384,
@@ -31,11 +35,11 @@ process returns its free heap). The fix for [#66](https://github.com/knapcio/Dee
   V4 (38 / 38 layers); in TP4 serving the KLD against the control is inside control-vs-control (0.0031-0.0053 vs
   0.0073 / 0.0076) and qeval 71 / 71 / 71 (capacity A/Bs). The cone replay copies the V4.1 FP4 pages and masks their
   replay writes (`tests/test_swa_cone_v41c.py`); on the fleet the evicted-resume cell replayed one 8192-row chunk on all
-  four nodes in every ladder boot (TTFT 2.07-2.13 s at 302K tokens). Output identity of that resume against a
-  non-v41n boot is the release gate's check.
+  four nodes in every ladder boot (TTFT 2.07-2.13 s at 302K tokens). In the release gate (below) the replayed
+  resume's 16 output tokens equal a v2.6.2 control's token for token.
 - **Tokenizer heap, measured.** In the trim A/B (`~/ds-gate/trim-20261106/run-20261106-023911-3456984`, 30-minute
   long-prompt soak; verdict INVALID on a pool mismatch and a receipt bug, fixed since): launch_server 1.0-3.1 GiB with
-  trim2 against 3.9-4.3 GiB at the controls' soak end, 19 trims returning 28.5 GiB, 0 of 74 stable qeval tasks
+  trim2 against 3.9-4.3 GiB at the controls' soak end, 19 trims returning 27.8 GiB, 0 of 74 stable qeval tasks
   changed, long-prompt count, companion and c1 / c4 speed within 1 %. In the ladder's four boots: 16-18 trims each,
   17.7-20.1 GiB returned. Cost: a busy trim runs on the HTTP event loop, so under back-to-back long prompts token
   delivery pauses up to 0.69-0.90 s about once per 2 minutes (the GPUs keep decoding).
@@ -47,6 +51,39 @@ process returns its free heap). The fix for [#66](https://github.com/knapcio/Dee
   dequantizing across many warps is Christopher Owen's ([christopherowen](https://github.com/christopherowen),
   spark-ds41f). The #66 fix is Alexander Busse's ([GanyX19](https://github.com/GanyX19)) MiaAI-Lab#55, reported here by
   [slidonnici](https://github.com/slidonnici) (details below).
+
+Release gate: PASS (run `run-20261106-214411-640735`, 2026-11-06 / 07, 277 min including the restore of production;
+0 KILL, 0 INVALID). v2.6.2 / v2.6.5 / v2.6.2, three fresh boots in that order, abliterated 1017 `517efab`; the
+controls are production v2.6.2 as it serves (tails 128, no pin, fraction 0.78). The v2.6.5 boot ran the v2.6.4 gate
+image with this release's files overlaid (the module `00505fe850b7` unchanged), launched with `--swa-prefix-tails
+384`, `MAX_TOTAL_TOKENS=8541952` and the fraction 0.85; the #66 switches at their defaults. Speedbench 0.3 full,
+median of two runs: greedy c1 all-prompt geomean 88.91 / 89.91 / 88.77 and prose 65.49 / 66.11 / 65.34 tok/s, c4
+131.39 / 132.08 / 131.33 aggregate tok/s; sampled (T 0.7, top-p 0.95, one run per cell) c1 84.85 / 85.77 / 85.00 and
+prose 62.26 / 62.58 / 62.73 tok/s, c4 127.62 / 129.24 / 127.99 aggregate tok/s; speedbench load c16 213.65 / 217.44 /
+216.81 aggregate tok/s. Cold 64K prefill 6182 / 6198 / 6210 tok/s (median of three flushed prompts); a cold
+388K-token prompt's first token 63.5 / 64.1 / 63.3 s (median of three); a short request beside a 131,072-token
+prefill 0.44 / 0.45 / 0.43 s. qeval 71 / 71 / 71; at T = 0 the v2.6.5 outputs equal the controls' on all 74 of the
+75 prompts on which the two controls agree. KLD long 0.0049 and short 0.00459 (control vs control 0.00485 / 0.00531;
+PASS); T = 1 distribution check PASS (12,000 samples); 1M needle (968,707 tokens) found in 186.9 s. Median first
+token after 60 s idle 188.8 / 190.8 / 189.5 ms; idle RDMA proxy CPU summed over the four nodes 9.45 / 2.13 / 9.25 % of
+a core (v2.6.2 has no idle park). Every rank of the v2.6.5 boot logged the v41n pool (912.25 B per full token,
+8,541,952 tokens) and its native reader, SWA thin, the cone replay, the decode yield, the #66 named exit and the
+history repair as installed, and trim2 was armed in the head's `launch_server` (10 trims, 12,101 MiB returned, longest
+493 ms), with no fallback and no error; the FlashInfer #7676 fence was present on every rank of the v2.6.5 boot.
+- **KV pool:** 4,316,160 / 8,541,952 / 4,552,192 tokens (the controls size their pool from the free memory at boot:
+  4,997,632 / 5,101,824 in the v2.6.4 gate).
+- **Memory:** the head's lowest MemAvailable over the boot 8.77 / 7.15 / 10.22 GiB (the judge's floors: 3.5 GiB KILL,
+  4.0 GiB MARGINAL); at the soak's 15th minute the schedulers held 7.77 / 7.82 / 7.77 GiB and the tokenizer process
+  4.12 / 1.63 / 3.13 GiB; NVRM out-of-memory lines 0 / 0 / 0.
+- **Evicted resume point:** a 302,048-token prompt of natural text (this repository's own files), first the document,
+  then 800 distinct 1K-token prompts that pushed its SWA window out (800 of 800 OK, 149.9 s), then the document plus
+  2,048 tokens. Every node of the v2.6.5 boot replayed one 8,192-row chunk from token 291,328, with 0 reverts: first
+  token 2.21 s, 291,328 tokens cached. The controls answered the same request with a full prefill in 53.3 / 50.8 s.
+  The v2.6.5 output (16 greedy tokens) equals the second control's token for token; the two controls differ from each
+  other after 9 tokens.
+- **Soak** (issue #16 reproduction, seeded document order, plus a c2 companion load): 268 / 307 / 261 requests with 0
+  failures, companion 39.57 / 49.28 / 38.92 tok/s (v2.6.5 keeps the soak's documents cached where the controls
+  re-prefill them), companion token-gap p99 2447 / 1712 / 2445 ms.
 
 ### v41n (`DSV41_KV_LAYOUT=v41c`, `DSV41_V41C_READER=native`)
 
@@ -94,7 +131,7 @@ process returns its free heap). The fix for [#66](https://github.com/knapcio/Dee
   (allocation only); the key and its knobs are volatile for `DSV41_AUTOTUNE_KEEP`. Tests:
   `tests/test_tokenizer_heap_trim2.py` (CI and the canary-roce image). On the four Sparks (2026-11-06, one A / X / A'
   window, 30-minute soak): launch_server 1.0-3.1 GiB with trim2 against 3.9-4.3 GiB at the controls' soak end, 19
-  trims returning 28 GiB, long-prompt count, companion tok/s and c1 / c4 speed within 1 % of the controls, 0 of 74
+  trims returning 27.8 GiB, long-prompt count, companion tok/s and c1 / c4 speed within 1 % of the controls, 0 of 74
   stable qeval tasks changed; the longest trim held the HTTP event loop 0.79 s (busy trims run between two prompts on
   the thread that just finished a tokenization). The `hooks` receipt is now cumulative and printed again whenever a
   later OpenAI serving class is hooked, so the last line names every hooked method (the first one was printed before
