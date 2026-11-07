@@ -761,7 +761,11 @@ class Profile(unittest.TestCase):
         items = self._production_line().split('"')[1].split()
         self.assertEqual([x for x in items if x.startswith("DSV41_SWA_CONE")],
                          ["DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
-        self.assertEqual(items[-3:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
+        i = items.index("DSV41_SWA_THIN=1")
+        self.assertEqual(items[i:i + 3], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
+        # v2.6.5: only the three v41n keys and the tokenizer heap trim follow the cone
+        self.assertEqual(items[i + 3:], ["DSV41_KV_LAYOUT=v41c", "DSV41_V41C_ARM=1", "DSV41_V41C_READER=native",
+                                         "DSV41_TOKENIZER_HEAP=trim2"])
 
     def test_code_default_is_the_production_chunk(self):
         self.assertEqual(C.DEFAULT_TOKENS, 8192)

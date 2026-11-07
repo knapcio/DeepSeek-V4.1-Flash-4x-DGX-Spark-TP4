@@ -247,6 +247,18 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    # DSV41_KV_LAYOUT=v41c: V4.1 FP4 extra records (288 B) are transcoded to
+    # V4 64-token pages (only what this call reads), then the stock prefill.
+    if extra_kv_u8 is not None and extra_kv_u8.shape[-1] == 288:
+        from .dsv41_v41c import is_fp4 as _v41c_is_fp4, prefill as _v41c_prefill
+
+        if _v41c_is_fp4(extra_kv_u8):
+            output = _v41c_prefill(
+                q2, kv_64, idx, softmax_scale, topk_length=topk_length,
+                attn_sink=attn_sink, extra_fp4=extra_kv_u8, extra_idx=extra_idx,
+                extra_topk_length=extra_topk_length, head_dim_v=head_dim_v,
+            )
+            return (output.unsqueeze(1), None)
     # DSV41_PREFILL_NATIVE_EXTRA=1: the extra source's native 128/256-token
     # pages go straight to a module instantiated for them (no extra split
     # buffer). Default OFF: the stock path below, unchanged.
@@ -689,6 +701,20 @@ def _flash_mla_flashinfer(
     else:
         mid_out = None
         mid_lse = None
+
+    # DSV41_KV_LAYOUT=v41c: V4.1 FP4 extra records (288 B) are read by the
+    # v41c decode kernel, which transcodes them to V4 rows in its IO warp.
+    if extra_kv_64 is not None and extra_kv_64.shape[-1] == 288 and B <= _FI_DECODE_MAX_TOKENS:
+        from .dsv41_v41c import decode as _v41c_decode, is_fp4 as _v41c_is_fp4
+
+        if _v41c_is_fp4(extra_kv_64):
+            _v41c_decode(
+                q.squeeze(1) if q.ndim == 4 else q, kv_64, idx, mid_out, mid_lse, output,
+                out_lse, softmax_scale, topk_length=topk_length, attn_sink=attn_sink,
+                extra_kv=extra_kv_64, extra_indices=extra_idx,
+                extra_topk_length=extra_topk_length,
+            )
+            return (output.unsqueeze(1), None)
 
     _sparse_mla_sm120_paged_attention(
         q.squeeze(1) if q.ndim == 4 else q,

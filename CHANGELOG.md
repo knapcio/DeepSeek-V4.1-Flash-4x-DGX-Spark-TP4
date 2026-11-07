@@ -1,6 +1,143 @@
 # Changelog
 
-## Unreleased
+## 2026-11-07 v2.6.5
+
+v2.6.4 plus three changes. The production profile in `.env.tp4.example` adds `DSV41_KV_LAYOUT=v41c
+DSV41_V41C_ARM=1 DSV41_V41C_READER=native` ("v41n": the compressed KV records in SGLang's V4.1 FP4 layout, read in
+place) with the KV pool pinned at `MAX_TOTAL_TOKENS=8541952` at `MEM_FRACTION_STATIC=HEAD_MEM_FRACTION_STATIC=0.85`, and `DSV41_TOKENIZER_HEAP=trim2` (the head's tokenizer
+process returns its free heap). The fix for [#66](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/66)
+(named loop-abort exit, broken tool calls in the history) is on by default. All new keys are volatile for
+`DSV41_AUTOTUNE_KEEP` (no re-tune when toggled; the pool size is out of the fingerprint too). The full KV pool is
+8,541,952 tokens: +69 % against v2.6.2's ~5.06M and x2.3-2.5 against v2.6.4's 3.44-3.70M, eight 1M-token contexts
+instead of three. The price is host memory on the head: its lowest MemAvailable was 5.72 GiB in the memory ladder's
+stress cells (eight 1M-token prompts resident at once) against 8.87-9.32 GiB at 5,130,752 / fraction 0.78. Rollback
+is config only (the v2.6.4 values, below).
+
+- **KV pool 3.44-3.70M -> 8,541,952 tokens (x2.3), measured.** Memory ladder on the four Sparks, first
+  `~/ds-gate/mlad-v264np-20261106/run-20261106-090824-539338` (2026-11-06; production's fraction 0.78, tails 384,
+  trim2 in every boot): two v2.6.4 control boots (pools 3,700,480 / 3,447,040) and two boots of this release's code at
+  the pin (5,130,752 granted on both). With four 1M-token prompts resident at once (controls: three) and the long-prompt
+  soak, the head's lowest MemAvailable was 9.32 / 8.87 GiB (controls 9.28 / 10.25), NVRM 0, swap 0, every 1M needle
+  retrieved. Then the bigger rungs at fraction 0.85 (at 0.78 v41n's budget is 6,098,432 / 6,194,944 tokens, so a larger
+  pin would not bind), `~/ds-gate/mlad-v264nx-20261106/run-20261106-173315-3341279`: 8,000,000 SAFE (head low-water
+  5.96 GiB, 7 / 7 1M needles at once, NVRM 0) and **8,541,952 SAFE** (head low-water 5.72 GiB, 8 / 8 1M needles resident
+  at once, a cold 1M prefill and the soak, NVRM 2: one line each on two workers during the 8 x 1M cell; speed against
+  the faster reference control c1 0.998 / c4 0.998 / c16 0.994 / stress 1.018 / cold 1M 1.008): verdict X-SAFE-POOL
+  8,541,952. The fraction 0.85 leaves the 8192-token prefill chunk less spare memory than 0.78 did; that run's 1M
+  prefills passed at it. The first window's verdict was INCONCLUSIVE on control-vs-control drift only (a slow control, a different control pool); the candidate rules
+  all passed and the review accepted it (`diagnostics/ds-mem-audit-20261029/v264nx-20261106/REVIEW-DECISION-v264np-20261106.md`
+  in the workspace).
+- **Speed, measured** (same run, c1 / c4 / c16 tok/s): candidates 77.09 / 131.89 / 211.6 and 77.17 / 133.88 /
+  214.73, controls 77.01 / 131.71 / 212.18 and 77.20 / 127.6 / 205.24; the worst candidate cell against the faster
+  control is c16 0.997. The capacity A/Bs of 2026-11-03..05 (12 boots, tails 128) put v41n's real cost at c16
+  -0.4..-0.8 %, c1 / c4 / prose within +-0.1 %, cold 1M prefill +1.6 %.
+- **Exactness.** v41n's readers rebuild the V4 operand bytes: on one GB10 decode, prefill and swan are bit-equal to
+  V4 (38 / 38 layers); in TP4 serving the KLD against the control is inside control-vs-control (0.0031-0.0053 vs
+  0.0073 / 0.0076) and qeval 71 / 71 / 71 (capacity A/Bs). The cone replay copies the V4.1 FP4 pages and masks their
+  replay writes (`tests/test_swa_cone_v41c.py`); on the fleet the evicted-resume cell replayed one 8192-row chunk on all
+  four nodes in every ladder boot (TTFT 2.07-2.13 s at 302K tokens). In the release gate (below) the replayed
+  resume's 16 output tokens equal a v2.6.2 control's token for token.
+- **Tokenizer heap, measured.** In the trim A/B (`~/ds-gate/trim-20261106/run-20261106-023911-3456984`, 30-minute
+  long-prompt soak; verdict INVALID on a pool mismatch and a receipt bug, fixed since): launch_server 1.0-3.1 GiB with
+  trim2 against 3.9-4.3 GiB at the controls' soak end, 19 trims returning 27.8 GiB, 0 of 74 stable qeval tasks
+  changed, long-prompt count, companion and c1 / c4 speed within 1 %. In the ladder's four boots: 16-18 trims each,
+  17.7-20.1 GiB returned. Cost: a busy trim runs on the HTTP event loop, so under back-to-back long prompts token
+  delivery pauses up to 0.69-0.90 s about once per 2 minutes (the GPUs keep decoding).
+- **Rollback, config only:** unset `DSV41_KV_LAYOUT`, `DSV41_V41C_ARM`, `DSV41_V41C_READER` and set
+  `MAX_TOTAL_TOKENS=8000000` and the fraction 0.78 (v2.6.4); unset `DSV41_TOKENIZER_HEAP` on its own; `DSV41_LOOP_NAMED_EXIT=0` /
+  `DSV41_HISTORY_REPAIR=0` restore v2.6.4's loop exit / the HTTP 400.
+- **Credits:** v41n's in-place readers extend FlashInfer's SM120 sparse-MLA kernels (NVIDIA, BSD-3-Clause) and write
+  through SGLang's own V41_FP4 layout (Apache-2.0); the design idea of copying raw FP4 records asynchronously and
+  dequantizing across many warps is Christopher Owen's ([christopherowen](https://github.com/christopherowen),
+  spark-ds41f). The #66 fix is Alexander Busse's ([GanyX19](https://github.com/GanyX19)) MiaAI-Lab#55, reported here by
+  [slidonnici](https://github.com/slidonnici) (details below).
+
+Release gate: PASS (run `run-20261106-214411-640735`, 2026-11-06 / 07, 277 min including the restore of production;
+0 KILL, 0 INVALID). v2.6.2 / v2.6.5 / v2.6.2, three fresh boots in that order, abliterated 1017 `517efab`; the
+controls are production v2.6.2 as it serves (tails 128, no pin, fraction 0.78). The v2.6.5 boot ran the v2.6.4 gate
+image with this release's files overlaid (the module `00505fe850b7` unchanged), launched with `--swa-prefix-tails
+384`, `MAX_TOTAL_TOKENS=8541952` and the fraction 0.85; the #66 switches at their defaults. Speedbench 0.3 full,
+median of two runs: greedy c1 all-prompt geomean 88.91 / 89.91 / 88.77 and prose 65.49 / 66.11 / 65.34 tok/s, c4
+131.39 / 132.08 / 131.33 aggregate tok/s; sampled (T 0.7, top-p 0.95, one run per cell) c1 84.85 / 85.77 / 85.00 and
+prose 62.26 / 62.58 / 62.73 tok/s, c4 127.62 / 129.24 / 127.99 aggregate tok/s; speedbench load c16 213.65 / 217.44 /
+216.81 aggregate tok/s. Cold 64K prefill 6182 / 6198 / 6210 tok/s (median of three flushed prompts); a cold
+388K-token prompt's first token 63.5 / 64.1 / 63.3 s (median of three); a short request beside a 131,072-token
+prefill 0.44 / 0.45 / 0.43 s. qeval 71 / 71 / 71; at T = 0 the v2.6.5 outputs equal the controls' on all 74 of the
+75 prompts on which the two controls agree. KLD long 0.0049 and short 0.00459 (control vs control 0.00485 / 0.00531;
+PASS); T = 1 distribution check PASS (12,000 samples); 1M needle (968,707 tokens) found in 186.9 s. Median first
+token after 60 s idle 188.8 / 190.8 / 189.5 ms; idle RDMA proxy CPU summed over the four nodes 9.45 / 2.13 / 9.25 % of
+a core (v2.6.2 has no idle park). Every rank of the v2.6.5 boot logged the v41n pool (912.25 B per full token,
+8,541,952 tokens) and its native reader, SWA thin, the cone replay, the decode yield, the #66 named exit and the
+history repair as installed, and trim2 was armed in the head's `launch_server` (10 trims, 12,101 MiB returned, longest
+493 ms), with no fallback and no error; the FlashInfer #7676 fence was present on every rank of the v2.6.5 boot.
+- **KV pool:** 4,316,160 / 8,541,952 / 4,552,192 tokens (the controls size their pool from the free memory at boot:
+  4,997,632 / 5,101,824 in the v2.6.4 gate).
+- **Memory:** the head's lowest MemAvailable over the boot 8.77 / 7.15 / 10.22 GiB (the judge's floors: 3.5 GiB KILL,
+  4.0 GiB MARGINAL); at the soak's 15th minute the schedulers held 7.77 / 7.82 / 7.77 GiB and the tokenizer process
+  4.12 / 1.63 / 3.13 GiB; NVRM out-of-memory lines 0 / 0 / 0.
+- **Evicted resume point:** a 302,048-token prompt of natural text (this repository's own files), first the document,
+  then 800 distinct 1K-token prompts that pushed its SWA window out (800 of 800 OK, 149.9 s), then the document plus
+  2,048 tokens. Every node of the v2.6.5 boot replayed one 8,192-row chunk from token 291,328, with 0 reverts: first
+  token 2.21 s, 291,328 tokens cached. The controls answered the same request with a full prefill in 53.3 / 50.8 s.
+  The v2.6.5 output (16 greedy tokens) equals the second control's token for token; the two controls differ from each
+  other after 9 tokens.
+- **Soak** (issue #16 reproduction, seeded document order, plus a c2 companion load): 268 / 307 / 261 requests with 0
+  failures, companion 39.57 / 49.28 / 38.92 tok/s (v2.6.5 keeps the soak's documents cached where the controls
+  re-prefill them), companion token-gap p99 2447 / 1712 / 2445 ms.
+
+### v41n (`DSV41_KV_LAYOUT=v41c`, `DSV41_V41C_READER=native`)
+
+- **v41n on v2.6.4, off by default** (`DSV41_KV_LAYOUT=v41c DSV41_V41C_READER=native`): the ratio-1 / ratio-2
+  compressed KV pools hold SGLang's own V4.1 FP4 records (288 B instead of the 584-byte V4 slot; `adapter/v41c_pool.py`)
+  and the sparse-MLA readers convert them in place (`runtime/flashinfer_v41c`, DSV41_V41C_READER=native). Port of
+  `perf/v41n-cap-atk-20261103` @ `15c3e33` (the capacity A/B branch: v2.6.3 + `perf/v41n-native-reader-20261029`
+  `8531d87` + the autotune_keep fixes `59c719a` / `15c3e33`): `adapter/v41c_pool.py`, the sitecustomize hooks (pool,
+  configurator, backend pins + layer tags), the canary's two v41c routing blocks, the `b12x_next` reference writer
+  arithmetic (`runtime/b12x_next/v41c-provenance.json`, test only), `adapter/autotune_keep.py` (the v41c / v41n keys
+  volatile; `--max-total-tokens` out of the fingerprint; `.launch` kept in the raw-argv form an older adapter reads,
+  `.launch-pool` beside it) and the v41c / v41n tests. `runtime/flashinfer_v41c` is v2.6.4's directory unchanged
+  (module tag `00505fe850b7`: v2.6.4's swan module already carries the v41c / v41n readers), so the module and .so
+  of a v2.6.4 build serve both. With the keys unset nothing of this is imported or routed: the finder list, the
+  canary (minus its v41c blocks) and sitecustomize (minus its v41c branches) are v2.6.4's (tests below).
+- **Autotune.** The v41c / v41n keys are volatile for `DSV41_AUTOTUNE_KEEP`: they change the KV pool layout and the
+  attention readers, never a tuned GEMM / MoE shape; the native reader never tunes and resolves the stock decode-dsv4
+  tactic for each shape from the kept table (`native_tactic`: the runner keeps the stock class name), so a v41n boot
+  must reuse the cache a V4 boot of the same launch tuned (a re-tune would change the MoE tactics and so the numerics
+  it is compared on: the 2026-11-03 capacity A/B, where every arm re-tuned, was invalid for that reason).
+- **SWA cone replay x v41c.** The cone copies every full-page-addressed pool buffer page for page and redirects the
+  replay rows' compressor writes to the padding slot. Under v41c the ratio-1 / ratio-2 buffers are V4.1 FP4 pages
+  (73,728 / 36,864 B per full page, data and scale rows in one row), and the prefill latent write of those pools is
+  `_low_ratio_write_group`'s V41_FP4 branch with the same `slots`. `tests/test_swa_cone_v41c.py` (real SGLang pool
+  construction with the v41c patch, the real `_low_ratio_compress_torch` / `_low_ratio_write_group` on it, CPU writers
+  of the same page ABI at the CUDA leaves): the cone's buffer list equals SGLang's own `get_contiguous_buf_infos` on
+  v41c and V4; the replay rows' FP4 latent and index-key slots are 0 and the copied pages keep their bytes; without
+  the mask the same writes overwrite them; both adapters pin the same engine text; all hooks install together.
+- Tests: `test_v41c_pool.py` (base sitecustomize = v2.6.4's), `test_v41c_reader.py`, `test_v41n_native.py`,
+  `test_v41n_page.py`, `test_v41c_fast.py`, `test_v41_kv_numerics.py`, `test_autotune_keep.py` (cross-adapter reuse),
+  `test_prefill_native_extra.py`, `test_v41c_offsets_64bit.py` (from `fix/v41n-cap-kill-20261105` `4fa4f70`: FP4
+  record addressing stays 64-bit past 2 GiB), `test_swa_cone_v41c.py`; the last runs in the canary-roce build, as
+  `test_v41c_pool.py` does in both canary builds.
+
+### Tokenizer heap trim (`DSV41_TOKENIZER_HEAP=trim2`)
+
+- **New, off by default: `DSV41_TOKENIZER_HEAP=trim2`** (`adapter/heap_trim2.py`). The head's tokenizer process
+  (`launch_server`) keeps the memory it used for long prompts: with several 200K-900K-token prompts in flight its
+  glibc heap grows by GiBs of free but resident pages (v2.6.4 on the four Sparks: 1.9 -> 5.1 / 7.1 GiB in a 15-minute
+  long-prompt soak, still rising; the schedulers flat). trim2 returns it with `malloc_trim(0)`: after >= 256 MiB of
+  new heap, at most once per 120 s, in a gap of the tokenizer (1.5 s without a prompt being rendered or encoded) or,
+  when prompts arrive back to back, 30 s later at the next end of a prompt's tokenization (on that thread, so no prompt
+  is being encoded during the call). The v2.6.3 candidate's `trim` (every 2 s, reverted) released the same pages over
+  and over and cost long prompts 17 % of their throughput; trim2's interval bounds that cost. Outputs are unchanged
+  (allocation only); the key and its knobs are volatile for `DSV41_AUTOTUNE_KEEP`. Tests:
+  `tests/test_tokenizer_heap_trim2.py` (CI and the canary-roce image). On the four Sparks (2026-11-06, one A / X / A'
+  window, 30-minute soak): launch_server 1.0-3.1 GiB with trim2 against 3.9-4.3 GiB at the controls' soak end, 19
+  trims returning 27.8 GiB, long-prompt count, companion tok/s and c1 / c4 speed within 1 % of the controls, 0 of 74
+  stable qeval tasks changed; the longest trim held the HTTP event loop 0.79 s (busy trims run between two prompts on
+  the thread that just finished a tokenization). The `hooks` receipt is now cumulative and printed again whenever a
+  later OpenAI serving class is hooked, so the last line names every hooked method (the first one was printed before
+  `serving_chat` was imported and named only the base).
+
+### Loop-abort exit and history repair (#66; on main since 540bf07)
 
 A loop-aborted request now ends as a named error instead of a normal stop, and a request whose history holds a
 broken tool call is no longer rejected with HTTP 400 ([#66](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4/issues/66)).

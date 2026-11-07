@@ -48,7 +48,9 @@ RUN FI_DIRS="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_
  && python3 -m sglang.kernels.ops.attention.dsv41_pce verify
 # DSV41_SWA_NATIVE_DECODE (module default off; on in the production profile since v2.6.4): FlashInfer's sparse-MLA
 # decode at the SWA pool's own 256-token pages. One module with all six sources of runtime/flashinfer_v41c (the
-# swan kernel plus v41c / v41n readers that have no caller here): the bytes the TP4 A/Bs ran; ~25 s of nvcc.
+# swan kernel plus the v41c / v41n readers): the bytes the TP4 A/Bs ran; ~25 s of nvcc.
+# DSV41_KV_LAYOUT=v41c (opt-in, default off): the same module's readers for V4.1 FP4 compressed records
+# (adapter/v41c_pool.py allocates the ratio-1/2 pools as those records; DSV41_V41C_READER=native = v41n).
 # The module (runtime/flashinfer_v41c: vendored FlashInfer sources, VENDORED.json) is built here against the same
 # approved FlashInfer closure as the K8 module above, .so sha256 recorded in lib/module.json and checked at load.
 COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py
@@ -183,6 +185,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_roce_idle_park.py \
  && FI7676_EXPECT=patched python3 /opt/dsv41/tests/test_fi7676_fence.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_moe_launch_prepared.py \
+ && CUDA_VISIBLE_DEVICES= SGLANG_CANARY_PY=/sgl-workspace/sglang/python python3 /opt/dsv41/tests/test_v41c_pool.py \
  && cd /opt/dsv41/tests && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_chunked_v3.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_nosync.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 # SGLANG_RUST_BUILD_MODE=never still probes `cargo --version --verbose`, and rustup can
@@ -200,6 +203,11 @@ RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_adapter_engine_pins.py
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py
 # DSV41_SWA_CONE_REPLAY on the real UnifiedRadixCache (CPU): engine pins, the cone flow, the hook install.
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone.py
+# The cone x DSV41_KV_LAYOUT=v41c: the page copy covers the V4.1 FP4 pools, the replay rows' FP4 writes go to slot 0.
+RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone_v41c.py
+# DSV41_TOKENIZER_HEAP=trim2 (CPU, off by default): the hook targets and every prompt encode on this engine tree, the
+# hooks on the real classes, the trimmer's gates and the real glibc heap.
+RUN CUDA_VISIBLE_DEVICES= DSV41_TRIM2_SGLANG_ROOT=/sgl-workspace/sglang/python/sglang python3 /opt/dsv41/tests/test_tokenizer_heap_trim2.py
 EXPOSE 8888
 HEALTHCHECK --interval=30s --timeout=30s --start-period=30m --retries=3 \
     CMD ["python3", "-S", "/opt/dsv41/boot.py", "health"]

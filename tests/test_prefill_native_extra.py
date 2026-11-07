@@ -345,9 +345,11 @@ class Loader(unittest.TestCase):
 
 class AdapterText(unittest.TestCase):
     def test_default_off_is_f744d83_plus_block(self):
-        # the canary also carries the DSV41_SWA_NATIVE_DECODE block (tests/test_swa_native_decode.py pins it)
+        # on the v41c branch the canary also carries the DSV41_KV_LAYOUT=v41c blocks (tests/test_v41c_reader.py) and
+        # the DSV41_SWA_NATIVE_DECODE block (tests/test_swa_native_decode.py)
         s = re.sub(r"    # DSV41_SWA_NATIVE_DECODE=1 \(opt-in, default off\):.*?return _swan_out\n\n", "",
                    CANARY.read_text(), count=1, flags=re.S)
+        s = re.sub(r"    # DSV41_KV_LAYOUT=v41c:.*?return \(output\.unsqueeze\(1\), None\)\n(\n)?", "", s, flags=re.S)
         self.assertEqual(s.count(CANARY_BLOCK), 1)
         self.assertEqual(_sha(s.replace(CANARY_BLOCK, "").encode()), CANARY_F744D83_SHA)
 

@@ -2462,6 +2462,25 @@ def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def mul_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """IEEE round-to-nearest f32 product (mul.rn.f32), never contracted into an FMA.
+
+    Reproduces a host-side f32 multiply bit for bit (e.g. torch's
+    ``amax * (1.0 / 6.0)`` on an f32 tensor, the scalar rounded to f32 first).
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 def div_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
     """IEEE round-to-nearest f32 division (div.rn.f32).
 
