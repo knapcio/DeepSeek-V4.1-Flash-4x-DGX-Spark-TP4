@@ -317,9 +317,44 @@ def sps_table_args(table, env=None):
     ]
 
 
+# v2.7: knobs whose modules were built from FlashInfer 0.6.18's sparse_mla_sm120 closure (runtime/flashinfer_pce,
+# runtime/flashinfer_v41c). FlashInfer >= 0.7 reads the V4.1 records and the pools' own page sizes natively
+# (SGLANG_DSV4_KV_LAYOUT=v41); an old profile must stop here, not at the first forward.
+FI0618_ONLY_KNOBS = {
+    'DSV41_KV_LAYOUT': ('v41c',),
+    'DSV41_SWA_NATIVE_DECODE': ('1',),
+    'DSV41_PREFILL_NATIVE_EXTRA': ('1',),
+}
+
+
+def flashinfer_version(default='unknown'):
+    try:
+        from importlib.metadata import version
+        return version('flashinfer-python')
+    except Exception:
+        return default
+
+
+def retired_fi0618_knobs(env=None, fi_version=None):
+    """The FlashInfer-0.6.18-only knobs set in env when the installed FlashInfer is 0.7 or newer ([] otherwise)."""
+    env = os.environ if env is None else env
+    fi_version = flashinfer_version() if fi_version is None else fi_version
+    try:
+        major_minor = tuple(int(x) for x in fi_version.split('.')[:2])
+    except ValueError:
+        return []
+    if major_minor < (0, 7):
+        return []
+    return sorted(f'{k}={env[k]}' for k, bad in FI0618_ONLY_KNOBS.items() if env.get(k, '').strip() in bad)
+
+
 def serve():
     mode = os.environ.get('OFFLOAD_MODE', 'nvme')
     assert mode in ('nvme', 'ram'), 'OFFLOAD_MODE must be nvme or ram'
+    retired = retired_fi0618_knobs()
+    assert not retired, (
+        f'FlashInfer {flashinfer_version()} has no FlashInfer-0.6.18 modules for {retired}; '
+        'use SGLANG_DSV4_KV_LAYOUT=v41 (v2.7) or the v2.6.5 image')
     context = int(os.environ.get('CONTEXT_LENGTH', '409600'))
     assert 4096 <= context <= 1048576, 'Context must be 4096 through the model limit 1048576'
     gpu = _gpu_lines()

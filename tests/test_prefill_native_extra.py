@@ -350,6 +350,11 @@ class AdapterText(unittest.TestCase):
         s = re.sub(r"    # DSV41_SWA_NATIVE_DECODE=1 \(opt-in, default off\):.*?return _swan_out\n\n", "",
                    CANARY.read_text(), count=1, flags=re.S)
         s = re.sub(r"    # DSV41_KV_LAYOUT=v41c:.*?return \(output\.unsqueeze\(1\), None\)\n(\n)?", "", s, flags=re.S)
+        # v2.7: the native V4.1 reader route (sglang#45851 port, tests/test_v27_fi07_guard.py) and its `import os`
+        s = s.replace("import logging\nimport math\nimport os\n", "import logging\nimport math\n", 1)
+        s = re.sub(r"    if k_cache\.shape\[-1\] == _V41_MAIN_BYTES:.*?extra_topk_length,\n        \)\n\n", "", s, count=1,
+                   flags=re.S)
+        s = re.sub(r"_V41_MAIN_BYTES = 528 .*?return \(output\.unsqueeze\(1\), None\)\n\n\n", "", s, count=1, flags=re.S)
         self.assertEqual(s.count(CANARY_BLOCK), 1)
         self.assertEqual(_sha(s.replace(CANARY_BLOCK, "").encode()), CANARY_F744D83_SHA)
 
@@ -359,6 +364,8 @@ class AdapterText(unittest.TestCase):
         self.assertLess(fn.index("kv_64 = ("), fn.index(CANARY_BLOCK))
         self.assertLess(fn.index(CANARY_BLOCK), fn.index('buffer_tag="extra"'))
 
+    @unittest.skip("v2.7 (FlashInfer 0.7.x): the K8 module is retired from both recipes (0.7 takes runtime extra page "
+                   "sizes); tests/test_v27_fi07_guard.py checks the retirement. TODO(v2.7): delete with the module.")
     def test_dockerfiles_install_and_generate(self):
         for name in ("Dockerfile.canary", "Dockerfile.canary-roce"):
             t = (ROOT / name).read_text()

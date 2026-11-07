@@ -559,6 +559,8 @@ class Profile(unittest.TestCase):
         self.assertIn('SWAN_ENV = "DSV41_SWA_NATIVE_DECODE"', src)
         self.assertIn('if raw in ("", "0", "off", "false", "no"):\n        return False', src)
 
+    @unittest.skip("v2.7 (FlashInfer 0.7.x): the swan module is retired from both recipes (0.7 decodes the SWA pool's "
+                   "own pages); tests/test_v27_fi07_guard.py checks the retirement. TODO(v2.7): delete with the module.")
     def test_dockerfiles_build_and_verify_the_module(self):
         for name in ("Dockerfile.canary", "Dockerfile.canary-roce"):
             d = (ROOT / name).read_text()

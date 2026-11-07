@@ -17,6 +17,24 @@ FROM ${BASE_IMAGE}
 # Same mirror knob as Dockerfile.canary (Saolence, #6): --build-arg PIP_INDEX=<mirror>/simple
 ARG PIP_INDEX=https://pypi.org/simple
 RUN pip install --no-deps --no-cache-dir -i "$PIP_INDEX" "sglang-kernel==0.4.7" "sgl-deep-gemm==0.2.0"
+# v2.7 (perf/v27-fi07-20261107): FlashInfer 0.7.2 (git d84335d8) replaces the base image's 0.6.18. 0.7.2 reads the
+# DeepSeek-V4.1 caches natively on SM120/SM121 (#5197: KVLayout.V41 528-byte main + V41_FP4 288-byte extra, runtime
+# page sizes; sglang#45851 route in flash_mla_sm120.canary.py) and keeps CUTLASS DSL >= 4.6.2a0, so b12x_next and the
+# SG17 RoCE kernels compile from the same DSL as v2.6.5. The jit-cache wheel carries the sm_121a sparse_mla_sm120 module
+# prebuilt (sha256 2db58ddc..., 13 sm_121a cubins; the same module also JIT-builds from source with this image's
+# nvcc 13.0 in ~25 s, diagnostics/v27-fi07-20261107/m1). Dependency floors that moved since 0.6.18: apache-tvm-ffi
+# >= 0.1.11, nccl4py >= 0.4.1, nvidia-cudnn-frontend >= 1.31.0, nccl-extensions >= 0.1.0 (new).
+# TODO(v2.7 M2): pin each wheel by sha256 (--require-hashes) once the base's own versions are read from the image;
+# make `pip check` fatal after that.
+ARG FLASHINFER_VERSION=0.7.2
+ARG FLASHINFER_COMMIT=d84335d8c54e0c8f9f7e22faa15c7e34a58abf94
+ARG FLASHINFER_JIT_INDEX=https://flashinfer.ai/whl/cu130
+RUN pip install --no-deps --no-cache-dir -i "$PIP_INDEX" "flashinfer-python==${FLASHINFER_VERSION}" "flashinfer-cubin==${FLASHINFER_VERSION}" \
+      "nccl-extensions>=0.1.0" "nvidia-cudnn-frontend>=1.31.0" \
+ && pip install --no-deps --no-cache-dir -i "$PIP_INDEX" --extra-index-url "${FLASHINFER_JIT_INDEX}" \
+      "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130" \
+ && python3 -c "import flashinfer, sys; v, c = flashinfer.__version__, flashinfer.__git_commit__; print('flashinfer', v, c); sys.exit(0 if (v, c) == ('${FLASHINFER_VERSION}', '${FLASHINFER_COMMIT}') else 'flashinfer identity mismatch')" \
+ && (pip check 2>&1 | grep -i -E "flashinfer|tvm|nccl4py|cudnn|cutlass" || true)
 RUN rm -rf /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/python /sgl-workspace/sglang/python
 RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark; print('import ok')"
@@ -36,32 +54,15 @@ COPY adapter /opt/dsv41/adapter
 RUN g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread \
     adapter/row_store.cpp -o adapter/librow_store.so
 COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-# DSV41_PREFILL_NATIVE_EXTRA (opt-in, default off): prefill reads the extra cache's native 128/256-token pages through
-# a separate FlashInfer module generated from THIS image's sparse_mla_sm120 sources; anchor drift fails the build.
-COPY runtime/flashinfer_pce/dsv41_pce.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_pce.py
-COPY runtime/flashinfer_pce/gen_pce_sources.py runtime/flashinfer_pce/APPROVED_CLOSURE.json /opt/dsv41/runtime/flashinfer_pce/
-# The generator refuses unless the image's whole sparse_mla_sm120 source closure is the approved one; the module is then
-# compiled here (sm_121a, no GPU needed) and served from the image with its sha256 checked (no JIT at boot).
-RUN FI_DIRS="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR)')" \
- && python3 /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py $FI_DIRS /opt/dsv41/runtime/flashinfer_pce/gen \
- && FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_pce build \
- && python3 -m sglang.kernels.ops.attention.dsv41_pce verify
-# DSV41_SWA_NATIVE_DECODE (module default off; on in the production profile since v2.6.4): FlashInfer's sparse-MLA
-# decode at the SWA pool's own 256-token pages. One module with all six sources of runtime/flashinfer_v41c (the
-# swan kernel plus the v41c / v41n readers): the bytes the TP4 A/Bs ran; ~25 s of nvcc.
-# DSV41_KV_LAYOUT=v41c (opt-in, default off): the same module's readers for V4.1 FP4 compressed records
-# (adapter/v41c_pool.py allocates the ratio-1/2 pools as those records; DSV41_V41C_READER=native = v41n).
-# The module (runtime/flashinfer_v41c: vendored FlashInfer sources, VENDORED.json) is built here against the same
-# approved FlashInfer closure as the K8 module above, .so sha256 recorded in lib/module.json and checked at load.
-COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py
-COPY runtime/flashinfer_v41c/csrc /opt/dsv41/runtime/flashinfer_v41c/csrc
-COPY runtime/flashinfer_v41c/include /opt/dsv41/runtime/flashinfer_v41c/include
-COPY runtime/flashinfer_v41c/VENDORED.json /opt/dsv41/runtime/flashinfer_v41c/VENDORED.json
-RUN FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_v41c build \
- && python3 -m sglang.kernels.ops.attention.dsv41_v41c verify
+# v2.7: the K8 / PCE module (runtime/flashinfer_pce) and the v41c / v41n / swan module (runtime/flashinfer_v41c) are
+# retired here. Both were generated from or checked against FlashInfer 0.6.18's approved sparse_mla_sm120 closure and
+# the v41c glue calls five 0.6.18 privates that 0.7.x removed (_get_sparse_mla_decode_dsv4_module, ...). FlashInfer
+# 0.7.x itself reads the V4.1 records (DSV41 v41n's job), takes runtime page sizes (swan's and K8's job).
+# TODO(v2.7 M2): delete the sources and their tests once the native-V41 profile passes its gate; until then a profile
+# that still sets DSV41_KV_LAYOUT=v41c, DSV41_SWA_NATIVE_DECODE=1 or DSV41_PREFILL_NATIVE_EXTRA=1 must refuse at boot.
 # FlashInfer PR #7676 (issue #7675, Thireus): one proxy fence after producer_acquire in the b12x SM120/SM121 dense GEMM
-# that every MXFP8 dense linear runs (adapter/mxfp8_b12x.py). The patcher only edits the pinned 0.6.18 file (sha256
-# before and after); any other FlashInfer fails the build. CuTe DSL compiles the kernel in-process at first use.
+# that every MXFP8 dense linear runs (adapter/mxfp8_b12x.py). The patcher only edits a pinned file (sha256 before
+# and after: 0.6.18's, or the 0.7.2 / 0.7.3 file = the PR's base blob); any other FlashInfer fails the build. CuTe DSL compiles the kernel in-process at first use.
 COPY runtime/flashinfer_fi7676 /opt/dsv41/runtime/flashinfer_fi7676
 RUN python3 /opt/dsv41/runtime/flashinfer_fi7676/apply_fi7676.py \
  && python3 /opt/dsv41/runtime/flashinfer_fi7676/apply_fi7676.py --check

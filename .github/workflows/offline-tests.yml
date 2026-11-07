@@ -68,6 +68,8 @@ jobs:
             tests/test_remote_dotenv.py \
             tests/test_upstream_launcher_ports.py \
             tests/test_adapter_engine_pins.py
+          python3 tests/test_v27_fi07_guard.py
+          python3 tests/test_fi7676_fence.py
       - name: Engram row store (Linux)
         if: runner.os == 'Linux'
         run: |
