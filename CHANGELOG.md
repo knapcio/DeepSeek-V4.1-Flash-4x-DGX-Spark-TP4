@@ -1,24 +1,47 @@
 # Changelog
 
-## Unreleased (v2.6.6 candidates, off by default)
+## v2.6.6 (candidate; release gate pending)
 
-Two opt-in ports from Eric Jinho Jang (dealign.ai),
-[jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark](https://github.com/jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark)
-commits `c175335` / `a9f87fe` (AGPL-3.0-or-later, modifications of this repository's files). Neither is in any profile
-line; both keys are volatile for `DSV41_AUTOTUNE_KEEP`. Not measured on GB10 yet.
+v2.6.5 plus three changes; the KV pool pin (8,541,952 tokens at fraction 0.85), the image's SGLang tree and FlashInfer
+0.6.18 are unchanged.
 
-- **`DSV41_SWA_PROMPT_TAIL_KEEP=<tokens>`** (`adapter/swa_prompt_tail.py`; theirs: 1024): the prompt-end insert
-  keeps the last N prompt tokens' SWA live instead of one page, so a revisit whose common prefix ends a few tokens
-  before the previous prompt's end (a chat turn with a new question) matches there on its 2nd visit instead of the
-  3rd. CPU test on the real UnifiedRadixCache (`tests/test_swa_prompt_tail.py`): document + new question, reuse
-  stock 0 / 0 / 40 tokens on visits 1-3, with the module 0 / 40 / 40. Difference against theirs: their floor also
-  stopped every decode-time SWA free once the tree owned the prompt end (a request held N + its whole output in SWA);
-  here decode frees stay stock then, and a still request-owned prompt end is held for at most
-  `DSV41_SWA_PROMPT_TAIL_HOLD` (8192) tokens. Chunked inserts (and so the cone replay's first insert) are stock.
-- **`DSV41_PREFILL_TRIM=1`** (`adapter/prefill_empty_cache.py`): instead of `torch.cuda.empty_cache()` after every
-  long prefill chunk, the last long forward's transient working set stays cached and only cached-but-free memory
-  beyond it + `DSV41_PREFILL_TRIM_GIB` (1) is returned, at most every `DSV41_PREFILL_TRIM_EVERY_S` (10). Allocation
-  only. Unset, the per-chunk `empty_cache` is unchanged.
+- **SWA prompt tail in the production profile: `DSV41_SWA_PROMPT_TAIL_KEEP=1024`** (`adapter/swa_prompt_tail.py`;
+  the hold `DSV41_SWA_PROMPT_TAIL_HOLD` stays at its default 8192). A prompt-end insert used to keep one page (256
+  tokens) of live SWA below the prompt's last full page, so a revisit whose shared prefix ends earlier (a document or a
+  chat turn with a new question) found no live window to end its match on: it re-prefilled from 0 on its 2nd visit
+  and hit only from the 3rd. Now the prompt end keeps 1024 tokens of live SWA. Port of Eric Jinho Jang's (dealign.ai)
+  prompt-tail floor ([jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark](https://github.com/jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark)
+  `c175335` / `a9f87fe`, AGPL-3.0-or-later), redesigned: their floor also stopped every decode-time SWA free once the
+  tree owned the prompt end (a request held N + its whole output in SWA); here decode frees stay stock then, and a
+  still request-owned prompt end is held for at most 8192 tokens; chunked inserts (and so the cone replay's first
+  insert) are stock. Screen on the four Sparks (`run-20261107-140633-3102469`, A / TK / A' on v2.6.5): token-exact
+  revisits with a new 192-token question cached 2048 of 2112 shared tokens (97.0 %, first token 0.24 s instead of
+  0.53 s) at 2k and 6144 of 6208 (98.97 %, 0.25 s instead of 1.16 s) at 6k where v2.6.5 cached 0; a 6k chat turn 2
+  97.3 % cached; c1 x1.005 and c4 x1.011 of the slower control; qeval 71 / 71 / 71 with no task outside the controls'
+  bracket; head low-water 6.35 GiB. Cost: each cached prompt end holds up to 1280 SWA slots instead of 256 (the 384
+  prefix tails' headroom is shared with them). Outputs and the pool are unchanged; the key is volatile for
+  `DSV41_AUTOTUNE_KEEP` (no re-tune). Rollback, config only: unset it.
+- **NCCL 2.30.7 with NVIDIA/nccl #2393 in the canary-roce image** (no version bump). An `nccl-builder` stage rebuilds
+  the base image's NCCL version (v2.30.7-1, `73cf112`) for sm_121 with Stanislav Bardyuk's backport of
+  [NVIDIA/nccl #2393](https://github.com/NVIDIA/nccl/pull/2393) (`patches/nccl-2393-aarch64-cts-fence.patch`, until
+  now only in the switchless-ring build): one acquire fence in `ncclIbIsend`, so a weakly ordered CPU cannot read a
+  peer's CTS `nreqs` before the index check that guards it. The image replaces the wheel's `libnccl.so.2` (the path
+  torch resolves) and checks the version, the fence and the library against the builder's receipt
+  (`scripts/nccl_receipt.py`, `/opt/dsv41/files/nccl-2393.json`). Stage the source with `scripts/fetch-nccl.sh`.
+  A/B on the four Sparks (`run-20261107-080134-2137538`, A / X / R / A', R = the same rebuild without the patch):
+  all-reduce bus bandwidth x0.9998 of stock at the worst size from 8 to 256 MiB, reduction results bit-equal at every
+  size, cold 64K x1.021 and 1M x1.0017, no stable qeval item changed and the one item that had differed in the first
+  run returned the production output on 5 of 5 replays. A newer NCCL release was reported to transfer ~15 % slower on
+  this hardware, so the version stays 2.30.7 and only the fence is added.
+- **Launcher fix: `NCCL_OVERLAY_PIP=1` on a switched fabric.** The head honoured the overlay only with
+  `NCCL_SWITCHLESS_RING_ONLY=1` and otherwise put `NCCL_HOST_DIR` on `LD_LIBRARY_PATH`, which torch ignores (it resolves
+  `libnccl.so.2` through its RPATH), while every worker mounted the library over the pip NCCL: the head and the
+  workers ran different NCCL builds. The head now mounts NCCL exactly as the workers do, and `serve` checks the NCCL
+  switches with the ring off too. With the overlay off the launch arguments are unchanged.
+- **Dropped:** the working-set-preserving prefill trim (`DSV41_PREFILL_TRIM`, from the same jjang-ai commits) was
+  screened in the same window and not adopted: the head's lowest free memory fell to 9.02 GiB at 64K and 4.82 GiB at
+  388K against 11.63-12.01 and 10.30-10.70 GiB on the controls, for +3 % prefill measured at 64K only. The code is not
+  in this release.
 
 ## 2026-11-07 v2.6.5
 

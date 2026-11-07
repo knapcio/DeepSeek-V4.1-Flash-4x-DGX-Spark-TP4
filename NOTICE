@@ -24,7 +24,11 @@ Third-party components and their licences:
   image installs it through runtime/patch_v41_tool_constraint.py.
 - patches/nccl-2393-aarch64-cts-fence.patch is Stanislav Bardyuk's change from
   NVIDIA/nccl PR #2393 (commit b85c5d9c4aa5), backported to NCCL v2.30.7-1;
-  Apache License 2.0 (LICENSE.sglang contains the same Apache-2.0 text).
+  Apache License 2.0 (LICENSE.sglang contains the same Apache-2.0 text). Since v2.6.6 the
+  canary-roce image builds NCCL v2.30.7-1 (NVIDIA, Apache License 2.0 with parts under their
+  original BSD licence, see its LICENSE.txt; source fetched by scripts/fetch-nccl.sh, not
+  redistributed here) with this patch and installs it in place of the wheel's library; the build
+  stage follows christopherowen/spark-ds41f's NCCL recipe (make src.build for sm_121).
 - runtime/b12x/b12x/comm/roce_ring is the path-aware RoCEnante package of
   FujitsuPolycom/sparkring (commit f16b5f4), itself derived from local-inference-lab/b12x
   (RoCEnante, PR 295); Apache License 2.0 (runtime/b12x/LICENSE). Origin and local
@@ -89,12 +93,11 @@ Third-party components and their licences:
   PR 55 by Alexander Busse (GanyX19), upstream commit bdf657c (issue 54), contributed there under
   the AGPL-3.0 and ported here unchanged under the same licence. The stall it fixes on this
   repository was reported by slidonnici (issue 66).
-- adapter/swa_prompt_tail.py (DSV41_SWA_PROMPT_TAIL_KEEP) and the DSV41_PREFILL_TRIM path of
-  adapter/prefill_empty_cache.py are ported from Eric Jinho Jang (dealign.ai),
-  jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark, commits c175335 / a9f87fe
-  (adapter/swa_evict_internal_first.py `install_prompt_tail_floor`, adapter/prefill_empty_cache.py: the
-  SWA prompt-tail floor and the working-set-preserving prefill trim), AGPL-3.0-or-later, themselves
-  modifications of this repository's AGPL files; the port's changes are described in the file headers.
+- adapter/swa_prompt_tail.py (DSV41_SWA_PROMPT_TAIL_KEEP, in the production profile since v2.6.6) is
+  ported from Eric Jinho Jang (dealign.ai), jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark,
+  commits c175335 / a9f87fe (adapter/swa_evict_internal_first.py `install_prompt_tail_floor`: the SWA
+  prompt-tail floor), AGPL-3.0-or-later, itself a modification of this repository's AGPL files; the port's
+  changes are described in the file header.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.
