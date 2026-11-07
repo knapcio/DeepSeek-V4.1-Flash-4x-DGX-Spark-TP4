@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""DSV41_SWA_PROMPT_TAIL_KEEP (adapter/swa_prompt_tail.py): a request-owned prompt end keeps its SWA through decode.
+"""DSV41_SWA_PROMPT_TAIL_KEEP (adapter/swa_prompt_tail.py): the prompt-end insert keeps the last N prompt tokens' SWA.
 
-Offline part (no SGLang): knob parsing, the floor rule on stand-in objects, the sitecustomize gate, the profile
-and autotune-key bookkeeping.
+Offline part (no SGLang): knob parsing, the floor rules on stand-in objects, the sitecustomize gate, the profile and
+autotune-key bookkeeping.
 Engine part (skipped without SGLang; CPU container with the pinned SGLang tree on PYTHONPATH): a real
-UnifiedRadixCache (FULL + SWA, page 4, window 4) and the real ScheduleBatch.maybe_evict_swa / _evict_swa per decode
-step. A short prompt (one extend) is decoded and finished, then revisited with a new suffix:
-  * with the prompt-end insert (the stock scheduler path) the revisit already matches page_floor(prompt), with or
-    without the module, and the module applies no floor at all (exact no-op: same reuse, same SWA ledgers);
-  * without the prompt-end insert (the case jjang-ai measured: 0 cached on the 2nd visit) stock reuses 0 and the
-    module reuses page_floor(prompt); the SWA the request holds stays <= keep + hold + window + page, and past the
-    hold bound the request falls back to stock frees.
+UnifiedRadixCache (FULL + SWA, page 4, window 4) and the real ScheduleBatch.maybe_evict_swa per decode step:
+  * a document + a new question (the common prefix ends before the last page of the previous prompt): stock reuses 0
+    on the 2nd visit and hits from the 3rd (jjang-ai's measured pattern); with the module the 2nd visit reuses the
+    whole document; decode frees are identical (no hold), the tree holds at most N more SWA slots;
+  * a revisit that continues after the prompt end: unchanged; chunked inserts: the tree identical; with DSV41_SWA_THIN
+    on as well: the same reuse;
+  * a request-owned prompt end (no prompt-end insert): stock reuses 0, the module the prompt end; the decode hold
+    stays <= N + hold, past the bound the request falls back to stock frees.
 """
 import ast
 import importlib.util
@@ -73,42 +74,52 @@ class FloorRule(unittest.TestCase):
     def setUp(self):
         T.STATE.released = 0
 
-    def test_floor_when_prompt_end_is_request_owned(self):
+    def test_prompt_end_insert_keeps_the_tail(self):
         c = _cache(page=256)
-        self.assertEqual(T.prompt_tail_floor(c, _req(6000, 10, 0), 1024, 8192), 5888 - 1024)
-        self.assertEqual(T.prompt_tail_floor(c, _req(6000, 10, 4096), 1024, 8192), 5888 - 1024)
-        self.assertEqual(T.prompt_tail_floor(c, _req(700, 10, 0), 1024, 8192), 0)    # floor clamps at 0
+        for phase in ("prompt_end", None):        # rule 1 (the insert) and rule 2 (decode, request-owned)
+            self.assertEqual(T.prompt_tail_floor(c, _req(6000, 1, 0), 1024, 8192, phase), 5888 - 1024)
+            self.assertEqual(T.prompt_tail_floor(c, _req(6000, 1, 4096), 1024, 8192, phase), 5888 - 1024)
+            self.assertEqual(T.prompt_tail_floor(c, _req(700, 1, 0), 1024, 8192, phase), 0)   # clamps at 0
 
-    def test_no_floor_when_the_tree_owns_the_prompt_end(self):
+    def test_chunked_inserts_are_stock(self):
         c = _cache(page=256)
-        self.assertIsNone(T.prompt_tail_floor(c, _req(6000, 10, 5888), 1024, 8192))
-        self.assertIsNone(T.prompt_tail_floor(c, _req(6000, 10, 6144), 1024, 8192))
+        self.assertIsNone(T.prompt_tail_floor(c, _req(6000, 0, 0), 1024, 8192, "chunked"))
+
+    def test_no_floor_once_the_tree_owns_the_prompt_end(self):
+        c = _cache(page=256)
+        for phase in ("prompt_end", None):
+            self.assertIsNone(T.prompt_tail_floor(c, _req(6000, 10, 5888), 1024, 8192, phase))
+            self.assertIsNone(T.prompt_tail_floor(c, _req(6000, 10, 6144), 1024, 8192, phase))
 
     def test_no_floor_outside_scope(self):
         r = _req(6000, 10, 0)
-        self.assertIsNone(T.prompt_tail_floor(_cache(page=256, chunk=True), r, 1024, 8192))
-        self.assertIsNone(T.prompt_tail_floor(_cache(page=256, is_eagle=True), r, 1024, 8192))
-        self.assertIsNone(T.prompt_tail_floor(_cache(page=256, enable_hicache=True), r, 1024, 8192))
-        self.assertIsNone(T.prompt_tail_floor(_cache(page=256, enable_session_radix_cache=True), r, 1024, 8192))
-        m = _cache(page=256)
-        m.is_mamba_enabled = True
-        self.assertIsNone(T.prompt_tail_floor(m, r, 1024, 8192))
-        self.assertIsNone(T.prompt_tail_floor(_cache(page=256), _req(200, 10, 0), 1024, 8192))   # < one page
-        self.assertIsNone(T.prompt_tail_floor(SimpleNamespace(is_chunk_cache=lambda: False), r, 1024, 8192))
+        for phase in ("prompt_end", None):
+            self.assertIsNone(T.prompt_tail_floor(_cache(page=256, chunk=True), r, 1024, 8192, phase))
+            self.assertIsNone(T.prompt_tail_floor(_cache(page=256, is_eagle=True), r, 1024, 8192, phase))
+            self.assertIsNone(T.prompt_tail_floor(_cache(page=256, enable_hicache=True), r, 1024, 8192, phase))
+            self.assertIsNone(T.prompt_tail_floor(_cache(page=256, enable_session_radix_cache=True), r, 1024, 8192,
+                                                  phase))
+            m = _cache(page=256)
+            m.is_mamba_enabled = True
+            self.assertIsNone(T.prompt_tail_floor(m, r, 1024, 8192, phase))
+            self.assertIsNone(T.prompt_tail_floor(_cache(page=256), _req(200, 10, 0), 1024, 8192, phase))  # < 1 page
+            self.assertIsNone(T.prompt_tail_floor(SimpleNamespace(is_chunk_cache=lambda: False), r, 1024, 8192,
+                                                  phase))
 
-    def test_hold_bound(self):
+    def test_decode_hold_bound(self):
         c = _cache(page=256)
         floor = 5888 - 1024
         r = _req(6000, 0, 0)
         r.seqlen = floor + 1024 + 8192
-        self.assertEqual(T.prompt_tail_floor(c, r, 1024, 8192), floor)          # at the bound: still held
+        self.assertEqual(T.prompt_tail_floor(c, r, 1024, 8192, None), floor)          # at the bound: still held
         setattr(r, T.REQ_ATTR, "held")
         r.seqlen += 1
-        self.assertIsNone(T.prompt_tail_floor(c, r, 1024, 8192))                # past it: stock
+        self.assertIsNone(T.prompt_tail_floor(c, r, 1024, 8192, None))                # past it: stock
         self.assertEqual(getattr(r, T.REQ_ATTR), "released")
         self.assertEqual(T.STATE.released, 1)
-        self.assertIsNone(T.prompt_tail_floor(c, r, 1024, 8192))
-        self.assertEqual(T.STATE.released, 1)                                    # counted once
+        self.assertIsNone(T.prompt_tail_floor(c, r, 1024, 8192, None))
+        self.assertEqual(T.STATE.released, 1)                                          # counted once
+        self.assertEqual(T.prompt_tail_floor(c, r, 1024, 8192, "prompt_end"), floor)  # the insert has no bound
 
 
 class Wiring(unittest.TestCase):
@@ -137,7 +148,7 @@ class Wiring(unittest.TestCase):
         self.assertIn("tests/test_swa_prompt_tail.py", (ROOT / ".github/workflows/offline-tests.yml").read_text())
 
     def test_pins_are_hex(self):
-        self.assertEqual(len(T.PINS), 7)
+        self.assertEqual(len(T.PINS), 9)
         for k, v in T.PINS.items():
             self.assertRegex(v, r"^[0-9a-f]{64}$", k)
 
@@ -145,7 +156,7 @@ class Wiring(unittest.TestCase):
 # ---------------------------------------------------------------- engine
 @unittest.skipUnless(HAVE_SGLANG, "needs the pinned SGLang tree")
 class Engine(unittest.TestCase):
-    PAGE, WIN = 4, 4
+    PAGE, WIN, CHUNK = 4, 4, 16
 
     @classmethod
     def setUpClass(cls):
@@ -158,15 +169,21 @@ class Engine(unittest.TestCase):
         from sglang.srt.mem_cache import unified_radix_cache as urc
         from sglang.srt.mem_cache.unified_cache.components import swa
         cls.sb, cls.common, cls.urc, cls.swa = sb, common, urc, swa
-        cls.stock_evict = staticmethod(sb.ScheduleBatch._evict_swa)
+        U = urc.UnifiedRadixCache
+        cls.stock = {"swa_retain_floor": U.swa_retain_floor, "cache_unfinished_req": U.cache_unfinished_req}
 
     def setUp(self):
-        self.sb.ScheduleBatch._evict_swa = self.stock_evict
-        T.STATE.__dict__.update(installed=False, active=False, applied=0, requests=0, released=0, errors=0)
+        for k, v in self.stock.items():
+            setattr(self.urc.UnifiedRadixCache, k, v)
+        T.STATE.__dict__.update(installed=False, active=False, prompt_end=0, decode=0, requests=0, released=0,
+                                errors=0)
 
     tearDown = setUp
 
-    def _arm(self, keep, hold=T.DEFAULT_HOLD):
+    def _arm(self, keep, hold=T.DEFAULT_HOLD, thin=False):
+        if thin:
+            import swa_thin
+            self.assertTrue(swa_thin.install(self.urc, env={swa_thin.ENV: "1"}))
         if keep:
             self.assertTrue(T.install(self.sb, env={T.ENV_KEEP: str(keep), T.ENV_HOLD: str(hold)}))
 
@@ -209,10 +226,16 @@ class Engine(unittest.TestCase):
         b._evict_swa = types.MethodType(self.sb.ScheduleBatch._evict_swa, b)
         return b
 
-    def _visit(self, cache, alloc, pool, rid, prompt, nout, prompt_end_insert=True):
-        """One request as the scheduler runs it: match + lock, the prompt in one extend, the first token, the
-        prompt-end insert (skipped to reproduce the request-owned prompt end), `nout` decode steps each followed by
-        the real maybe_evict_swa, the finished insert. Returns (reused, max request-owned live SWA during decode)."""
+    def _swa_held(self, cache):
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        tc = cache.tree_core
+        return tc.component_evictable_size_[ComponentType.SWA] + tc.component_protected_size_[ComponentType.SWA]
+
+    def _visit(self, cache, alloc, pool, rid, prompt, nout, prompt_end_insert=True, chunk=None, after_chunks=None):
+        """One request as the scheduler runs it: match + lock, the prompt in extends of `chunk` tokens (chunked inserts
+        in between), the first token, the prompt-end insert (skipped to reproduce a request-owned prompt end), `nout`
+        decode steps each followed by the real maybe_evict_swa, the finished insert. Returns (reused, max SWA the
+        request held past cache_protected_len during decode)."""
         from array import array
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
@@ -235,10 +258,19 @@ class Engine(unittest.TestCase):
         req.prefix_indices = mr.device_indices
         req.kv.cache_protected_len = m
         req.swa_branching_seqlen = getattr(mr, "swa_branching_seqlen", None)
-        idx = self._alloc(alloc, len(prompt) - m)
-        pool.write((req.kv.req_pool_idx, slice(m, len(prompt))), idx)
-        req.set_extend_range(m, len(prompt))
-        req.kv.kv_committed_len = len(prompt)
+        pos = m
+        step = chunk or len(prompt)
+        while pos < len(prompt):
+            end = min(pos + step, len(prompt))
+            idx = self._alloc(alloc, end - pos)
+            pool.write((req.kv.req_pool_idx, slice(pos, end)), idx)
+            req.set_extend_range(pos, end)
+            req.kv.kv_committed_len = end
+            if end < len(prompt):
+                cache.cache_unfinished_req(req, chunked=True)
+            pos = end
+        if after_chunks is not None:
+            after_chunks(cache)
         out = [90000 + 1000 * rid + i for i in range(nout)]
         req.output_ids = array("q", out[:1])
         req._refresh_fill_ids()
@@ -261,74 +293,109 @@ class Engine(unittest.TestCase):
         cache.sanity_check()
         return m, held
 
-    def _run(self, keep, hold=T.DEFAULT_HOLD, prompt_end_insert=True, nout=30, plen=46):
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    def _turns(self, keep, prompts, hold=T.DEFAULT_HOLD, prompt_end_insert=True, nout=30, thin=False, chunk=None):
+        """Fresh cache, the prompts in order; returns [(reused, held)], the tree's SWA after the first request, and
+        the applied counters."""
         self.setUp()                                              # every run starts from the stock engine
-        self._arm(keep, hold)
+        self._arm(keep, hold, thin)
         cache, alloc, pool = self._build()
-        base = list(range(1000, 1000 + plen))
-        v1 = self._visit(cache, alloc, pool, 1, base, nout, prompt_end_insert)
-        v2 = self._visit(cache, alloc, pool, 2, base + [7, 8, 9], nout, prompt_end_insert)
-        tc = cache.tree_core
-        sizes = (dict(tc.component_evictable_size_), dict(tc.component_protected_size_),
-                 alloc.swa_available_size(), alloc.full_available_size())
-        return v1, v2, sizes, T.STATE.applied
+        out, first = [], None
+        for i, p in enumerate(prompts):
+            out.append(self._visit(cache, alloc, pool, i + 1, p, nout, prompt_end_insert, chunk))
+            if first is None:
+                first = self._swa_held(cache)
+        return out, first, (T.STATE.prompt_end, T.STATE.decode, T.STATE.requests, T.STATE.released)
+
+    DOC = list(range(1000, 1040))                                 # 40 tokens: ends on a page boundary
+
+    def _q(self, k):
+        return [5000 + 10 * k + j for j in range(6)]               # a 6-token question: prompt 46, page_floor 44
 
     def test_pins_match_engine(self):
-        self.assertEqual(T.pin_drift(T.pin_targets(self.sb, self.common, self.urc, self.swa)), [])
+        self.assertEqual(T.pin_drift(T.pin_targets(self.urc, self.swa, self.common, self.sb)), [])
 
-    def test_replacement_mirrors_the_pinned_body(self):
-        # the stock body calls free_swa_out_of_window_slots with exactly these keywords; ours passes the same
-        import inspect
-        call = [n for n in ast.walk(ast.parse(inspect.getsource(self.stock_evict).strip()))
-                if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "free_swa_out_of_window_slots"]
-        self.assertEqual(len(call), 1)
-        stock_kw = [k.arg for k in call[0].keywords]
-        mine = [n for n in ast.walk(ast.parse((ROOT / "adapter" / "swa_prompt_tail.py").read_text()))
-                if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "free"]
-        self.assertEqual(len(mine), 1)
-        self.assertEqual([k.arg for k in mine[0].keywords], stock_kw)
-        self.assertEqual(len(call[0].args), 2)
-        self.assertEqual(len(mine[0].args), 2)
+    def test_divergence_before_the_last_page(self):
+        # visit k = DOC + question k: the common prefix ends at 40 < page_floor(46) = 44
+        prompts = [self.DOC + self._q(k) for k in range(3)]
+        stock, s_tree, _ = self._turns(0, prompts)
+        armed, a_tree, cnt = self._turns(8, prompts)
+        print(f"\n  DOC + new question: stock reuse {[m for m, _ in stock]}, keep=8 {[m for m, _ in armed]}; "
+              f"tree SWA after visit 1 stock {s_tree} / keep {a_tree}; counters {cnt}")
+        self.assertEqual([m for m, _ in stock], [0, 0, 40])       # their pattern: 2nd visit 0, hits from the 3rd
+        self.assertEqual([m for m, _ in armed], [0, 40, 40])      # kept: the 2nd visit matches the whole DOC
+        self.assertEqual([h for _, h in armed], [h for _, h in stock])   # decode frees stay stock
+        self.assertEqual(cnt[1:], (0, 0, 0))                      # no decode-time floor: the tree owned the prompt end
+        self.assertEqual(cnt[0], 3)                               # one prompt-end insert per visit
+        self.assertGreater(a_tree, s_tree)                        # the cost: the kept tail in the tree
+        self.assertLessEqual(a_tree - s_tree, 8)
 
-    def test_stock_path_is_an_exact_noop(self):
-        stock = self._run(0)
-        armed = self._run(1024)
-        armed8 = self._run(8)
-        page_floor = 46 // self.PAGE * self.PAGE
-        self.assertEqual(stock[1][0], page_floor)            # the revisit already matches the prompt end
-        self.assertEqual(stock[:3], armed[:3])                # same reuse, held SWA and ledgers
-        self.assertEqual(stock[:3], armed8[:3])
-        self.assertEqual(armed[3], 0)                         # and no floor was ever applied
-        self.assertEqual(armed8[3], 0)
+    def test_revisit_after_the_prompt_end_is_unchanged(self):
+        base = self.DOC + self._q(0)
+        prompts = [base, base + [7, 8, 9]]
+        stock, _, _ = self._turns(0, prompts)
+        armed, _, cnt = self._turns(8, prompts)
+        self.assertEqual(stock[1][0], 44)
+        self.assertEqual([m for m, _ in armed], [m for m, _ in stock])
+        self.assertEqual([h for _, h in armed], [h for _, h in stock])
+        self.assertEqual(cnt[1], 0)
+
+    def test_chunked_inserts_are_stock(self):
+        # a 58-token prompt in 16-token chunks (inserts at 16, 32, 48; page_floor 56): the tree after the chunked
+        # inserts is identical with the module, and only the prompt-end insert uses the floor
+        prompt = list(range(3000, 3058))
+        snaps = []
+        for keep in (0, 8):
+            self.setUp()
+            self._arm(keep)
+            cache, alloc, pool = self._build()
+            seen = []
+
+            def snap(c):
+                tc = c.tree_core
+                seen.append((dict(tc.component_evictable_size_), dict(tc.component_protected_size_),
+                             alloc.swa_available_size(), alloc.full_available_size()))
+            self._visit(cache, alloc, pool, 1, prompt, 30, chunk=self.CHUNK, after_chunks=snap)
+            snaps.append(seen[0])
+            if keep:
+                self.assertEqual(T.STATE.prompt_end, 1)          # only the prompt-end insert used the floor
+        self.assertEqual(snaps[0], snaps[1])
+
+    def test_composes_with_swa_thin(self):
+        prompts = [self.DOC + self._q(k) for k in range(3)]
+        armed, _, _ = self._turns(8, prompts)
+        both, _, _ = self._turns(8, prompts, thin=True)
+        import swa_thin
+        self.assertTrue(swa_thin.STATS.installed)
+        self.assertEqual([m for m, _ in both], [m for m, _ in armed])
+        self.assertTrue(getattr(self.urc.UnifiedRadixCache.cache_unfinished_req, "_dsv41_swa_thin", False))
 
     def test_request_owned_prompt_end_is_kept(self):
-        stock = self._run(0, prompt_end_insert=False)
-        armed = self._run(8, prompt_end_insert=False)
-        requests = T.STATE.requests
-        page_floor = 46 // self.PAGE * self.PAGE
-        print(f"\n  request-owned prompt end: stock revisit {stock[1][0]}, keep=8 {armed[1][0]} "
-              f"(page_floor {page_floor}); held SWA stock {stock[0][1]} / keep {armed[0][1]}")
-        self.assertEqual(stock[1][0], 0)                      # the bug: the revisit reuses nothing
-        self.assertEqual(armed[1][0], page_floor)             # kept: it matches the prompt end
-        self.assertGreater(armed[3], 0)
-        self.assertEqual(requests, 2)
-        # the hold bound: keep + hold + (window + page) of the stock trailing slots, here hold 8192 > output
+        base = self.DOC + self._q(0)
+        prompts = [base, base + [7, 8, 9]]
+        stock, _, _ = self._turns(0, prompts, prompt_end_insert=False)
+        armed, _, cnt = self._turns(8, prompts, prompt_end_insert=False)
+        print(f"\n  request-owned prompt end: stock revisit {stock[1][0]}, keep=8 {armed[1][0]}; "
+              f"held SWA stock {stock[0][1]} / keep {armed[0][1]}; counters {cnt}")
+        self.assertEqual(stock[1][0], 0)                          # their docstring's case: nothing reusable
+        self.assertEqual(armed[1][0], 44)                         # kept: it matches the prompt end
+        self.assertEqual(cnt[2], 2)
         self.assertLessEqual(armed[0][1], 8 + 30 + self.WIN + self.PAGE)
 
     def test_hold_bound_falls_back_to_stock(self):
-        stock = self._run(0, prompt_end_insert=False)
-        capped = self._run(8, hold=8, prompt_end_insert=False)
-        released = T.STATE.released
-        print(f"\n  hold 8: revisit {capped[1][0]}, max held SWA {capped[0][1]}, released {released}")
-        self.assertEqual(capped[1][0], stock[1][0])           # 30-token outputs pass the bound: stock outcome
-        self.assertEqual(released, 2)
+        base = self.DOC + self._q(0)
+        prompts = [base, base + [7, 8, 9]]
+        stock, _, _ = self._turns(0, prompts, prompt_end_insert=False)
+        capped, _, cnt = self._turns(8, prompts, hold=8, prompt_end_insert=False)
+        print(f"\n  hold 8: revisit {capped[1][0]}, max held SWA {capped[0][1]}, counters {cnt}")
+        self.assertEqual(capped[1][0], stock[1][0])               # 30-token outputs pass the bound: stock outcome
+        self.assertEqual(cnt[3], 2)
         self.assertLessEqual(capped[0][1], 8 + 8 + self.WIN + 2 * self.PAGE)
-        roomy = self._run(8, hold=64, prompt_end_insert=False)
-        self.assertEqual(roomy[1][0], 46 // self.PAGE * self.PAGE)
+        roomy, _, _ = self._turns(8, prompts, hold=64, prompt_end_insert=False)
+        self.assertEqual(roomy[1][0], 44)
 
     def test_deterministic(self):
-        self.assertEqual(self._run(8, prompt_end_insert=False)[:3], self._run(8, prompt_end_insert=False)[:3])
+        prompts = [self.DOC + self._q(k) for k in range(3)]
+        self.assertEqual(self._turns(8, prompts)[:2], self._turns(8, prompts)[:2])
 
     def test_sitecustomize_installs_the_hook(self):
         # The engine's import hook (active with DSV41_SOURCE, as boot.py sets it) next to the v2.6.5 scheduler-side
@@ -337,13 +404,15 @@ class Engine(unittest.TestCase):
         adapter = str(ROOT / "adapter")
         probe = ("import sglang.srt.managers.scheduler as S, sglang.srt.managers.schedule_batch as SB,"
                  " sglang.srt.mem_cache.unified_radix_cache as U, sys\n"
-                 "print('HOOKS', getattr(SB.ScheduleBatch._evict_swa, '_dsv41_prompt_tail_hook', False),"
+                 "thin = sys.modules.get('swa_thin')\n"
+                 "print('HOOKS', getattr(U.UnifiedRadixCache.swa_retain_floor, '_dsv41_prompt_tail_hook', False),"
                  " 'swa_prompt_tail' in sys.modules,"
                  " getattr(SB.Req.init_next_round_input, '_dsv41_swa_cone_hook', False),"
-                 " getattr(U.UnifiedRadixCache.cache_unfinished_req, '_dsv41_swa_thin', False))\n")
-        for keep, want, log in (("1024", "True True True True", "DSV41_SWA_PROMPT_TAIL installed: keep=1024"),
-                                ("0", "False False True True", None),
-                                ("abc", "False True True True", "DSV41_SWA_PROMPT_TAIL not installed")):
+                 " getattr(U.UnifiedRadixCache.cache_unfinished_req, '_dsv41_swa_thin', False),"
+                 " bool(thin and thin.STATS.installed and thin.STATS.active))\n")
+        for keep, want, log in (("1024", "True True True True True", "DSV41_SWA_PROMPT_TAIL installed: keep=1024"),
+                                ("0", "False False True True True", None),
+                                ("abc", "False True True True True", "DSV41_SWA_PROMPT_TAIL not installed")):
             env = dict(os.environ, DSV41_SOURCE="/models/x", DSV41_SWA_PROMPT_TAIL_KEEP=keep, DSV41_SWA_THIN="1",
                        DSV41_SWA_CONE_REPLAY="1", DSV41_SWA_CONE_TOKENS="8192", DSV41_PREFILL_BYPASS="256",
                        DSV41_PREFILL_BYPASS_SOLO="1", DSV41_DECODE_YIELD="33", CUDA_VISIBLE_DEVICES="",

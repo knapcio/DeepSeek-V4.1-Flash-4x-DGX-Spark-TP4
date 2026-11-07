@@ -7,14 +7,14 @@ Two opt-in ports from Eric Jinho Jang (dealign.ai),
 commits `c175335` / `a9f87fe` (AGPL-3.0-or-later, modifications of this repository's files). Neither is in any profile
 line; both keys are volatile for `DSV41_AUTOTUNE_KEEP`. Not measured on GB10 yet.
 
-- **`DSV41_SWA_PROMPT_TAIL_KEEP=<tokens>`** (`adapter/swa_prompt_tail.py`; theirs: 1024): a request whose prompt end is
-  still request-owned during decode keeps the last N prompt tokens' SWA, so a revisit of the prompt (or a chat turn
-  that diverges right after it) can end its prefix match there. Their measurement: a 6k chat turn 2 from 0 % to
-  93.7 % cached. Differences against theirs: the floor acts on the decode-time free only (`ScheduleBatch._evict_swa`;
-  every insert stays stock), only while `cache_protected_len < page_floor(prompt)` (with a normal prompt-end insert the
-  module does nothing), and it is dropped after `DSV41_SWA_PROMPT_TAIL_HOLD` (8192) more tokens, because the one
-  contiguous SWA frontier also holds every later decode slot (`tests/test_swa_prompt_tail.py`: 40 vs 8 slots held at
-  the end of a 30-token output). Only the timing of SWA frees changes.
+- **`DSV41_SWA_PROMPT_TAIL_KEEP=<tokens>`** (`adapter/swa_prompt_tail.py`; theirs: 1024): the prompt-end insert
+  keeps the last N prompt tokens' SWA live instead of one page, so a revisit whose common prefix ends a few tokens
+  before the previous prompt's end (a chat turn with a new question) matches there on its 2nd visit instead of the
+  3rd. CPU test on the real UnifiedRadixCache (`tests/test_swa_prompt_tail.py`): document + new question, reuse
+  stock 0 / 0 / 40 tokens on visits 1-3, with the module 0 / 40 / 40. Difference against theirs: their floor also
+  stopped every decode-time SWA free once the tree owned the prompt end (a request held N + its whole output in SWA);
+  here decode frees stay stock then, and a still request-owned prompt end is held for at most
+  `DSV41_SWA_PROMPT_TAIL_HOLD` (8192) tokens. Chunked inserts (and so the cone replay's first insert) are stock.
 - **`DSV41_PREFILL_TRIM=1`** (`adapter/prefill_empty_cache.py`): instead of `torch.cuda.empty_cache()` after every
   long prefill chunk, the last long forward's transient working set stays cached and only cached-but-free memory
   beyond it + `DSV41_PREFILL_TRIM_GIB` (1) is returned, at most every `DSV41_PREFILL_TRIM_EVERY_S` (10). Allocation
