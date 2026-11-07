@@ -1,0 +1,11 @@
+# v2.7: FlashInfer 0.7.2 (git d84335d8) over the base image's 0.6.18, installed with
+#   pip install --no-deps --require-hashes -r files/flashinfer-0.7.2.requirements \
+#     --extra-index-url https://flashinfer.ai/whl/cu130 --extra-index-url https://flashinfer.ai/whl
+# sha256 = PyPI's / flashinfer.ai's index values, re-checked on the downloaded files 2026-11-07. The jit-cache meta
+# package plus ONLY its sm121a provider (13 sm_121a cubins of sparse_mla_sm120 and the rest; GB10 needs no other arch).
+# Not installed (unchanged from the base): nvidia-cudnn-frontend (imported behind try/except, cuDNN routes unused),
+# nccl-extensions (not imported by 0.7.2), apache-tvm-ffi 0.1.11, nccl4py, cuda-tile, nvidia-cutlass-dsl 4.6.2.
+flashinfer-python==0.7.2 --hash=sha256:770550a0aa92b2f10e6c9a1f048dd43713f0f3bb6a12710186fcf8e4e9c99bd8
+flashinfer-cubin==0.7.2 --hash=sha256:31704fa5b2562d459d34c67cee9e80e0abb96c82f89943d542276d5a92c88079
+flashinfer-jit-cache==0.7.2+cu130 --hash=sha256:157e74a786c84df49c59cf1d7568a531a8833ec47a58e9fd52de52737705cc21
+flashinfer-jit-cache-sm121a==0.7.2+cu130 --hash=sha256:1b827a99581a5166fe5a398610d1ef764055592498f5f92b4bd402e176ddaa8d

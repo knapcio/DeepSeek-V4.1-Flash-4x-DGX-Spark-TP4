@@ -98,6 +98,13 @@ Third-party components and their licences:
   commits c175335 / a9f87fe (adapter/swa_evict_internal_first.py `install_prompt_tail_floor`: the SWA
   prompt-tail floor), AGPL-3.0-or-later, itself a modification of this repository's AGPL files; the port's
   changes are described in the file header.
+- v2.7 (DSV41_KV_LAYOUT=v41, FlashInfer 0.7.2): the SM12x V4.1 KV-layout selection and the native reader route
+  (adapter/v41_pool.py, the V41 branch of runtime/flash_mla_sm120.canary.py) follow sgl-project/sglang PR 45851 by
+  05yuki (Apache License 2.0; closed unmerged 2026-11-06). The SM120 DSv4.1 sparse-MLA kernels that read the V4.1
+  records are FlashInfer's (flashinfer-ai/flashinfer PRs 5197 and 6616 by lucifer1004; Apache License 2.0). The
+  pool-pricing gap (A7) and the selector / reader patches (A1 / A2) were identified from luxingcom's
+  luz-deepseek-flash-all-in-one notes; no luz code is included. The FlashInfer PR 7676 fence (Thireus) now applies
+  to FlashInfer 0.7.2's copy of the b12x dense GEMM (the PR's base blob).
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

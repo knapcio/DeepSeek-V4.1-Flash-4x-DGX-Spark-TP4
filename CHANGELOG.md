@@ -1,9 +1,29 @@
 # Changelog
 
-## v2.6.6 (candidate; release gate pending)
+## v2.7 (candidate; release gate pending)
 
-v2.6.5 plus three changes; the KV pool pin (8,541,952 tokens at fraction 0.85), the image's SGLang tree and FlashInfer
-0.6.18 are unchanged.
+v2.6.5 plus FlashInfer 0.7.2 with the native DeepSeek-V4.1 KV layouts on GB10, and the three changes of the v2.6.6
+candidate (listed after the FlashInfer items; v2.6.6 is v2.7 without FlashInfer 0.7.2). The production profile
+replaces v2.6.5's v41n keys, `DSV41_SWA_NATIVE_DECODE=1` and `DSV41_PREFILL_NATIVE_EXTRA=1` with `DSV41_KV_LAYOUT=v41 SGLANG_SM120_V41_PRECISION=bf16`:
+the SWA cache (and the draft's paged SWA) holds `KVLayout.V41` (528 B per token, all 512 values e4m3 in groups of 32,
+RoPE included, as DeepSeek's V4.1 reference stores the window K), the ratio-1/2 caches `V41_FP4` (288 B), read in place
+by FlashInfer's SM120 DSv4.1 kernels on the full-BF16 route. A numerics change against v2.6.5 (RoPE in fp8 in the SWA
+cache), accepted by the owner on the condition that the v2.7 gate passes. The three FlashInfer-0.6.18-only modules
+(v41c / v41n / swan, K8) are no longer built; their knobs refuse at boot on FlashInfer >= 0.7. Pool sizing prices the
+528-byte rows (bytes per full token 912.25 as v2.6.5; the SWA term x 528 / 584). Credits: sglang#45851 (05yuki),
+FlashInfer #5197 / #6616 (lucifer1004), #7676 (Thireus), luz-deepseek-flash-all-in-one (luxingcom). Measurements:
+pending (the cold-boot confirm of the frozen calibration with the TP4 boot smoke, then the release gate: speed, KLD,
+qeval bracket, reasoning length, draft acceptance and needles against v2.6.5).
+
+- **No in-process sparse-MLA calibration.** FlashInfer 0.7 calibrates its SM120 sparse-MLA kernels whenever an autotune
+  pass meets a request with no profile on disk, also in SGLang's draft autotune pass, after the target-verify CUDA
+  graphs are captured. Every cold boot on the four Sparks then faulted at the first decode: a captured graph wrote to
+  unmapped memory on every rank (Xid 31 / 13; the faulting kernel a cuBLAS bf16 batched GEMM; debug runs
+  `run-20261107-105507-2650424` and `run-20261107-134634-3060892`), while every boot that found the calibration on disk
+  served. `boot.py` now adds `sparse_mla_sm120` to `--flashinfer-autotune-skip-ops` and points `FLASHINFER_AUTOTUNE_DIR`
+  at the calibration shipped in the image (`files/fi-autotune/sparse_mla_sm120_cpb.json`: FlashInfer 0.7.2's own
+  calibration of the four V4.1 TP4 request shapes on a GB10, read-only, the same plans on every rank). A missing
+  calibration refuses the boot; `DSV41_V41_CALIBRATION=inprocess` restores FlashInfer's behaviour for diagnostics.
 
 - **SWA prompt tail in the production profile: `DSV41_SWA_PROMPT_TAIL_KEEP=1024`** (`adapter/swa_prompt_tail.py`;
   the hold `DSV41_SWA_PROMPT_TAIL_HOLD` stays at its default 8192). A prompt-end insert used to keep one page (256

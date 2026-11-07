@@ -1228,8 +1228,8 @@ class Profile(unittest.TestCase):
 
     def test_production_line_ends_with_trim2_once(self):
         items = self._production_line().split('"')[1].split()
-        # v2.6.6: the SWA prompt tail follows trim2
-        self.assertEqual(items[-3:], ['DSV41_V41C_READER=native', 'DSV41_TOKENIZER_HEAP=trim2',
+        # v2.7; v2.6.6: the SWA prompt tail follows trim2
+        self.assertEqual(items[-3:], ['SGLANG_SM120_V41_PRECISION=bf16', 'DSV41_TOKENIZER_HEAP=trim2',
                                       'DSV41_SWA_PROMPT_TAIL_KEEP=1024'])
         self.assertEqual(sum(x.split('=')[0] == 'DSV41_TOKENIZER_HEAP' for x in items), 1)
 

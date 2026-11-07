@@ -71,6 +71,8 @@ class PatchText(unittest.TestCase):
         self.assertFalse(set(fi.PINS) & set(fi.PINS.values()))
         self.assertEqual(mxfp8_b12x._FI7676_ABSENT in fi.PINS, True)
         self.assertEqual(fi.PINS[mxfp8_b12x._FI7676_ABSENT], mxfp8_b12x._FI7676_PRESENT)
+        # v2.7: the receipt knows exactly the patcher's pairs (0.6.18 and the 0.7.2 / 0.7.3 file = the PR base blob)
+        self.assertEqual(mxfp8_b12x._FI7676_PAIRS, fi.PINS)
         self.assertEqual(fi.FENCE.strip(), mxfp8_b12x._FI7676_LINE)
 
     def test_main_refuses_unknown_and_leaves_it(self):

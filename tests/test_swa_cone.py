@@ -763,8 +763,8 @@ class Profile(unittest.TestCase):
                          ["DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
         i = items.index("DSV41_SWA_THIN=1")
         self.assertEqual(items[i:i + 3], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
-        # v2.6.5: only the three v41n keys and the tokenizer heap trim follow the cone; v2.6.6: then the SWA prompt tail
-        self.assertEqual(items[i + 3:], ["DSV41_KV_LAYOUT=v41c", "DSV41_V41C_ARM=1", "DSV41_V41C_READER=native",
+        # v2.7: only the native V4.1 layout keys, the tokenizer heap trim and (v2.6.6) the SWA prompt tail follow the cone
+        self.assertEqual(items[i + 3:], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
                                          "DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
 
     def test_code_default_is_the_production_chunk(self):

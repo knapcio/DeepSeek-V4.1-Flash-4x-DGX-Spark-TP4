@@ -47,6 +47,21 @@ COPY --from=nccl-builder /opt/nccl /tmp/nccl-2393
 RUN set -eu; target=/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2; test -f "$target" \
  && install -m 0644 -o root -g root /tmp/nccl-2393/libnccl.so.2 "$target" \
  && install -D -m 0644 /tmp/nccl-2393/nccl-2393.json /opt/dsv41/files/nccl-2393.json && rm -rf /tmp/nccl-2393
+# v2.7 (perf/v27-fi07-20261107): FlashInfer 0.7.2 (git d84335d8) replaces the base image's 0.6.18. 0.7.2 reads the
+# DeepSeek-V4.1 caches natively on SM120/SM121 (#5197: KVLayout.V41 528-byte main + V41_FP4 288-byte extra, runtime
+# page sizes; sglang#45851 route in flash_mla_sm120.canary.py, adapter/v41_pool.py) and accepts CUTLASS DSL >= 4.6.2a0:
+# its b12x dense MXFP8 GEMM compiles for sm_121a under the base's DSL 4.6.2 at every DSV41 tile (10 / 10, 0 local,
+# diagnostics/v27-fi07-20261107/m2-dsl), so b12x_next and the SG17 RoCE kernels keep v2.6.5's DSL. The four wheels are
+# hash-pinned (files/flashinfer-0.7.2.requirements); the jit-cache's sm121a provider carries the sparse_mla_sm120 module
+# prebuilt (no JIT at boot).
+ARG FLASHINFER_COMMIT=d84335d8c54e0c8f9f7e22faa15c7e34a58abf94
+ARG FLASHINFER_JIT_INDEX=https://flashinfer.ai/whl/cu130
+ARG FLASHINFER_CUBIN_INDEX=https://flashinfer.ai/whl
+COPY files/flashinfer-0.7.2.requirements /tmp/flashinfer-0.7.2.requirements
+RUN pip install --no-deps --no-cache-dir --require-hashes -i "$PIP_INDEX" --extra-index-url "${FLASHINFER_JIT_INDEX}" \
+      --extra-index-url "${FLASHINFER_CUBIN_INDEX}" -r /tmp/flashinfer-0.7.2.requirements \
+ && python3 -c "import flashinfer, sys; v, c = flashinfer.__version__, flashinfer.__git_commit__; print('flashinfer', v, c); sys.exit(0 if (v, c) == ('0.7.2', '${FLASHINFER_COMMIT}') else 'flashinfer identity mismatch')" \
+ && python3 -c "import importlib.metadata as m, sys; v = {p: m.version(p) for p in ('flashinfer-cubin', 'flashinfer-jit-cache', 'flashinfer-jit-cache-sm121a', 'nvidia-cutlass-dsl')}; print(v); sys.exit(0 if v['flashinfer-cubin'] == '0.7.2' and v['flashinfer-jit-cache'].startswith('0.7.2+') and v['flashinfer-jit-cache-sm121a'].startswith('0.7.2+') and v['nvidia-cutlass-dsl'] == '4.6.2' else 'flashinfer companion / DSL versions')"
 RUN rm -rf /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/python /sgl-workspace/sglang/python
 RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark; print('import ok')"
@@ -66,32 +81,19 @@ COPY adapter /opt/dsv41/adapter
 RUN g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread \
     adapter/row_store.cpp -o adapter/librow_store.so
 COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-# DSV41_PREFILL_NATIVE_EXTRA (opt-in, default off): prefill reads the extra cache's native 128/256-token pages through
-# a separate FlashInfer module generated from THIS image's sparse_mla_sm120 sources; anchor drift fails the build.
+# v2.7: the K8 / PCE module (runtime/flashinfer_pce) and the v41c / v41n / swan module (runtime/flashinfer_v41c) are
+# retired here. Both were generated from or checked against FlashInfer 0.6.18's approved sparse_mla_sm120 closure and
+# the v41c glue calls five 0.6.18 privates that 0.7.x removed (_get_sparse_mla_decode_dsv4_module, ...). FlashInfer
+# 0.7.x itself reads the V4.1 records (DSV41 v41n's job), takes runtime page sizes (swan's and K8's job).
+# TODO(v2.7): delete the module sources and their tests once the native-V41 profile passes its gate. A profile
+# that still sets DSV41_KV_LAYOUT=v41c, DSV41_SWA_NATIVE_DECODE=1 or DSV41_PREFILL_NATIVE_EXTRA=1 must refuse at boot.
+# Their Python fronts stay importable (stdlib-only at import, every entry gated off): the V4 SM120 bridge imports
+# them on its 256-page decode / extra-page prefill paths and falls back to the stock split when they are off.
 COPY runtime/flashinfer_pce/dsv41_pce.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_pce.py
-COPY runtime/flashinfer_pce/gen_pce_sources.py runtime/flashinfer_pce/APPROVED_CLOSURE.json /opt/dsv41/runtime/flashinfer_pce/
-# The generator refuses unless the image's whole sparse_mla_sm120 source closure is the approved one; the module is then
-# compiled here (sm_121a, no GPU needed) and served from the image with its sha256 checked (no JIT at boot).
-RUN FI_DIRS="$(python3 -c 'from flashinfer.jit import env; print(env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR)')" \
- && python3 /opt/dsv41/runtime/flashinfer_pce/gen_pce_sources.py $FI_DIRS /opt/dsv41/runtime/flashinfer_pce/gen \
- && FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_pce build \
- && python3 -m sglang.kernels.ops.attention.dsv41_pce verify
-# DSV41_SWA_NATIVE_DECODE (module default off; on in the production profile since v2.6.4): FlashInfer's sparse-MLA
-# decode at the SWA pool's own 256-token pages. One module with all six sources of runtime/flashinfer_v41c (the
-# swan kernel plus the v41c / v41n readers): the bytes the TP4 A/Bs ran; ~25 s of nvcc.
-# DSV41_KV_LAYOUT=v41c (opt-in, default off): the same module's readers for V4.1 FP4 compressed records
-# (adapter/v41c_pool.py allocates the ratio-1/2 pools as those records; DSV41_V41C_READER=native = v41n).
-# The module (runtime/flashinfer_v41c: vendored FlashInfer sources, VENDORED.json) is built here against the same
-# approved FlashInfer closure as the K8 module above, .so sha256 recorded in lib/module.json and checked at load.
 COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py
-COPY runtime/flashinfer_v41c/csrc /opt/dsv41/runtime/flashinfer_v41c/csrc
-COPY runtime/flashinfer_v41c/include /opt/dsv41/runtime/flashinfer_v41c/include
-COPY runtime/flashinfer_v41c/VENDORED.json /opt/dsv41/runtime/flashinfer_v41c/VENDORED.json
-RUN FLASHINFER_CUDA_ARCH_LIST=12.1a python3 -m sglang.kernels.ops.attention.dsv41_v41c build \
- && python3 -m sglang.kernels.ops.attention.dsv41_v41c verify
 # FlashInfer PR #7676 (issue #7675, Thireus): one proxy fence after producer_acquire in the b12x SM120/SM121 dense GEMM
-# that every MXFP8 dense linear runs (adapter/mxfp8_b12x.py). The patcher only edits the pinned 0.6.18 file (sha256
-# before and after); any other FlashInfer fails the build. CuTe DSL compiles the kernel in-process at first use.
+# that every MXFP8 dense linear runs (adapter/mxfp8_b12x.py). The patcher only edits a pinned file (sha256 before
+# and after: 0.6.18's, or the 0.7.2 / 0.7.3 file = the PR's base blob); any other FlashInfer fails the build. CuTe DSL compiles the kernel in-process at first use.
 COPY runtime/flashinfer_fi7676 /opt/dsv41/runtime/flashinfer_fi7676
 RUN python3 /opt/dsv41/runtime/flashinfer_fi7676/apply_fi7676.py \
  && python3 /opt/dsv41/runtime/flashinfer_fi7676/apply_fi7676.py --check
@@ -99,6 +101,8 @@ RUN python3 /opt/dsv41/runtime/flashinfer_fi7676/apply_fi7676.py \
 COPY runtime/patch_encoding_dsv41.py /opt/dsv41/runtime/patch_encoding_dsv41.py
 RUN python3 /opt/dsv41/runtime/patch_encoding_dsv41.py
 COPY boot.py /opt/dsv41/boot.py
+# v2.7: the frozen sparse-MLA calibration (boot.py v41_frozen_calibration; FlashInfer never calibrates in-process)
+COPY files/fi-autotune /opt/dsv41/files/fi-autotune
 COPY scripts /opt/dsv41/scripts
 RUN python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py /sgl-workspace/sglang/python
 RUN python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py /sgl-workspace/sglang/python
@@ -216,6 +220,8 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && FI7676_EXPECT=patched python3 /opt/dsv41/tests/test_fi7676_fence.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_moe_launch_prepared.py \
  && CUDA_VISIBLE_DEVICES= SGLANG_CANARY_PY=/sgl-workspace/sglang/python python3 /opt/dsv41/tests/test_v41c_pool.py \
+ && CUDA_VISIBLE_DEVICES= SGLANG_CANARY_PY=/sgl-workspace/sglang/python python3 /opt/dsv41/tests/test_v41_pool.py \
+ && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_v27_fi07_guard.py \
  && cd /opt/dsv41/tests && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_chunked_v3.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_nosync.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 # SGLANG_RUST_BUILD_MODE=never still probes `cargo --version --verbose`, and rustup can

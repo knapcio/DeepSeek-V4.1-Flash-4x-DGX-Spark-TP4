@@ -69,11 +69,12 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_backend as install_swa_cone_backend
                 install_swa_cone_backend(module)
-            # DSV41_KV_LAYOUT=v41c (adapter/v41c_pool.py): the writer / reader call sites must be the pinned ones.
+            # DSV41_KV_LAYOUT=v41c (adapter/v41c_pool.py) / v41 (adapter/v41_pool.py, v2.7): the writer / reader call
+            # sites must be the pinned ones.
             if os.environ.get('DSV41_KV_LAYOUT', '').strip() not in _V41C_OFF:
-                from v41c_pool import enabled as _v41c_enabled, check_backend as _v41c_check_backend
-                if _v41c_enabled():
-                    _v41c_check_backend(module)
+                _kv = _kv_layout_adapter()
+                if _kv is not None:
+                    _kv.check_backend(module)
         elif module.__name__ == 'sglang.srt.model_executor.forward_batch_info':
             # Gated on DSV41_SWA_CONE_REPLAY=1: the resident latents / index keys of a replay are copied
             # into the request's fresh pages on the forward stream (adapter/swa_cone.py).
@@ -81,16 +82,22 @@ class EngramLoader(importlib.abc.Loader):
                 from swa_cone import install_forward_batch as install_swa_cone_forward_batch
                 install_swa_cone_forward_batch(module)
         elif module.__name__ == 'sglang.srt.mem_cache.deepseek_v4_memory_pool':
-            # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records.
-            # enabled() raises on any value but v4 / v41c, so a typo stops the engine instead of serving V4.
-            from v41c_pool import enabled as _v41c_enabled, install_pool as _v41c_install_pool
-            if _v41c_enabled():
-                _v41c_install_pool(module)
+            # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records (v41c),
+            # or the whole V4.1 layout pair on SM12x (v41, v2.7). v41c_pool.enabled() raises on any value but v4 /
+            # v41c / v41 is routed first, so a typo stops the engine instead of serving V4.
+            _kv = _kv_layout_adapter()
+            if _kv is not None:
+                _kv.install_pool(module)
         elif module.__name__ == 'sglang.srt.model_executor.pool_configurator':
-            # The same gate: pool sizing prices the ratio-1/2 records at 288 B.
-            from v41c_pool import enabled as _v41c_enabled, install_configurator as _v41c_install_configurator
-            if _v41c_enabled():
-                _v41c_install_configurator(module)
+            # The same gate: pool sizing prices the ratio-1/2 records at 288 B (v41: and the latent slots at 528 B).
+            _kv = _kv_layout_adapter()
+            if _kv is not None:
+                _kv.install_configurator(module)
+        elif module.__name__ == 'sglang.srt.mem_cache.kv_cache_configurator':
+            # Only in the finder with DSV41_KV_LAYOUT=v41: its by-name import of select_dsv4_kv_layout -> the wrapper.
+            _kv = _kv_layout_adapter()
+            if _kv is not None and hasattr(_kv, 'install_kv_configurator'):
+                _kv.install_kv_configurator(module)
         elif module.__name__ == 'sglang.srt.entrypoints.openai.encoding_dsv41':
             from encoding_compat import install_encoder
             install_encoder(module)
@@ -361,7 +368,18 @@ class EngramLoader(importlib.abc.Loader):
 # DSV41_KV_LAYOUT unset or v4 (the default): the finder list is unchanged and adapter/v41c_pool.py is never imported.
 _V41C_OFF = ('', 'v4')
 _V41C_MODULES = (() if os.environ.get('DSV41_KV_LAYOUT', '').strip() in _V41C_OFF else
-                 ('sglang.srt.mem_cache.deepseek_v4_memory_pool', 'sglang.srt.model_executor.pool_configurator'))
+                 ('sglang.srt.mem_cache.deepseek_v4_memory_pool', 'sglang.srt.model_executor.pool_configurator')
+                 + (('sglang.srt.mem_cache.kv_cache_configurator',)
+                    if os.environ.get('DSV41_KV_LAYOUT', '').strip() == 'v41' else ()))
+
+
+def _kv_layout_adapter():
+    """The KV-layout adapter module for DSV41_KV_LAYOUT: v41 -> v41_pool (v2.7), v41c -> v41c_pool, else None / raise."""
+    if os.environ.get('DSV41_KV_LAYOUT', '').strip() == 'v41':
+        import v41_pool
+        return v41_pool if v41_pool.enabled() else None
+    import v41c_pool
+    return v41c_pool if v41c_pool.enabled() else None
 
 class EngramFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):

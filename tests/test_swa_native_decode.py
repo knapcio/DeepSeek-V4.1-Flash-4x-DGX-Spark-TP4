@@ -536,17 +536,15 @@ class Profile(unittest.TestCase):
         self.assertTrue(lines[i - 1].startswith('#EXTRA_CONTAINER_ENV="'), lines[i - 1][:60])
         return lines[i - 1]
 
-    def test_production_line_enables_swan_once(self):
+    def test_production_line_no_longer_enables_swan(self):
+        # v2.7: swan is retired (FlashInfer 0.7 decodes the SWA pool's own pages; boot.py refuses the knob on 0.7)
         items = self._production_line().split('"')[1].split()
-        self.assertEqual([x for x in items if x.startswith("DSV41_SWA_NATIVE_DECODE")], ["DSV41_SWA_NATIVE_DECODE=1"])
-        i = items.index("DSV41_SWA_NATIVE_DECODE=1")     # after v2.6.3's two keys (v2.6.4's decode yield follows)
-        self.assertEqual(items[i - 2:i + 1], ["DSV41_BLOCK_VERIFY_FOLD=1", "DSV41_ROCE_IDLE_PARK=1",
-                                              "DSV41_SWA_NATIVE_DECODE=1"])
+        self.assertEqual([x for x in items if x.startswith("DSV41_SWA_NATIVE_DECODE")], [])
 
-    def test_only_the_production_line_enables_swan(self):
+    def test_no_profile_line_enables_swan(self):
         text = (ROOT / ".env.tp4.example").read_text()
         on = [line for line in text.splitlines() if line.startswith("#EXTRA_CONTAINER_ENV=") and "SWA_NATIVE" in line]
-        self.assertEqual(on, [self._production_line()])
+        self.assertEqual(on, [])
 
     def test_volatile_in_autotune_keep(self):
         tree = ast.parse((ROOT / "adapter" / "autotune_keep.py").read_text())
@@ -559,6 +557,8 @@ class Profile(unittest.TestCase):
         self.assertIn('SWAN_ENV = "DSV41_SWA_NATIVE_DECODE"', src)
         self.assertIn('if raw in ("", "0", "off", "false", "no"):\n        return False', src)
 
+    @unittest.skip("v2.7 (FlashInfer 0.7.x): the swan module is retired from both recipes (0.7 decodes the SWA pool's "
+                   "own pages); tests/test_v27_fi07_guard.py checks the retirement. TODO(v2.7): delete with the module.")
     def test_dockerfiles_build_and_verify_the_module(self):
         for name in ("Dockerfile.canary", "Dockerfile.canary-roce"):
             d = (ROOT / name).read_text()
