@@ -89,6 +89,12 @@ Third-party components and their licences:
   PR 55 by Alexander Busse (GanyX19), upstream commit bdf657c (issue 54), contributed there under
   the AGPL-3.0 and ported here unchanged under the same licence. The stall it fixes on this
   repository was reported by slidonnici (issue 66).
+- adapter/swa_prompt_tail.py (DSV41_SWA_PROMPT_TAIL_KEEP) and the DSV41_PREFILL_TRIM path of
+  adapter/prefill_empty_cache.py are ported from Eric Jinho Jang (dealign.ai),
+  jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark, commits c175335 / a9f87fe
+  (adapter/swa_evict_internal_first.py `install_prompt_tail_floor`, adapter/prefill_empty_cache.py: the
+  SWA prompt-tail floor and the working-set-preserving prefill trim), AGPL-3.0-or-later, themselves
+  modifications of this repository's AGPL files; the port's changes are described in the file headers.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

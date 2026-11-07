@@ -205,6 +205,11 @@ RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone.py
 # The cone x DSV41_KV_LAYOUT=v41c: the page copy covers the V4.1 FP4 pools, the replay rows' FP4 writes go to slot 0.
 RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone_v41c.py
+# DSV41_SWA_PROMPT_TAIL_KEEP (CPU, off by default): engine pins, the stock path is a no-op, a request-owned prompt
+# end is kept through decode on the real UnifiedRadixCache + ScheduleBatch.maybe_evict_swa, the hook install.
+RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_prompt_tail.py
+# DSV41_PREFILL_TRIM (CPU, off by default): the trim's decisions on a stand-in allocator, the per-chunk default.
+RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_prefill_trim.py
 # DSV41_TOKENIZER_HEAP=trim2 (CPU, off by default): the hook targets and every prompt encode on this engine tree, the
 # hooks on the real classes, the trimmer's gates and the real glibc heap.
 RUN CUDA_VISIBLE_DEVICES= DSV41_TRIM2_SGLANG_ROOT=/sgl-workspace/sglang/python/sglang python3 /opt/dsv41/tests/test_tokenizer_heap_trim2.py

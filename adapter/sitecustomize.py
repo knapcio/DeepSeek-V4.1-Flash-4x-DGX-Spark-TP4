@@ -332,6 +332,12 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_schedule_batch as install_swa_cone_schedule_batch
                 install_swa_cone_schedule_batch(module)
+            # Gated on DSV41_SWA_PROMPT_TAIL_KEEP=<tokens>: a prompt end the tree does not own yet keeps its last
+            # SWA tokens through decode, so a revisit can match there (adapter/swa_prompt_tail.py). Gate checked
+            # BEFORE the import.
+            if os.environ.get('DSV41_SWA_PROMPT_TAIL_KEEP', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from swa_prompt_tail import install as install_swa_prompt_tail
+                install_swa_prompt_tail(module)
         elif module.__name__ == 'sglang.srt.mem_cache.unified_radix_cache':
             # Gated on DSV41_SWA_THIN=1: superseded chunk-boundary SWA checkpoints go to the
             # evict-first end of the SWA LRU (adapter/swa_thin.py). Gate checked BEFORE the import.

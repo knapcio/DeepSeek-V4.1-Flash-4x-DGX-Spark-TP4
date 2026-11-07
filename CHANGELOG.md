@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased (v2.6.6 candidates, off by default)
+
+Two opt-in ports from Eric Jinho Jang (dealign.ai),
+[jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark](https://github.com/jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark)
+commits `c175335` / `a9f87fe` (AGPL-3.0-or-later, modifications of this repository's files). Neither is in any profile
+line; both keys are volatile for `DSV41_AUTOTUNE_KEEP`. Not measured on GB10 yet.
+
+- **`DSV41_SWA_PROMPT_TAIL_KEEP=<tokens>`** (`adapter/swa_prompt_tail.py`; theirs: 1024): a request whose prompt end is
+  still request-owned during decode keeps the last N prompt tokens' SWA, so a revisit of the prompt (or a chat turn
+  that diverges right after it) can end its prefix match there. Their measurement: a 6k chat turn 2 from 0 % to
+  93.7 % cached. Differences against theirs: the floor acts on the decode-time free only (`ScheduleBatch._evict_swa`;
+  every insert stays stock), only while `cache_protected_len < page_floor(prompt)` (with a normal prompt-end insert the
+  module does nothing), and it is dropped after `DSV41_SWA_PROMPT_TAIL_HOLD` (8192) more tokens, because the one
+  contiguous SWA frontier also holds every later decode slot (`tests/test_swa_prompt_tail.py`: 40 vs 8 slots held at
+  the end of a 30-token output). Only the timing of SWA frees changes.
+- **`DSV41_PREFILL_TRIM=1`** (`adapter/prefill_empty_cache.py`): instead of `torch.cuda.empty_cache()` after every
+  long prefill chunk, the last long forward's transient working set stays cached and only cached-but-free memory
+  beyond it + `DSV41_PREFILL_TRIM_GIB` (1) is returned, at most every `DSV41_PREFILL_TRIM_EVERY_S` (10). Allocation
+  only. Unset, the per-chunk `empty_cache` is unchanged.
+
 ## 2026-11-07 v2.6.5
 
 v2.6.4 plus three changes. The production profile in `.env.tp4.example` adds `DSV41_KV_LAYOUT=v41c
