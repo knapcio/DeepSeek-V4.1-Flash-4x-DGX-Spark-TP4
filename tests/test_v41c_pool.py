@@ -493,6 +493,8 @@ TRIM2_SITE_BLOCK = re.compile(r"# DSV41_TOKENIZER_HEAP=trim2 \(off by default\).
 class DefaultOff(unittest.TestCase):
     SITE = ADAPTER / "sitecustomize.py"
 
+    @unittest.skip("v2.7: sitecustomize routes DSV41_KV_LAYOUT through _kv_layout_adapter (v41 / v41c); "
+                   "tests/test_v41_pool.py DefaultOff pins the text")
     def test_text_minus_v41c_is_f744d83(self):
         s = self.SITE.read_text()
         for rx in V41C_SITE_BLOCKS:
@@ -538,8 +540,8 @@ class DefaultOff(unittest.TestCase):
     def test_hook_branches(self):
         s = self.SITE.read_text()
         tree = ast.parse(s)
-        self.assertIn("_v41c_install_pool(module)", s)
-        self.assertIn("_v41c_install_configurator(module)", s)
+        self.assertIn("_kv.install_pool(module)", s)          # v2.7: v41c_pool or v41_pool via _kv_layout_adapter
+        self.assertIn("_kv.install_configurator(module)", s)
         # every hooked name has its own branch before the final else (whose body assumes dsv4.metadata)
         for name in P.MODULES:
             self.assertIn(f"elif module.__name__ == '{name}':", s)
@@ -555,6 +557,7 @@ V41N_KEYS = ["DSV41_KV_LAYOUT=v41c", "DSV41_V41C_ARM=1", "DSV41_V41C_READER=nati
 
 
 @unittest.skipUnless((ROOT / ".env.tp4.example").exists(), "not a repo checkout (in an image)")
+@unittest.skip("v2.7: the v41n keys left the production line (DSV41_KV_LAYOUT=v41); tests/test_v41_pool.py Profile")
 class Profile(unittest.TestCase):
     """v2.6.5: the production line of .env.tp4.example ends with the three v41n keys (after v2.6.4's cone keys) and
     v2.6.5's tokenizer heap trim, no other profile line sets the layout or a reader, no diagnostic v41c / v41n knob is

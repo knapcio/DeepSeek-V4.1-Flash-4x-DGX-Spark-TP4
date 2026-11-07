@@ -19,22 +19,19 @@ ARG PIP_INDEX=https://pypi.org/simple
 RUN pip install --no-deps --no-cache-dir -i "$PIP_INDEX" "sglang-kernel==0.4.7" "sgl-deep-gemm==0.2.0"
 # v2.7 (perf/v27-fi07-20261107): FlashInfer 0.7.2 (git d84335d8) replaces the base image's 0.6.18. 0.7.2 reads the
 # DeepSeek-V4.1 caches natively on SM120/SM121 (#5197: KVLayout.V41 528-byte main + V41_FP4 288-byte extra, runtime
-# page sizes; sglang#45851 route in flash_mla_sm120.canary.py) and keeps CUTLASS DSL >= 4.6.2a0, so b12x_next and the
-# SG17 RoCE kernels compile from the same DSL as v2.6.5. The jit-cache wheel carries the sm_121a sparse_mla_sm120 module
-# prebuilt (sha256 2db58ddc..., 13 sm_121a cubins; the same module also JIT-builds from source with this image's
-# nvcc 13.0 in ~25 s, diagnostics/v27-fi07-20261107/m1). Dependency floors that moved since 0.6.18: apache-tvm-ffi
-# >= 0.1.11, nccl4py >= 0.4.1, nvidia-cudnn-frontend >= 1.31.0, nccl-extensions >= 0.1.0 (new).
-# TODO(v2.7 M2): pin each wheel by sha256 (--require-hashes) once the base's own versions are read from the image;
-# make `pip check` fatal after that.
-ARG FLASHINFER_VERSION=0.7.2
+# page sizes; sglang#45851 route in flash_mla_sm120.canary.py, adapter/v41_pool.py) and accepts CUTLASS DSL >= 4.6.2a0:
+# its b12x dense MXFP8 GEMM compiles for sm_121a under the base's DSL 4.6.2 at every DSV41 tile (10 / 10, 0 local,
+# diagnostics/v27-fi07-20261107/m2-dsl), so b12x_next and the SG17 RoCE kernels keep v2.6.5's DSL. The four wheels are
+# hash-pinned (files/flashinfer-0.7.2.requirements); the jit-cache's sm121a provider carries the sparse_mla_sm120 module
+# prebuilt (no JIT at boot).
 ARG FLASHINFER_COMMIT=d84335d8c54e0c8f9f7e22faa15c7e34a58abf94
 ARG FLASHINFER_JIT_INDEX=https://flashinfer.ai/whl/cu130
-RUN pip install --no-deps --no-cache-dir -i "$PIP_INDEX" "flashinfer-python==${FLASHINFER_VERSION}" "flashinfer-cubin==${FLASHINFER_VERSION}" \
-      "nccl-extensions>=0.1.0" "nvidia-cudnn-frontend>=1.31.0" \
- && pip install --no-deps --no-cache-dir -i "$PIP_INDEX" --extra-index-url "${FLASHINFER_JIT_INDEX}" \
-      "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130" \
- && python3 -c "import flashinfer, sys; v, c = flashinfer.__version__, flashinfer.__git_commit__; print('flashinfer', v, c); sys.exit(0 if (v, c) == ('${FLASHINFER_VERSION}', '${FLASHINFER_COMMIT}') else 'flashinfer identity mismatch')" \
- && (pip check 2>&1 | grep -i -E "flashinfer|tvm|nccl4py|cudnn|cutlass" || true)
+ARG FLASHINFER_CUBIN_INDEX=https://flashinfer.ai/whl
+COPY files/flashinfer-0.7.2.requirements /tmp/flashinfer-0.7.2.requirements
+RUN pip install --no-deps --no-cache-dir --require-hashes -i "$PIP_INDEX" --extra-index-url "${FLASHINFER_JIT_INDEX}" \
+      --extra-index-url "${FLASHINFER_CUBIN_INDEX}" -r /tmp/flashinfer-0.7.2.requirements \
+ && python3 -c "import flashinfer, sys; v, c = flashinfer.__version__, flashinfer.__git_commit__; print('flashinfer', v, c); sys.exit(0 if (v, c) == ('0.7.2', '${FLASHINFER_COMMIT}') else 'flashinfer identity mismatch')" \
+ && python3 -c "import importlib.metadata as m, sys; v = {p: m.version(p) for p in ('flashinfer-cubin', 'flashinfer-jit-cache', 'flashinfer-jit-cache-sm121a', 'nvidia-cutlass-dsl')}; print(v); sys.exit(0 if v['flashinfer-cubin'] == '0.7.2' and v['flashinfer-jit-cache'].startswith('0.7.2+') and v['flashinfer-jit-cache-sm121a'].startswith('0.7.2+') and v['nvidia-cutlass-dsl'] == '4.6.2' else 'flashinfer companion / DSL versions')"
 RUN rm -rf /sgl-workspace/sglang/python
 COPY runtime/sglang-canary/python /sgl-workspace/sglang/python
 RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark; print('import ok')"
@@ -187,6 +184,8 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && FI7676_EXPECT=patched python3 /opt/dsv41/tests/test_fi7676_fence.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_moe_launch_prepared.py \
  && CUDA_VISIBLE_DEVICES= SGLANG_CANARY_PY=/sgl-workspace/sglang/python python3 /opt/dsv41/tests/test_v41c_pool.py \
+ && CUDA_VISIBLE_DEVICES= SGLANG_CANARY_PY=/sgl-workspace/sglang/python python3 /opt/dsv41/tests/test_v41_pool.py \
+ && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_v27_fi07_guard.py \
  && cd /opt/dsv41/tests && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_chunked_v3.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_nosync.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 # SGLANG_RUST_BUILD_MODE=never still probes `cargo --version --verbose`, and rustup can

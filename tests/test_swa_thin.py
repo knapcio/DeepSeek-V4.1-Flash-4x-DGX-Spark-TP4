@@ -459,7 +459,8 @@ class Profile(unittest.TestCase):
         items = self._production_line().split('"')[1].split()
         self.assertEqual([x for x in items if x.startswith("DSV41_SWA_THIN")], ["DSV41_SWA_THIN=1"])
         i = items.index("DSV41_SWA_THIN=1")
-        self.assertEqual(items[i - 2:i + 1], ["DSV41_SWA_NATIVE_DECODE=1", "DSV41_DECODE_YIELD=33", "DSV41_SWA_THIN=1"])
+        # v2.7: swan retired from the line (tests/test_v41_pool.py Profile)
+        self.assertEqual(items[i - 2:i + 1], ["DSV41_ROCE_IDLE_PARK=1", "DSV41_DECODE_YIELD=33", "DSV41_SWA_THIN=1"])
         self.assertEqual(T.mode({T.ENV: "1"}), "all")
 
     def test_production_args_tails_384_once(self):

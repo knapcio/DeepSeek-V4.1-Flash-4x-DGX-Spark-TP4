@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.7 (candidate, in progress; not released)
+
+FlashInfer 0.7.2 and the native DeepSeek-V4.1 KV layouts on GB10. The production profile replaces v2.6.5's v41n keys,
+`DSV41_SWA_NATIVE_DECODE=1` and `DSV41_PREFILL_NATIVE_EXTRA=1` with `DSV41_KV_LAYOUT=v41 SGLANG_SM120_V41_PRECISION=bf16`:
+the SWA cache (and the draft's paged SWA) holds `KVLayout.V41` (528 B per token, all 512 values e4m3 in groups of 32,
+RoPE included, as DeepSeek's V4.1 reference stores the window K), the ratio-1/2 caches `V41_FP4` (288 B), read in place
+by FlashInfer's SM120 DSv4.1 kernels on the full-BF16 route. A numerics change against v2.6.5 (RoPE in fp8 in the SWA
+cache), accepted by the owner on the condition that the v2.7 gate passes. The three FlashInfer-0.6.18-only modules
+(v41c / v41n / swan, K8) are no longer built; their knobs refuse at boot on FlashInfer >= 0.7. Pool sizing prices the
+528-byte rows (bytes per full token 912.25 as v2.6.5; the SWA term x 528 / 584). Credits: sglang#45851 (05yuki),
+FlashInfer #5197 / #6616 (lucifer1004), #7676 (Thireus), luz-deepseek-flash-all-in-one (luxingcom). Measurements: pending
+(W1 one-GB10 parity / microbench, W2 TP4 boot smoke, then the A / X / A' screen and the release gate).
+
 ## 2026-11-07 v2.6.5
 
 v2.6.4 plus three changes. The production profile in `.env.tp4.example` adds `DSV41_KV_LAYOUT=v41c

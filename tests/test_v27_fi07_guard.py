@@ -94,14 +94,28 @@ class CanaryV41Route(unittest.TestCase):
 
 
 class Recipes(unittest.TestCase):
+    @unittest.skipUnless((ROOT / "Dockerfile.canary").exists(), "no recipes here")
     def test_flashinfer_072_and_retired_modules(self):
         for name in ("Dockerfile.canary", "Dockerfile.canary-roce"):
             text = (ROOT / name).read_text()
-            self.assertIn("ARG FLASHINFER_VERSION=0.7.2", text, name)
             self.assertIn("ARG FLASHINFER_COMMIT=d84335d8c54e0c8f9f7e22faa15c7e34a58abf94", text, name)
+            self.assertIn("--require-hashes", text, name)
+            self.assertIn("-r /tmp/flashinfer-0.7.2.requirements", text, name)
             self.assertNotIn("dsv41_pce build", text, name)
             self.assertNotIn("dsv41_v41c build", text, name)
         self.assertIn("apply_fi7676.py --check", (ROOT / "Dockerfile.canary-roce").read_text())
+
+    @unittest.skipUnless((ROOT / "files" / "flashinfer-0.7.2.requirements").exists(), "not a repo checkout (in an image)")
+    def test_wheel_pins(self):
+        want = {
+            "flashinfer-python==0.7.2": "770550a0aa92b2f10e6c9a1f048dd43713f0f3bb6a12710186fcf8e4e9c99bd8",
+            "flashinfer-cubin==0.7.2": "31704fa5b2562d459d34c67cee9e80e0abb96c82f89943d542276d5a92c88079",
+            "flashinfer-jit-cache==0.7.2+cu130": "157e74a786c84df49c59cf1d7568a531a8833ec47a58e9fd52de52737705cc21",
+            "flashinfer-jit-cache-sm121a==0.7.2+cu130": "1b827a99581a5166fe5a398610d1ef764055592498f5f92b4bd402e176ddaa8d",
+        }
+        lines = [l.split() for l in (ROOT / "files" / "flashinfer-0.7.2.requirements").read_text().splitlines()
+                 if l and not l.startswith("#")]
+        self.assertEqual({l[0]: l[1].split("sha256:")[1] for l in lines}, want)
 
 
 if __name__ == "__main__":
