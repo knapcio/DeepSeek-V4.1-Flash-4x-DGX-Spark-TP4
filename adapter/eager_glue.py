@@ -80,10 +80,13 @@ def _parse(value):
     if bad:
         raise ValueError(f"DSV41_EAGER_GLUE: unknown part(s) {sorted(bad)}; known {PARTS}")
     dropped = parts & DROPPED
-    if dropped and not dropped <= _warned:
-        _warned.update(dropped)
-        print(f"[eager_glue] {sorted(dropped)} dropped (stale out_cache_loc pointer in a glue graph); ignored",
-              flush=True)
+    # Override site: the dropped parts tvglue and dglue used to parse and be ignored with a print.
+    # A user-set DSV41_EAGER_GLUE that names one of them explicitly now raises, because the named
+    # part would not take effect ("all" / "1" never included them).
+    if dropped:
+        raise RuntimeError(
+            f"DSV41_EAGER_GLUE={value!r} names {sorted(dropped)}, which are dropped (stale out_cache_loc "
+            f"pointer in a glue graph) and install nothing; remove them from DSV41_EAGER_GLUE")
     return parts - DROPPED
 
 
@@ -119,6 +122,15 @@ def fused_clone(tensors):
     for t in tensors:
         if (t.device != dev or t.dtype not in (torch.int32, torch.int64) or not t.is_contiguous()
                 or t.numel() == 0):
+            # Override site: a tensor the one-kernel fence clone does not cover (mixed device,
+            # dtype other than int32 / int64, non-contiguous, empty) makes the caller clone each
+            # tensor separately. The fall-through is kept and logged once per reason.
+            reason = (f"device={t.device} vs {dev}, dtype={t.dtype}, contiguous={t.is_contiguous()}, "
+                      f"empty={t.numel() == 0}")
+            if ("fence", reason) not in _warned:
+                _warned.add(("fence", reason))
+                print(f"WARNING [eager_glue] fence: DSV41_EAGER_GLUE part fence falls back to per-tensor "
+                      f"clones for an ineligible tensor ({reason})", flush=True)
             return None
     order = sorted(range(len(tensors)), key=lambda i: tensors[i].dtype != torch.int64)
     words = [tensors[i].reshape(-1).view(torch.int32) for i in order]
@@ -200,9 +212,13 @@ def _eligible_sizes():
         try:
             from sglang.srt.runtime_context import get_exec
             sizes = sorted(set(int(b) for b in get_exec().graph.cuda_graph_config.decode.bs))
-        except Exception as exc:   # engine drift: vcap stays eager (safe), say so once
-            print(f"[eager_glue] vcap: decode graph sizes unavailable ({exc!r}); vcap stays eager", flush=True)
-            sizes = []
+        except Exception as exc:
+            # Override site: engine drift that hides the decode graph sizes used to keep vcap eager
+            # for every size with one print. vcap is requested whenever this runs, so the part
+            # that cannot take effect now raises.
+            raise RuntimeError(
+                f"DSV41_EAGER_GLUE={os.environ.get('DSV41_EAGER_GLUE', '')!r} requests vcap but the decode "
+                f"graph sizes are unavailable ({exc!r})") from exc
         got = frozenset(b for i, b in enumerate(sizes) if i == 0 or sizes[i - 1] == b - 1)
         _vcap["eligible"] = got
     return got
@@ -264,17 +280,30 @@ try:
         k += run
         k = tl.minimum(tl.maximum(k, kmin), kmax)
         tl.store(LIVE + r, k + 1, m)
-except Exception:                                    # no triton: vcapk stays off
+except Exception as _vcap_kernel_exc:                # no triton: vcapk cannot run
     _vcap_kernel = None
+    _vcap_kernel_error = repr(_vcap_kernel_exc)
+else:
+    _vcap_kernel_error = None
 
 _vcapk = {"checks": 0, "off": False}
 
 
 def _vcapk_update(vc, confidence, bs):
     """The fused live-length update; False when it does not apply (caller runs the torch ops)."""
-    if (_vcap_kernel is None or _vcapk["off"] or not on("vcapk") or confidence is None
-            or confidence.dim() != 2 or confidence.shape[1] != 5 or confidence.stride(1) != 1
+    if _vcap_kernel is None or _vcapk["off"] or not on("vcapk") or confidence is None:
+        return False
+    if (confidence.dim() != 2 or confidence.shape[1] != 5 or confidence.stride(1) != 1
             or not confidence.is_cuda or confidence.shape[0] != bs or bs > 1024 or vc.STRIDE != 6):
+        # Override site: a confidence tensor the fused Triton kernel (GB10 sm_121) does not cover
+        # runs the torch ops of verify_cap. The fall-through is kept and logged once per reason.
+        reason = (f"dim={confidence.dim()} cols={confidence.shape[-1]} inner stride={confidence.stride()[-1]} "
+                  f"cuda={confidence.is_cuda} rows==bs={confidence.shape[0] == bs} bs>1024={bs > 1024} "
+                  f"STRIDE={vc.STRIDE}")
+        if ("vcapk", reason) not in _warned:
+            _warned.add(("vcapk", reason))
+            print(f"WARNING [eager_glue] vcapk: kernel _vcap_kernel falls back to torch ops for an ineligible "
+                  f"input ({reason})", flush=True)
         return False
     capturing = torch.cuda.is_current_stream_capturing()
     if not capturing and _vcapk["checks"] < CHECKS:
@@ -284,10 +313,14 @@ def _vcapk_update(vc, confidence, bs):
         got = torch.empty_like(ref)
         _launch_vcapk(vc, confidence, bs, got)
         _vcapk["checks"] += 1
+        # Override site: a bit mismatch of the fused Triton kernel (GB10 sm_121) against the torch
+        # ops used to switch vcapk off for good. vcapk is requested whenever this runs, so the part
+        # that does not take effect now raises.
         if not torch.equal(got, ref):
             _vcapk["off"] = True
-            print(f"[eager_glue] vcapk: CHECK FAILED at bs={bs} ({got.tolist()} vs torch {ref.tolist()}); "
-                  "torch ops for good", flush=True)
+            raise RuntimeError(
+                f"DSV41_EAGER_GLUE={os.environ.get('DSV41_EAGER_GLUE', '')!r} requests vcapk but the fused "
+                f"kernel CHECK FAILED at bs={bs} ({got.tolist()} vs torch {ref.tolist()})")
         return True
     buf = vc.live_buf(confidence.device)
     vc._state["last_conf"] = confidence
@@ -317,9 +350,19 @@ def _live_update(vc, confidence, bs):
 
 def _install_vcap_sampler(cls):
     vc = _vcap_module()
+    # Override site: vcap / vcapk without a conf:T policy in DSV41_VERIFY_CAP used to install
+    # nothing with one print. A user-set DSV41_EAGER_GLUE that requests vcap or vcapk (by name, or
+    # through "all" / "1") now raises, because the requested part would not take effect.
     if not vc.ENABLED or vc._state.get("thr") is None:
-        print("[eager_glue] vcap: DSV41_VERIFY_CAP is not a conf:T policy; nothing to capture", flush=True)
-        return
+        raise RuntimeError(
+            f"DSV41_EAGER_GLUE={os.environ.get('DSV41_EAGER_GLUE', '')!r} requests vcap/vcapk but "
+            f"DSV41_VERIFY_CAP={os.environ.get('DSV41_VERIFY_CAP', '')!r} is not a conf:T policy")
+    # Override site: without Triton the fused kernel of vcapk is absent and the torch ops used to
+    # run silently. A user-set DSV41_EAGER_GLUE that requests vcapk now raises.
+    if "vcapk" in installed() and _vcap_kernel is None:
+        raise RuntimeError(
+            f"DSV41_EAGER_GLUE={os.environ.get('DSV41_EAGER_GLUE', '')!r} requests vcapk but the Triton "
+            f"kernel _vcap_kernel is unavailable ({_vcap_kernel_error})")
     cls._dsv41_eager_glue_vcap = True
     if _vcap["orig"] is None:
         _vcap["orig"] = vc.set_live_from_confidence
@@ -330,6 +373,13 @@ def _install_vcap_sampler(cls):
         out = orig_call(self, hidden_states, input_ids)
         if self.confidence_out is not None and on("vcap"):
             bs = hidden_states.shape[0] // self.query_token_num
+            # Override site: a batch size that a smaller batch is padded into keeps the eager
+            # verify_cap call, because the graph rows differ from the eager rows. The fall-through
+            # is kept and logged once per batch size.
+            if bs not in _eligible_sizes() and ("vcap_bs", bs) not in _warned:
+                _warned.add(("vcap_bs", bs))
+                print(f"WARNING [eager_glue] vcap: DSV41_EAGER_GLUE part vcap stays eager at bs={bs} "
+                      f"(padded decode graph size)", flush=True)
             if bs in _eligible_sizes():
                 # the eager call (or its fused twin), on the tensor the proposer hands the verify step
                 _live_update(vc, self.confidence_out[:bs], bs)

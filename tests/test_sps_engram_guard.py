@@ -22,15 +22,29 @@ class SpsEngramGuardTests(unittest.TestCase):
         os.close(fd)
         self.addCleanup(os.unlink, self.table)
 
-    def call(self, table, env):
+    def call(self, table, env, default=None):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            return boot.sps_table_args(table, env), output.getvalue()
+            return boot.sps_table_args(table, env, table if default is None else default), output.getvalue()
 
     def test_existing_table_is_ignored_by_default(self):
         args, message = self.call(self.table, {})
         self.assertEqual(args, [])
         self.assertIn('Engram', message)
+        self.assertIn('WARNING', message)
+
+    def test_explicit_table_refuses_instead_of_being_ignored(self):
+        with self.assertRaisesRegex(RuntimeError, 'set explicitly'):
+            self.call(self.table, {}, default='/state/dspark_sps.json')
+        with self.assertRaisesRegex(RuntimeError, 'does not exist'):
+            self.call('/nonexistent/sps.json', {'DSPARK_SPS_ALLOW_ENGRAM': '1'},
+                      default='/state/dspark_sps.json')
+
+    def test_sts_table(self):
+        self.assertEqual(boot.sts_table_args(self.table), ['--speculative-dspark-confidence-sts-path', self.table])
+        self.assertEqual(boot.sts_table_args(''), [])
+        with self.assertRaisesRegex(RuntimeError, 'does not exist'):
+            boot.sts_table_args('/nonexistent/sts.json')
 
     def test_explicit_fixed_engine_override_restores_flags(self):
         args, _ = self.call(self.table, {'DSPARK_SPS_ALLOW_ENGRAM': '1'})

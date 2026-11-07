@@ -339,7 +339,8 @@ class SoloOffIdentityAndPinTests(unittest.TestCase):
     def test_unknown_solo_value_refuses_without_mutation(self):
         module, scheduler, running, memory = base.mocked_engine()
         before = (module.Scheduler._get_new_batch_prefill_raw, module.PrefillAdder.add_one_req)
-        self.assertFalse(arm(module, 'maybe'))
+        with self.assertRaises(RuntimeError):
+            arm(module, 'maybe')
         self.assertEqual(before, (module.Scheduler._get_new_batch_prefill_raw, module.PrefillAdder.add_one_req))
 
     def test_pins_are_the_v2_6_1_pins(self):
@@ -354,7 +355,8 @@ class SoloOffIdentityAndPinTests(unittest.TestCase):
             broken = list(adapter.SOLO_PATCHES)
             broken[i] = (old + '# drifted\n', new)
             with patch.object(adapter, 'SOLO_PATCHES', broken):
-                self.assertFalse(arm(module, '1', adapter=adapter), i)
+                with self.assertRaises(RuntimeError):
+                    arm(module, '1', adapter=adapter)
             self.assertEqual(before, (module.Scheduler._get_new_batch_prefill_raw,
                                       module.PrefillAdder.add_one_req,
                                       module.PrefillAdder._select_prefill_admission), i)
@@ -362,7 +364,8 @@ class SoloOffIdentityAndPinTests(unittest.TestCase):
     def test_source_drift_refuses_solo_too(self):
         module, scheduler, running, memory = base.mocked_engine()
         module.Scheduler._get_new_batch_prefill_raw = lambda *a: None
-        self.assertFalse(arm(module, '1'))
+        with self.assertRaises(RuntimeError):
+            arm(module, '1')
 
 
 class SoloSwitchTests(unittest.TestCase):

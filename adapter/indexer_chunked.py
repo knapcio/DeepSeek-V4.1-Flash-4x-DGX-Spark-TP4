@@ -39,13 +39,18 @@ def budget_bytes():
     raw = os.environ.get("DSV41_INDEXER_LOGITS_BUDGET_BYTES", "").strip()
     if not raw:
         return DEFAULT_BUDGET_BYTES
+    # Override site: a set DSV41_INDEXER_LOGITS_BUDGET_BYTES that is not an int, or is <= 0, was
+    # replaced by DEFAULT_BUDGET_BYTES (2 GiB) with at most a warning. A value the user set must
+    # take effect, so a bad value now stops the boot instead of being replaced.
     try:
         value = int(raw)
     except ValueError:
-        logger.warning("DSV41_INDEXER_LOGITS_BUDGET_BYTES=%r is not an int; using %d",
-                       raw, DEFAULT_BUDGET_BYTES)
-        return DEFAULT_BUDGET_BYTES
-    return value if value > 0 else DEFAULT_BUDGET_BYTES
+        raise RuntimeError(f"DSV41_INDEXER_LOGITS_BUDGET_BYTES={raw!r}: not an int; the default "
+                           f"{DEFAULT_BUDGET_BYTES} would replace it; refusing to boot") from None
+    if value <= 0:
+        raise RuntimeError(f"DSV41_INDEXER_LOGITS_BUDGET_BYTES={raw!r}: must be > 0; the default "
+                           f"{DEFAULT_BUDGET_BYTES} would replace it; refusing to boot")
+    return value
 
 
 def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):

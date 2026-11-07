@@ -64,14 +64,18 @@ def install(module):
     def linear(input, weight, weight_scale, input_scale=None, bias=None,
                output_dtype=None, backend='cutlass', pin_tactic=False):
         key = (int(weight.shape[0]), int(weight.shape[1]))
+        # Fall-through site (GB10 SM121 kernel choice): when the FlashInfer backend chosen by
+        # DSV41_MXFP8_BACKEND rejects an N x K shape, that shape runs the CUTLASS SM120 MXFP8 kernel
+        # for the rest of the process. Kept, because the other shapes stay on the chosen backend;
+        # logged with WARNING once per rejected shape (_REJECTED keeps the hot path silent after that).
         if backend == 'cutlass' and key not in _REJECTED:
             try:
                 return original(input, weight, weight_scale, input_scale, bias,
                                 output_dtype, backend=want, pin_tactic=pin_tactic)
             except Exception as exc:  # shape/backend rejection: keep serving
                 _REJECTED.add(key)
-                logger.warning('DSV41 MXFP8 backend %r rejected N=%s K=%s (%s); '
-                               'cutlass for this shape', want, key[0], key[1], exc)
+                logger.warning('WARNING DSV41_MXFP8_BACKEND=%r rejected N=%s K=%s (%s); '
+                               'kernel chosen: cutlass for this shape', want, key[0], key[1], exc)
         return original(input, weight, weight_scale, input_scale, bias,
                         output_dtype, backend=backend, pin_tactic=pin_tactic)
 
@@ -134,18 +138,26 @@ def install_fp8(module):
     if mxfp8_backend_disabled(os.environ.get('DSV41_MXFP8_BACKEND', 'b12x')):
         return
     cls = getattr(module, 'Fp8LinearMethod', None)
+    # Fall-through site (GB10 kernel choice): without Fp8LinearMethod._prepare_block_fp8_as_mxfp8 the
+    # padded-shard scale repair is not installed, so a TP-padded shard with invalid block scales stays
+    # on SGLang's non-MXFP8 path. Kept (the repair is not a user setting); logged with WARNING.
     if cls is None or not hasattr(cls, '_prepare_block_fp8_as_mxfp8'):
-        logger.warning('DSV41: Fp8LinearMethod._prepare_block_fp8_as_mxfp8 not found; no scale repair')
+        logger.warning('WARNING DSV41_MXFP8_BACKEND: Fp8LinearMethod._prepare_block_fp8_as_mxfp8 not found; '
+                       'no padded-shard scale repair')
         return
     original = cls._prepare_block_fp8_as_mxfp8
 
     def prepare(self, layer):
+        # Fall-through site (GB10 kernel choice): a layer whose scales could not be repaired (repair
+        # error, non-float32 scales, a shape that does not tile, invalid scales on non-zero blocks) is
+        # passed to SGLang unchanged, which may keep it off the MXFP8 kernel. Kept; one WARNING line per
+        # affected layer at load time (not on the serving path).
         try:
             note = _repair_padded_scales(layer, self.weight_block_size)
         except Exception as exc:  # never let diagnostics break loading
             note = f'repair failed: {exc}'
         if note:
-            logger.warning('DSV41 block scales for %s: %s', getattr(layer, 'prefix', layer.__class__.__name__), note)
+            logger.warning('WARNING DSV41 block scales for %s: %s', getattr(layer, 'prefix', layer.__class__.__name__), note)
         return original(self, layer)
 
     cls._prepare_block_fp8_as_mxfp8 = prepare

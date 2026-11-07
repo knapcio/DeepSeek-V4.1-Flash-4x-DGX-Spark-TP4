@@ -93,7 +93,7 @@ _MARK = "_dsv41_swa_cone_hook"
 RECEIPT_EVERY = 64
 
 # sha256 of inspect.getsource() of the engine pieces the argument above relies on, on the
-# pinned SGLang dsv4.1 tree (f80c91a4b + recipe patches). On drift: not installed (stock).
+# pinned SGLang dsv4.1 tree (f80c91a4b + recipe patches). On drift: RuntimeError at install (was: not installed).
 PINS = {
     "schedule_batch.Req.init_next_round_input":
         "1932d7fdf86159e584102564849deea0b3884940049c5873a545ba904ceaec65",
@@ -161,12 +161,17 @@ def configure(env=None):
     env = os.environ if env is None else env
     STATE.active = enabled(env)
     STATE.test = _truthy(env.get(ENV_TEST, "0"))
+    # Override site: with the gate on, a non-integer token count or min_save left DSV41_SWA_CONE
+    # silently not installed. A gate the user set must take effect, so this now stops the boot.
     try:
         STATE.tokens = int(env.get(ENV_TOKENS, DEFAULT_TOKENS))
         STATE.min_save = int(env.get(ENV_MIN_SAVE, DEFAULT_MIN_SAVE))
     except ValueError:
-        logger.warning("DSV41_SWA_CONE not installed: %s / %s must be integers", ENV_TOKENS, ENV_MIN_SAVE)
         STATE.active = False
+        if enabled(env):
+            raise RuntimeError(f"{ENV}={env.get(ENV)!r}: {ENV_TOKENS}={env.get(ENV_TOKENS)!r} / {ENV_MIN_SAVE}="
+                               f"{env.get(ENV_MIN_SAVE)!r} must be integers; the cone would not be "
+                               f"installed; refusing to boot") from None
     return STATE.active
 
 
@@ -510,17 +515,23 @@ def pin_drift(names=None, pins=None, originals=None):
 
 def _check(names, originals=None) -> bool:
     drift = pin_drift(names, originals=originals)
+    # Override site: engine source drift left a set DSV41_SWA_CONE silently not installed (stock
+    # match). A gate the user set must take effect, so drift now stops the boot.
     if drift:
         STATE.active = False
-        logger.warning("DSV41_SWA_CONE not installed: engine source drift in %s", ", ".join(drift))
-        return False
+        raise RuntimeError(f"{ENV}={os.environ.get(ENV, '')!r}: engine source drift in {', '.join(drift)}; "
+                           f"the cone would not be installed; refusing to boot")
     return True
 
 
+# Override site: an error in the plan or the model check turned a set DSV41_SWA_CONE off for the
+# rest of the process (stock match from then on). A gate the user set must not stop taking effect
+# silently, so the error now raises where it happens.
 def _disable(where, exc):
     STATE.errors += 1
     STATE.active = False
-    logger.warning("DSV41_SWA_CONE disabled after an error in %s: %r", where, exc)
+    raise RuntimeError(f"{ENV}={os.environ.get(ENV, '')!r}: error in {where} ({exc!r}); the cone would be "
+                       f"disabled for the rest of the process; refusing to continue") from exc
 
 
 def install_schedule_batch(module, env=None):
@@ -593,8 +604,10 @@ def guarded_select(orig, adder, req, args, kwargs, add_req_result):
     if res.extend_len >= plan.n and getattr(res, "is_chunked", False) is True:
         return res
     delta = plan.s - len(plan.stock["prefix_indices"])
+    # Fall-through site: a request whose first chunk does not cover the replay in a chunked pass
+    # goes back to its stock match (per-request eligibility). Kept; WARNING line per revert.
     revert(req)
-    logger.warning("DSV41_SWA_CONE revert: rid=%s first chunk %d (chunked=%s) does not cover replay %d "
+    logger.warning("WARNING DSV41_SWA_CONE revert: rid=%s first chunk %d (chunked=%s) does not cover replay %d "
                    "in a chunked pass: stock match kept", getattr(req, "rid", None), res.extend_len,
                    getattr(res, "is_chunked", None), plan.n)
     if "total_tokens" in kwargs:
@@ -659,9 +672,12 @@ def install_forward_batch(module, env=None):
             try:
                 late = getattr(getattr(model_runner.model, "model", None), "late_layer_start", None)
                 STATE.early_layers = int(late) if late is not None else None
+                # Override site: without decoder SWA bounded replay a set DSV41_SWA_CONE was silently
+                # inactive. A gate the user set must take effect, so this now stops at the first forward.
                 if late is None:
                     STATE.active = False
-                    logger.warning("DSV41_SWA_CONE inactive: decoder SWA bounded replay is off")
+                    raise RuntimeError(f"{ENV}={os.environ.get(ENV, '')!r}: decoder SWA bounded replay is off "
+                                       f"(no late_layer_start), so the cone would be inactive; refusing to boot")
             except Exception as exc:
                 _disable("model check", exc)
         cone = batch.__dict__.pop(BATCH_ATTR, None) if hasattr(batch, "__dict__") else None

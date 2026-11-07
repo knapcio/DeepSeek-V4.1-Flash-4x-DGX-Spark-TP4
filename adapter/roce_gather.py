@@ -9,6 +9,7 @@ import logging
 import os
 
 logger = logging.getLogger(__name__)
+_WARNED = []
 
 
 def install(module):
@@ -19,8 +20,21 @@ def install(module):
     def __init__(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
         roce = getattr(self, 'roce', None)
+        # Fall-through site: a communicator without a RoCE runtime keeps NCCL for every all-gather,
+        # so DSV41_ROCE_GATHER takes no effect on it. Kept (groups other than TP have no RoCE runtime);
+        # one WARNING line per process.
+        if roce is None and limit > 0 and not _WARNED:
+            _WARNED.append(True)
+            logger.warning('WARNING DSV41_ROCE_GATHER=%d: communicator rank=%s has no RoCE runtime; '
+                           'kernel chosen: NCCL all-gather on such communicators (logged once)',
+                           limit, getattr(self, 'rank', '?'))
         if roce is None or limit <= 0:
             return
+        # Override site: a DSV41_ROCE_GATHER above the runtime's slot size was silently clamped to the
+        # slot size. A value the user set must take effect, so it now stops the boot.
+        if limit > roce._slot_bytes:
+            raise RuntimeError(f'DSV41_ROCE_GATHER={limit}: above the RoCE slot size {roce._slot_bytes} bytes; '
+                               f'it would be clamped to {roce._slot_bytes}; refusing to boot')
         roce.max_gather_bytes = min(limit, roce._slot_bytes)
         roce.prepare((), padded_gather=True)
         self._roce_gather_logged = False

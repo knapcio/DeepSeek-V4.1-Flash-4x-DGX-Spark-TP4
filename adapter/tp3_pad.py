@@ -16,6 +16,7 @@ import os
 import torch
 
 logger = logging.getLogger(__name__)
+_WARNED_SHAPES = set()
 
 
 def _tp() -> int:
@@ -60,34 +61,39 @@ def pad_dsv41_hf_config(hf) -> None:
             if new_groups * per != new_heads:
                 new_groups = _ceil_to(new_groups, tp)
                 new_heads = new_groups * per
+        # Default changed by code (GB10 / SM12x relevant): heads and o_groups are padded so the local
+        # head count is one the SM120 sparse-MLA kernels instantiate. Kept (the purpose of
+        # DSV41_TP_PAD); the log line starts with WARNING.
         if new_heads != heads or new_groups != groups:
             text.o_groups = new_groups
             text.num_attention_heads = new_heads
             if hasattr(hf, 'num_attention_heads'):
                 hf.num_attention_heads = new_heads
             logger.warning(
-                'DSV41 TP pad: num_attention_heads %s→%s, o_groups %s→%s '
+                'WARNING DSV41_TP_PAD: num_attention_heads %s→%s, o_groups %s→%s '
                 '(tp=%s, local_heads=%s)',
                 heads, new_heads, groups, new_groups, tp, new_heads // tp,
             )
     draft = int(getattr(text, 'dspark_n_routed_experts', 0) or 0)
+    # Default changed by code: draft expert count padded to a multiple of tp. Kept; WARNING line.
     if draft and draft % tp:
         new_draft = _ceil_to(draft, tp)
         text.dspark_n_routed_experts = new_draft
         logger.warning(
-            'DSV41 TP pad: dspark_n_routed_experts %s→%s (tp=%s)',
+            'WARNING DSV41_TP_PAD: dspark_n_routed_experts %s→%s (tp=%s)',
             draft, new_draft, tp,
         )
     vis = getattr(hf, 'vision_config', None)
     if vis is not None:
         vh = int(getattr(vis, 'num_attention_heads', 0) or getattr(vis, 'num_heads', 0) or 0)
+        # Default changed by code: vision heads padded to a multiple of tp. Kept; WARNING line.
         if vh and vh % tp:
             nv = _ceil_to(vh, tp)
             if hasattr(vis, 'num_attention_heads'):
                 vis.num_attention_heads = nv
             if hasattr(vis, 'num_heads'):
                 vis.num_heads = nv
-            logger.warning('DSV41 TP pad: vision heads %s→%s', vh, nv)
+            logger.warning('WARNING DSV41_TP_PAD: vision heads %s→%s', vh, nv)
 
 
 def _install_vocab_pad() -> None:
@@ -120,8 +126,11 @@ def _install_config_pad() -> None:
                         self.hf_text_config.o_groups = int(text.o_groups)
                 if hasattr(self, 'num_attention_heads'):
                     self.num_attention_heads = int(text.num_attention_heads)
-        except Exception:
-            logger.exception('DSV41 TP config pad failed')
+        # Override site: a failed config pad was logged and the engine booted unpadded, so a set
+        # DSV41_TP_PAD (start.sh always passes it) took no effect. It now stops the boot.
+        except Exception as exc:
+            raise RuntimeError(f"DSV41_TP_PAD={os.environ.get('DSV41_TP_PAD', '')!r}: config pad failed "
+                               f"({exc!r}) at tp={_tp()}; refusing to boot") from exc
 
     ModelConfig.__init__ = wrapped
 
@@ -195,9 +204,17 @@ def _install_default_loader_pad() -> None:
     orig = wu.default_weight_loader
 
     def default_weight_loader(param, loaded_weight):
+        # Fall-through site: a shape mismatch in the stock loader is answered by zero-filling the
+        # parameter and copying the overlapping slice. Kept (the DSV41_TP_PAD pad); one WARNING line
+        # per (parameter shape, checkpoint shape) pair, at load time.
         try:
             return orig(param, loaded_weight)
         except AssertionError:
+            key = (tuple(param.data.shape), tuple(loaded_weight.shape))
+            if key not in _WARNED_SHAPES:
+                _WARNED_SHAPES.add(key)
+                logger.warning('WARNING DSV41_TP_PAD: default_weight_loader shape mismatch param=%s '
+                               'checkpoint=%s; zero-pad and copy the overlap', key[0], key[1])
             pdata = param.data
             pdata.zero_()
             if loaded_weight.numel() == 0:
@@ -211,10 +228,13 @@ def _install_default_loader_pad() -> None:
 
 
 def _install_moe_padded_loading() -> None:
+    # Override site: when FusedMoE could not be imported, padded MoE loading was silently not forced
+    # although DSV41_TP_PAD is set. It now stops the boot.
     try:
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    except Exception:
-        return
+    except Exception as exc:
+        raise RuntimeError(f"DSV41_TP_PAD={os.environ.get('DSV41_TP_PAD', '')!r}: FusedMoE import failed "
+                           f"({exc!r}); padded MoE loading would not be forced; refusing to boot") from exc
     orig = FusedMoE.use_padded_loading.fget if hasattr(FusedMoE.use_padded_loading, 'fget') else None
 
     def use_padded_loading(self) -> bool:
@@ -222,10 +242,13 @@ def _install_moe_padded_loading() -> None:
             return True
         return True
 
+    # Override site: a failed property assignment was logged and padded MoE loading not forced
+    # although DSV41_TP_PAD is set. It now stops the boot.
     try:
         FusedMoE.use_padded_loading = property(use_padded_loading)
-    except Exception:
-        logger.warning('could not force FusedMoE.use_padded_loading')
+    except Exception as exc:
+        raise RuntimeError(f"DSV41_TP_PAD={os.environ.get('DSV41_TP_PAD', '')!r}: could not force "
+                           f"FusedMoE.use_padded_loading ({exc!r}); refusing to boot") from exc
 
 
 def install() -> None:

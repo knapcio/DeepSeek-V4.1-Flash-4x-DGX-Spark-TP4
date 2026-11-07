@@ -58,6 +58,12 @@ if "all" in _TOKENS:
 _UNKNOWN = _TOKENS - {"draft", "accept", "vcap", "merge", "audit", "all", "1", "on"}
 if _UNKNOWN:
     raise ValueError(f"DSV41_SPEC_SYNC_FREE: unknown token(s) {sorted(_UNKNOWN)}")
+# Override site: an explicit "merge" next to "accept" (without audit) was silently dropped, because
+# accept removes the broadcasts merge would pack. A token the user set must take effect, so this
+# combination now stops the boot. "all", "1" and "on" add merge themselves and stay accepted.
+if {"merge", "accept"} <= _TOKENS and not _TOKENS & {"all", "1", "on", "audit"}:
+    raise RuntimeError(f"DSV41_SPEC_SYNC_FREE={_SPEC!r}: merge takes no effect when accept is dropped; "
+                       f"remove merge or accept; refusing to boot")
 if _TOKENS & {"1", "on"}:
     _TOKENS |= {"draft", "accept", "vcap", "merge"}
 ENABLED = bool(_TOKENS)

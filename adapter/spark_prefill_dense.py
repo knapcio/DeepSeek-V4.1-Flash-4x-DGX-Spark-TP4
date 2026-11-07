@@ -91,6 +91,13 @@ class NativePrefillTPSplit:
         if context<32768 or rows<1024:raise ValueError(settings)
         topology=(group.world_size in (4,8) and parallel.attn_cp_size==parallel.attn_dp_size==parallel.attn_dcp_size==1)
         hardware=torch.cuda.is_available() and torch.cuda.get_device_capability()==(12,1)
+        # Override site (GB10 / sm_121): SPARK_PREFILL_TP_SPLIT=1 on a GPU other than capability
+        # (12,1), or on a TP group that is not 4 or 8 ranks without CP/DP/DCP, was silently disabled.
+        # A gate the user set must take effect, so it now stops the boot. The draft model stays unsplit.
+        if settings[0]=='1' and not is_draft and not (topology and hardware):
+            raise RuntimeError(f'SPARK_PREFILL_TP_SPLIT=1: native prefill TP split needs capability (12,1) and a '
+                               f'TP group of 4 or 8 without CP/DP/DCP (capability ok={hardware}, topology ok={topology}, '
+                               f'world_size={group.world_size}); refusing to boot')
         enabled=settings[0]=='1' and topology and hardware and not is_draft
         logger.info('SPARK_NATIVE_PREFILL_TP_INIT rank=%s enabled=%s context=%s rows=%s draft=%s',group.rank_in_group,enabled,context,rows,is_draft)
         return cls(group,group.rank_in_group,group.world_size,enabled,context,rows)

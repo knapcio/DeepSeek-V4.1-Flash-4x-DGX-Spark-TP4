@@ -45,9 +45,11 @@ def normalize_chat_template_kwargs(kwargs):
     if has_thinking and has_enable:
         thinking = bool(out['thinking'])
         enable = bool(out['enable_thinking'])
+        # Override site: a request whose chat_template_kwargs set thinking and enable_thinking to
+        # different values gets thinking. The per-request choice is kept and logged as WARNING.
         if thinking != enable:
             logger.warning(
-                'chat_template_kwargs thinking=%r disagrees with enable_thinking=%r; '
+                'WARNING chat_template_kwargs thinking=%r disagrees with enable_thinking=%r; '
                 'using thinking', out['thinking'], out['enable_thinking'])
         out['thinking'] = thinking
         out['enable_thinking'] = thinking
@@ -63,12 +65,17 @@ def normalize_chat_template_kwargs(kwargs):
 def configured_max_new_tokens():
     """Return the completion-token default/cap, or 0 to leave the engine uncapped."""
     raw = os.environ.get('DSV41_MAX_NEW_TOKENS', str(DEFAULT_MAX_NEW_TOKENS)).strip()
+    # Override site: a non-integer DSV41_MAX_NEW_TOKENS used to be replaced by
+    # DEFAULT_MAX_NEW_TOKENS with a log line. A user-set invalid value now raises.
     try:
         return int(raw)
     except ValueError:
-        logger.warning('DSV41_MAX_NEW_TOKENS=%r is not an int; using %s',
-                       raw, DEFAULT_MAX_NEW_TOKENS)
-        return DEFAULT_MAX_NEW_TOKENS
+        raise RuntimeError(
+            f'DSV41_MAX_NEW_TOKENS={raw!r} is not an int (default {DEFAULT_MAX_NEW_TOKENS}, '
+            f'0 leaves completions uncapped)') from None
+
+
+_CLAMP_WARNED = []   # once-per-process guard for the request clamp WARNING line
 
 
 def apply_request_max_tokens(request):
@@ -86,7 +93,13 @@ def apply_request_max_tokens(request):
     if current is None:
         request.max_tokens = limit
         return request
+    # Override site: a request max_tokens / max_completion_tokens above DSV41_MAX_NEW_TOKENS is
+    # clamped to the cap. The per-request clamp is kept and logged once per process as WARNING.
     if current > limit:
+        if not _CLAMP_WARNED:
+            _CLAMP_WARNED.append(True)
+            logger.warning('WARNING DSV41_MAX_NEW_TOKENS=%s clamps a request max_tokens=%s to %s '
+                           '(logged once per process)', limit, current, limit)
         if completion is not None:
             request.max_completion_tokens = limit
         else:
@@ -121,6 +134,16 @@ def install_serving_chat(module):
         cls._convert_to_internal_request = _convert
 
     limit = configured_max_new_tokens()
+    # Override site: without OpenAIServingChat._convert_to_internal_request the completion-token
+    # cap is not applied. A user-set DSV41_MAX_NEW_TOKENS above 0 that cannot take effect now
+    # raises; with the variable unset the default cap is skipped and logged as WARNING.
+    if original_convert is None and limit > 0:
+        if os.environ.get('DSV41_MAX_NEW_TOKENS', '').strip():
+            raise RuntimeError(
+                f'DSV41_MAX_NEW_TOKENS={limit} is set but OpenAIServingChat has no '
+                f'_convert_to_internal_request to apply the cap')
+        logger.warning('WARNING DSV41_MAX_NEW_TOKENS default %s is not applied: OpenAIServingChat has no '
+                       '_convert_to_internal_request', limit)
     logger.warning(
         'DSV41 chat_template_kwargs: enable_thinking is accepted as an alias for thinking'
         + (f'; omitted max_tokens defaults and caps at {limit}' if limit > 0
@@ -141,8 +164,11 @@ def install_anthropic_protocol(module):
     cls = getattr(module, 'AnthropicThinkingParam', None)
     validators = getattr(getattr(cls, '__pydantic_decorators__', None), 'model_validators', {})
     entry = validators.get('_validate_thinking_shape')
+    # Override sites (here and the source-drift check below): no environment variable gates this
+    # patch, so a missing or drifted AnthropicThinkingParam shape check keeps the stock validator
+    # (enabled without budget_tokens answers 400). The fall-through is kept and logged as WARNING.
     if entry is None:
-        logger.warning('DSV41 Anthropic thinking: AnthropicThinkingParam shape check not found; unchanged')
+        logger.warning('WARNING DSV41 Anthropic thinking: AnthropicThinkingParam shape check not found; unchanged')
         return False
     if getattr(entry.func, '_dsv41_optional_budget', False):
         return False
@@ -152,7 +178,7 @@ def install_anthropic_protocol(module):
         if hashlib.sha256(source.encode()).hexdigest() != ANTHROPIC_THINKING_SHAPE_SHA256:
             raise ValueError('AnthropicThinkingParam._validate_thinking_shape source drift')
     except (TypeError, OSError, ValueError) as exc:
-        logger.warning('DSV41 Anthropic thinking: refusing to patch; %s; unchanged', exc)
+        logger.warning('WARNING DSV41 Anthropic thinking: refusing to patch; %s; unchanged', exc)
         return False
 
     def _validate_thinking_shape(self):

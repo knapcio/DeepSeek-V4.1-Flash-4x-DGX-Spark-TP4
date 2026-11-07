@@ -169,6 +169,31 @@ def eligible(x_flat, hc_fn, hc_mult, min_rows=None):
     )
 
 
+_warned: set = set()   # once-per-site guard for the WARNING lines of the stock fall-throughs
+
+
+def _warn_ineligible(x_flat, hc_fn, hc_mult):
+    """WARNING once per reason when an ineligible call falls through to the stock kernels.
+
+    Below DSV41_HC_FUSED_MIN_ROWS rows the stock path is the configured behavior, so no line.
+    """
+    # Override site: a call whose shape, dtype, stride, device or hc_mult the fused Triton kernel
+    # (GB10 sm_121) does not cover runs the stock split-K + reduce kernels. The fall-through is
+    # kept and logged once per reason; the row threshold DSV41_HC_FUSED_MIN_ROWS is not logged.
+    if _state["disabled"]:
+        return
+    if x_flat.dim() == 2 and _logical_rows(x_flat) < MIN_ROWS:
+        return
+    reason = (f"x_flat dim={x_flat.dim()} trailing shape={tuple(x_flat.shape[1:])} "
+              f"inner stride={x_flat.stride()[1:]} dtype={x_flat.dtype} "
+              f"cuda={x_flat.is_cuda} hc_mult={hc_mult} hc_fn shape={tuple(hc_fn.shape)} dtype={hc_fn.dtype}")
+    if reason in _warned:
+        return
+    _warned.add(reason)
+    print(f"WARNING DSV41 hc_fused: kernel hc_mix_stats_sinkhorn falls back to stock for ineligible input "
+          f"({reason})", flush=True)
+
+
 def check_engine(mod):
     """Raise if anything the exactness argument relies on differs from the audited engine."""
     for name, want in _EXPECTED.items():
@@ -192,10 +217,15 @@ def _self_check(stock, args):
     _state["checked"] = True
     ref = stock(*args)
     got = fused_mix_stats_sinkhorn(_state["mod"], *args)
+    # Override site: a first-call mismatch of the fused Triton kernel (GB10 sm_121 lowering) used
+    # to disable the kernel for good and serve the stock kernels. DSV41_HC_FUSED is set on
+    # whenever this runs, so the gate that does not take effect now raises.
     if not all(torch.equal(a, b) for a, b in zip(ref, got)):
         _state["disabled"] = True
-        logger.error("hc_fused: fused hc stats differ from stock on live inputs; using stock")
-        print("DSV41 hc_fused: MISMATCH vs stock on first call, disabled", flush=True)
+        logger.error("hc_fused: fused hc stats differ from stock on live inputs")
+        raise RuntimeError(
+            f"hc_fused: DSV41_HC_FUSED={os.environ.get('DSV41_HC_FUSED', '')!r} is set but the fused hc stats "
+            f"differ from stock on the first live call ({args[0].shape[0]} rows)")
     else:
         print(f"DSV41 hc_fused: first call ({args[0].shape[0]} rows) bit-identical to stock", flush=True)
     return ref
@@ -213,9 +243,16 @@ def install(mod):
                               rms_eps, hc_eps):
         args = (x_flat, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, rms_eps, hc_eps)
         if _state["disabled"] or not eligible(x_flat, hc_fn, hc_mult):
+            _warn_ineligible(x_flat, hc_fn, hc_mult)
             return stock(*args)
         if not _state["checked"]:
             if torch.cuda.is_current_stream_capturing():
+                # Override site: an eligible call inside CUDA-graph capture before the first-call
+                # self-check runs the stock kernels. The fall-through is kept and logged once.
+                if "capture_before_check" not in _warned:
+                    _warned.add("capture_before_check")
+                    print("WARNING DSV41 hc_fused: kernel hc_mix_stats_sinkhorn uses stock inside CUDA-graph "
+                          "capture because the fused kernel is not self-checked yet", flush=True)
                 return stock(*args)  # never capture an unchecked kernel
             return _self_check(stock, args)
         return fused_mix_stats_sinkhorn(mod, *args)

@@ -134,8 +134,14 @@ try:
             i = tl.load(I + anchor * SI + k, dead, 0)
             tl.store(W + r * SW + k, w, dead)
             tl.store(I + r * SI + k, i, dead)
-except Exception:                                   # no triton: fall back to index_select
+# Fall-through site (GB10 / sm_121 relevant): when Triton is missing or the remap kernel cannot be
+# defined, DSV41_VERIFY_CAP remaps dead rows with two index_select copies instead of the in-place
+# kernel. Same values; kept, with one WARNING line at import when the gate is on.
+except Exception as _exc:                           # no triton: fall back to index_select
     _remap_kernel = None
+    if ENABLED:
+        print(f"[verify_cap] WARNING DSV41_VERIFY_CAP={SPEC!r}: Triton remap kernel unavailable ({_exc!r}); "
+              f"kernel chosen: index_select", flush=True)
 
 
 def remap_dead_rows(weights, indices):
@@ -150,6 +156,14 @@ def remap_dead_rows(weights, indices):
         _remap_kernel[(1,)](weights, indices, live_buf(indices.device), m, weights.stride(0),
                             indices.stride(0), STRIDE, K_TARGET, triton.next_power_of_2(m))
         return weights, indices
+    # Fall-through site: a verify batch the in-place kernel does not take (non-contiguous router
+    # output, K != 6, or M > 1024 rows) is remapped with index_select. Same values; kept, with one
+    # WARNING line per process when the kernel exists but the shape is refused.
+    if _remap_kernel is not None and not _state.get("warned_shape"):
+        _state["warned_shape"] = True
+        print(f"[verify_cap] WARNING DSV41_VERIFY_CAP={SPEC!r}: remap kernel refused M={m} "
+              f"K={weights.shape[1]} contiguous={weights.is_contiguous() and indices.is_contiguous()}; "
+              f"kernel chosen: index_select for such batches (logged once)", flush=True)
     src = _src_rows(m, indices.device)
     return weights.index_select(0, src), indices.index_select(0, src)
 

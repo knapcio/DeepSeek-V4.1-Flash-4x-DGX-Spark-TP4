@@ -81,6 +81,18 @@ def _enabled() -> bool:
     return os.environ.get("DSV41_SHARED_PAD_K", "0").strip() not in ("0", "off", "false", "")
 
 
+# Override site: DSV41_SHARED_PAD_K=1 with the MXFP8 overlay off (DSV41_MXFP8_BACKEND '', cutlass,
+# off or 0) padded the weight for a b12x kernel that never runs. A gate the user set must take
+# effect, so this combination now stops the boot.
+def _refuse_without_b12x() -> None:
+    from mxfp8_mode import mxfp8_backend_disabled
+    backend = os.environ.get("DSV41_MXFP8_BACKEND", "b12x")
+    if mxfp8_backend_disabled(backend):
+        raise RuntimeError(
+            f"DSV41_SHARED_PAD_K={os.environ.get('DSV41_SHARED_PAD_K', '')!r} needs the b12x MXFP8 overlay, "
+            f"but DSV41_MXFP8_BACKEND={backend!r} turns it off; refusing to boot")
+
+
 def _looks_like_shared_down(layer) -> bool:
     w = getattr(layer, "weight", None)
     return (w is not None and w.ndim == 2
@@ -146,16 +158,18 @@ def _pad_input(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     key = (weight.data_ptr(), x2.dtype, x2.device.index)
     buf = _bufs.get(key)
     if buf is None or buf.shape[0] < rows:
+        # Fall-through site: more rows than DSV41_SHARED_PAD_BUF_ROWS take a freshly allocated
+        # padded input instead of the persistent buffer. Same values; kept, WARNING line once.
         if rows > cap:
             # Prefill is eager (prefill CUDA graph: disabled), so allocating here is
             # safe; the decode graph never reaches this branch.
             if not _state["warned_big"]:
                 _state["warned_big"] = True
                 logger.warning(
-                    "DSV41 shared-expert K padding: %d rows exceed the %d-row buffer, "
+                    "WARNING DSV41_SHARED_PAD_BUF_ROWS=%d: %d rows exceed the buffer, "
                     "allocating on the fly. Expected for prefill, which runs eager; raise "
                     "DSV41_SHARED_PAD_BUF_ROWS only if this appears for a decode batch.",
-                    rows, cap,
+                    cap, rows,
                 )
             out = torch.zeros((rows, TGT_K), dtype=x2.dtype, device=x2.device)
             out[:, :SRC_K] = x2
@@ -171,6 +185,7 @@ def install_fp8(module):
     prepared, so the swizzle already runs on the 640 shape."""
     if not _enabled():
         return
+    _refuse_without_b12x()
     cls = getattr(module, "Fp8LinearMethod", None)
     if cls is None or not hasattr(cls, "_prepare_block_fp8_as_mxfp8"):
         raise RuntimeError(
@@ -205,6 +220,7 @@ def install(module):
     Install AFTER mxfp8_b12x.install so this wraps its wrapper, not the original."""
     if not _enabled():
         return
+    _refuse_without_b12x()
     inner = module.flashinfer_mxfp8_blockscaled_linear
 
     def linear(input, weight, weight_scale, input_scale=None, bias=None,
@@ -222,12 +238,23 @@ def install(module):
                 _state["logged_accept"] = True
                 out = inner(input, weight, weight_scale, input_scale, bias,
                             output_dtype, backend=backend, pin_tactic=pin_tactic)
+                # Fall-through site (GB10 / sm_121): when mxfp8_b12x cannot be read, whether b12x
+                # took the padded shape is unknown; kept, the log line below starts with WARNING.
                 try:
                     from mxfp8_b12x import _REJECTED
                     accepted = (HID, TGT_K) not in _REJECTED
                 except Exception:
                     accepted = None
+                # Override site (GB10 / sm_121): when b12x rejected the padded N x K, the layer still
+                # ran CUTLASS and DSV41_SHARED_PAD_K=1 only added the padding. A gate the user set
+                # must take effect, so this now stops at the first call (warm-up).
+                if accepted is False:
+                    raise RuntimeError(
+                        f"DSV41_SHARED_PAD_K={os.environ.get('DSV41_SHARED_PAD_K', '')!r}: DSV41_MXFP8_BACKEND="
+                        f"{os.environ.get('DSV41_MXFP8_BACKEND', 'b12x')!r} rejected the "
+                        f"padded shape N={HID} K={TGT_K}, so the layer stays on CUTLASS; refusing to continue")
                 logger.warning(
+                    ("WARNING " if accepted is None else "") +
                     "DSV41 shared-expert K padding: first call N=%d K=%d went through; "
                     "b12x accepted the shape: %s (%d layers padded)",
                     HID, TGT_K, accepted, _state["padded"],

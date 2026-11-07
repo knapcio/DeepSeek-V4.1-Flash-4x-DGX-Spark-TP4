@@ -316,9 +316,23 @@ def check_plan_table():
     assert det["p6"] == d["p6"] and det["p3"] == d["p3"], det
     assert table({"DSV41_MOE_B12X_NEXT_SMALL_PLAN": "internal:none:16"})["p6"][0] == ["internal", None, 16]
     t = table({"DSV41_MOE_B12X_NEXT_DETERMINISTIC": "1", "DSV41_MOE_B12X_NEXT_DET_TRITON": "0",
-               "DSV41_MOE_B12X_NEXT_PLAN_TABLE": "1-8=triton:48:16, 40-80@k3=internal:32:16, 96=heur, 9-96=internal:none:16"})
+               "DSV41_MOE_B12X_NEXT_PLAN_TABLE": "1-8=internal:48:16, 40-80@k3=internal:32:16, 96=heur, 9-96=internal:none:16"})
     assert t["p6"] == [["internal", 48, 16]] * 3 + [["internal", None, 16], None, None], t
     assert t["p3"] == [["internal", 48, 16], ["internal", 32, 16], ["internal", 32, 16]], t
+    # an operator-set triton entry that determinism would turn into internal, or SMALL_PLAN beside PLAN_TABLE,
+    # refuses to load instead of being masked
+    det0 = {"DSV41_MOE_B12X_NEXT_DETERMINISTIC": "1", "DSV41_MOE_B12X_NEXT_DET_TRITON": "0"}
+    for env, needle in ((dict(det0, DSV41_MOE_B12X_NEXT_PLAN_TABLE="1-8=triton:48:16"), "asks for the triton"),
+                        (dict(det0, DSV41_MOE_B12X_NEXT_SMALL_PLAN="triton:48:16"), "asks for the triton"),
+                        ({"DSV41_MOE_B12X_NEXT_SMALL_PLAN": "internal:none:16",
+                          "DSV41_MOE_B12X_NEXT_PLAN_TABLE": "1-8=heur"}, "replaces the whole plan table"),
+                        ({"CUDA_GRAPH_MAX_BS_DECODE": "8", "DSV41_MOE_B12X_NEXT_GRAPH_BS": "1,2,16"}, "never captured"),
+                        ({"CHUNKED_PREFILL_SIZE": "8192", "DSV41_MOE_B12X_NEXT_LADDER": "128,4096"}, "tops out below")):
+        try:
+            run(TABLE, env=env)
+            raise RuntimeError(f"{env!r} was accepted")
+        except AssertionError as exc:
+            assert needle in str(exc), (env, str(exc)[-300:])
     for bad in ("1-8=cutlass:48:16", "8-1=internal:48:16", "x=heur", "1-8=internal:48"):
         try:
             run(TABLE, env={"DSV41_MOE_B12X_NEXT_PLAN_TABLE": bad})
@@ -352,6 +366,14 @@ def check_det_triton_probe():
             res = json.loads(out.split("RESULT ", 1)[1])
             assert res["after"] == want and res["p3"] == want[0], (kind, env, res)
             assert ("lacks the det-triton-planner patch" in out) == warn, (kind, env, out[-500:])
+    # an operator-set DET_TRITON=1 on a runtime without the patch refuses to boot instead of falling back
+    with tempfile.TemporaryDirectory() as tree:
+        make_tree(tree, pinned, det="stock")
+        try:
+            run(PROBE, env=dict(det, DSV41_MOE_B12X_NEXT_DET_TRITON="1"), path=tree)
+            raise RuntimeError("DET_TRITON=1 on a stock runtime was accepted")
+        except AssertionError as exc:
+            assert "needs the det-triton-planner patch" in str(exc), str(exc)[-300:]
     print("det-triton probe: patched runtime keeps the triton planner under DETERMINISTIC; stock / absent "
           "sources fall back to internal with a WARNING; non-deterministic and DET_TRITON=0 unaffected")
 

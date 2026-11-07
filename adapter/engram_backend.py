@@ -129,9 +129,20 @@ def install(module):
         # sized to DSV41_ENGRAM_DRM_MIB (<= 2032, multiple of 16). Its keys stay in ordinary memory.
         drm_node = os.getenv('DSV41_ENGRAM_DRM_NODE', '')
         drm_layer = os.getenv('DSV41_ENGRAM_DRM_LAYER', '')
+        # Override site: a set DSV41_ENGRAM_DRM_NODE whose device path does not exist used to leave
+        # every row cache in ordinary memory silently. The user-set gate that cannot take effect raises.
+        if drm_node and not os.path.exists(drm_node):
+            raise RuntimeError(f'DSV41_ENGRAM_DRM_NODE={drm_node!r} is set but the device path does not exist')
         if (drm_node and os.path.exists(drm_node) and not _DRM_USED[0]
                 and (not drm_layer or int(drm_layer) == layer_id)):
             pool = int(os.getenv('DSV41_ENGRAM_DRM_MIB', '1792')) << 20
+            # Override site: the DRM layer's row cache is capped at the DSV41_ENGRAM_DRM_MIB pool, so
+            # its DSV41_CACHE_GIB share shrinks when the pool is smaller. The pool size is the
+            # documented size of that layer's cache, so the cap is kept and logged as WARNING.
+            if pool * 272 // 264 < budget:
+                logging.getLogger(__name__).warning(
+                    'WARNING DSV41_CACHE_GIB share of Engram layer %s is capped from %d to %d bytes by '
+                    'DSV41_ENGRAM_DRM_MIB=%d', layer_id, budget, pool * 272 // 264, pool >> 20)
             budget = min(budget, pool * 272 // 264)          # slots * 264 B of rows fit the pool
             _lib.row_store_next_cache_on_drm(drm_node.encode(), pool)
             _DRM_USED[0] = True
@@ -145,8 +156,15 @@ def install(module):
         packed_dir = os.environ.get('DSV41_PACKED_DIR', '')
         if packed_dir:
             shard = Path(packed_dir)/f'engram-l{layer_id}-r{rank}of{self.tp_size}.bin'
+            # Override site: a missing packed shard under DSV41_PACKED_DIR makes every miss read the
+            # checkpoint instead of the local shard. start.sh always sets DSV41_PACKED_DIR, so the
+            # fall-through is kept and logged as WARNING once per Engram layer.
             if shard.exists():
                 _lib.row_store_attach_packed(self._store, str(shard).encode(), layer_id)
+            else:
+                logging.getLogger(__name__).warning(
+                    'WARNING DSV41_PACKED_DIR=%s has no %s; Engram layer %s misses read the checkpoint',
+                    packed_dir, shard.name, layer_id)
         _register_store(self._store, layer_id)
         self._staging = {}
         self._works = {}

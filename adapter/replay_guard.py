@@ -17,6 +17,7 @@ import logging
 import os
 
 logger = logging.getLogger(__name__)
+_WARNED = []
 
 
 def enabled():
@@ -49,10 +50,17 @@ def install(module):
     original = cls._validate_one_request
 
     def _validate_one_request(self, obj, input_ids):
+        # Fall-through site: when the engine's enable_decoder_swa_bounded_replay feature cannot be
+        # read, DSV41_REPLAY_GUARD assumes bounded replay is on (the safe side: such requests get a
+        # 400). Kept; one WARNING line per process, because this runs on every request.
         try:
             bounded = bool(module.get_exec().features.enable_decoder_swa_bounded_replay)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             bounded = True
+            if not _WARNED:
+                _WARNED.append(True)
+                logger.warning('WARNING DSV41_REPLAY_GUARD: enable_decoder_swa_bounded_replay unreadable (%r); '
+                               'assuming bounded replay is on (logged once)', exc)
         if type(obj).__name__ == 'GenerateReqInput':
             check(obj, input_ids, bounded)
         return original(self, obj, input_ids)

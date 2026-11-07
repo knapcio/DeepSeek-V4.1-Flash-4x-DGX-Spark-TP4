@@ -185,7 +185,9 @@ def drop_bf16(model):
         _DROPPED.add(tag.data_ptr())
         freed += 1
     torch.cuda.empty_cache()
-    print(f"[wo_a_w8] released the bf16 copy of {freed} wo_a weights ({freed * 16.8:.0f} MB); "
+    # Fall-through site: a twin whose dequantized copy is not bit-identical keeps its bf16 storage
+    # (DSV41_WO_A_W8_DROP skipped for it). Kept; the line starts with WARNING when any is kept.
+    print(f"[wo_a_w8] {'WARNING DSV41_WO_A_W8_DROP: ' if mismatched else ''}released the bf16 copy of {freed} wo_a weights ({freed * 16.8:.0f} MB); "
           f"{mismatched} kept (dequantized copy not bit-identical)", flush=True)
 
 
@@ -281,7 +283,15 @@ def build_twins(model: torch.nn.Module) -> tuple[int, int]:
             continue
         _TWINS[w3.data_ptr()] = twin
         made += 1
-    print(f"[wo_a_w8] fp8 twins for {made} wo_a weights, {kept} left on bf16", flush=True)
+    # Override site: when no wo_a weight has an exact fp8 twin, a set DSV41_WO_A_W8 took no effect
+    # (every weight stayed on bf16). It now stops the boot.
+    if made == 0 and kept > 0:
+        raise RuntimeError(f"DSV41_WO_A_W8={os.environ.get('DSV41_WO_A_W8', '')!r}: none of {kept} wo_a weights has "
+                           f"an exact fp8 twin, so every call stays on bf16; refusing to boot")
+    # Fall-through site: a wo_a weight whose fp8 twin is not bit-exact stays on the bf16 path. Kept
+    # (per-weight eligibility); the line starts with WARNING when any weight is kept, at load time.
+    print(f"[wo_a_w8] {'WARNING DSV41_WO_A_W8: ' if kept else ''}fp8 twins for {made} wo_a weights, "
+          f"{kept} left on bf16", flush=True)
     return made, kept
 
 

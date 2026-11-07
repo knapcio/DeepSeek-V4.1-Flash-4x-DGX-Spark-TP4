@@ -41,7 +41,7 @@ of plans, so the M -> plan mapping is rank-invariant. Race buffers are released 
 
 Knobs: DSV41_MOE_B12X_NEXT_TUNE (1), _TUNE_ROWS ("6:6,3:5" top-k:rows raced), _GRAPH_BS
 ("1,2,3,4,5,6,7,8,10,12,14,16"), _LADDER ("128,256,512,1024,2048,4096"), _CACHE_ONLY (0),
-_WARM (1: run every plan once at load), _DETERMINISTIC (0; EP1 only, b12x rejects it at N=1152;
+_WARM (1: run every plan once at load), _DETERMINISTIC (0; EP1 only, the adapter refuses EP>1 (N=1152);
 nothing is raced: b12x's race cannot compile the deterministic top-k sum kernel), _DET_TRITON (1:
 under _DETERMINISTIC the pinned plans keep the Triton route planner, which needs the runtime patch
 scripts/b12x_next-det-triton-planner.patch, else internal with a warning; 0: internal planner),
@@ -88,6 +88,28 @@ def _env(name, default):
     return os.environ.get(name, default).strip()
 
 
+# Override policy of this adapter: a value the operator set explicitly (the variable is present in the
+# environment) that the adapter would replace, ignore or downgrade stops the engine with a RuntimeError
+# naming the variable, its value and the conflicting setting. A default that the adapter changes, or a
+# fallback to another kernel or path, keeps its behaviour and prints one WARNING line.
+def _user_set(name):
+    return name in os.environ
+
+
+def _user_val(name):
+    return f"{name}={os.environ.get(name, '')!r}"
+
+
+_WARNED = set()
+
+
+def _warn_once(key, msg):
+    """One WARNING line per fall-through site, so a hot path does not flood the log."""
+    if key not in _WARNED:
+        _WARNED.add(key)
+        print(f"{_TAG} WARNING: {msg}", flush=True)
+
+
 def _ints(text):
     return [int(v) for v in text.replace(" ", "").split(",") if v]
 
@@ -129,7 +151,18 @@ def _peak_mb(dev, base):
 
 GRAPH_BS = _ints(_env("DSV41_MOE_B12X_NEXT_GRAPH_BS", "1,2,3,4,5,6,7,8,10,12,14,16"))
 _MAX_BS = int(_env("CUDA_GRAPH_MAX_BS_DECODE", "16") or 16)
+# OVERRIDE: graph batch sizes above CUDA_GRAPH_MAX_BS_DECODE are dropped (the engine never captures them;
+# an empty result becomes [1]). An operator-set DSV41_MOE_B12X_NEXT_GRAPH_BS that loses an entry is a
+# masked setting: refuse to boot. The default list is trimmed with a WARNING.
+_GRAPH_BS_ASKED = GRAPH_BS
 GRAPH_BS = [b for b in GRAPH_BS if b <= _MAX_BS] or [1]
+if GRAPH_BS != _GRAPH_BS_ASKED:
+    if _user_set("DSV41_MOE_B12X_NEXT_GRAPH_BS"):
+        raise RuntimeError(f"DSV41_MOE_B12X_NEXT: {_user_val('DSV41_MOE_B12X_NEXT_GRAPH_BS')} would become "
+                           f"{GRAPH_BS}: batch sizes above CUDA_GRAPH_MAX_BS_DECODE={_MAX_BS} are never captured; "
+                           f"refusing to boot (list only batch sizes <= {_MAX_BS})")
+    print(f"{_TAG} WARNING: DSV41_MOE_B12X_NEXT_GRAPH_BS (default) trimmed to {GRAPH_BS} by "
+          f"CUDA_GRAPH_MAX_BS_DECODE={_MAX_BS}", flush=True)
 BLOCK = int(_env("DSPARK_BLOCK_SIZE", "5") or 5)
 LADDER = _ints(_env("DSV41_MOE_B12X_NEXT_LADDER", "128,256,512,1024,2048,4096"))
 # Prefill capacities of the compact N64 geometry (EP1, N=576) on the M64 tile instead of b12x's M16 pin.
@@ -146,16 +179,27 @@ SMALL_PLANNER, SMALL_MAC, SMALL_TILE = _SMALL[0], (int(_SMALL[1]) if _SMALL[1] !
 # front-end with one 1-CTA Triton launch. Measured (diagnostics/dsv41-moe-launch): -3.5 us per call at
 # E=128, bit-identical on 9530 cases (M 1-8, 12-64, eager and graph).
 DET_TRITON = _env("DSV41_MOE_B12X_NEXT_DET_TRITON", "1") not in ("0", "off", "false", "")
+# OVERRIDE: DSV41_MOE_B12X_NEXT_PLAN_TABLE replaces the whole plan table, and SMALL_PLAN only feeds the
+# default table, so an operator-set SMALL_PLAN beside an operator-set PLAN_TABLE is never used: refuse to boot.
+if _user_set("DSV41_MOE_B12X_NEXT_SMALL_PLAN") and _user_set("DSV41_MOE_B12X_NEXT_PLAN_TABLE"):
+    raise RuntimeError(f"DSV41_MOE_B12X_NEXT: {_user_val('DSV41_MOE_B12X_NEXT_SMALL_PLAN')} is ignored because "
+                       f"{_user_val('DSV41_MOE_B12X_NEXT_PLAN_TABLE')} replaces the whole plan table; refusing to "
+                       f"boot (set only one of them)")
+# OVERRIDE: under DETERMINISTIC with DET_TRITON=0 a triton small plan runs the internal route planner.
+# SMALL_PLANNER is informational here; the plan table parse below is where the planner is replaced, and it
+# raises for an operator-set triton plan and warns for the default one.
 if DETERMINISTIC and SMALL_PLANNER == "triton" and not DET_TRITON:
     # b12x's Triton route planner refuses deterministic compact queries (_tuning validation)
     SMALL_PLANNER = "internal"
 
 
-def parse_plan_table(text, deterministic):
+def parse_plan_table(text, deterministic, source=None, why="DSV41_MOE_B12X_NEXT_DET_TRITON=0"):
     """``lo-hi[@k<top-k>]=<planner>:<mac|none>:<tile>`` or ``...=heur``, comma-separated; first match wins.
 
     Returns [(lo, hi, top-k or None, (planner, mac, tile) or None)]. ``heur`` = no override (b12x's
-    heuristic plan). Under determinism a ``triton`` planner becomes ``internal`` (b12x refuses it)."""
+    heuristic plan). Under determinism a ``triton`` planner becomes ``internal`` (b12x refuses it).
+    ``source`` is "NAME='value'" of the operator-set variable that supplied ``text`` (None = default
+    table); ``why`` names the setting that forces the internal planner."""
     table = []
     for item in text.replace(" ", "").split(","):
         if not item:
@@ -173,7 +217,15 @@ def parse_plan_table(text, deterministic):
                 planner, mac, tile = spec.split(":")
                 if planner not in ("internal", "triton"):
                     raise ValueError(planner)
+                # OVERRIDE: a triton route planner becomes internal under determinism without the
+                # det-triton path. Operator-set triton entry: refuse to boot. Default table: WARNING.
                 if deterministic and planner == "triton":
+                    if source is not None:
+                        raise RuntimeError(f"DSV41_MOE_B12X_NEXT: {source}: entry {item!r} asks for the triton "
+                                           f"route planner, but DSV41_MOE_B12X_NEXT_DETERMINISTIC=1 with {why} "
+                                           f"runs the internal planner; refusing to boot")
+                    _warn_once(("plan", item, why), f"default plan entry {item!r} runs the internal route "
+                               f"planner instead of triton: DSV41_MOE_B12X_NEXT_DETERMINISTIC=1 with {why}")
                     planner = "internal"
                 plan = (planner, None if mac == "none" else int(mac), int(tile))
         except ValueError as exc:
@@ -191,7 +243,17 @@ def parse_plan_table(text, deterministic):
 # heuristic beyond noise; every candidate was bit-identical to it; the calls run at the ~214 GB/s MoE
 # read ceiling, so the per-call cost is set by the distinct experts' bytes, not the plan.
 _PLAN_TABLE_SPEC = _env("DSV41_MOE_B12X_NEXT_PLAN_TABLE", f"1-8={_SMALL_SPEC}")
-PLAN_TABLE = parse_plan_table(_PLAN_TABLE_SPEC, DETERMINISTIC and not DET_TRITON)
+
+
+def _plan_table_source():
+    """NAME='value' of the operator-set variable that supplies the plan table text, or None (default)."""
+    for name in ("DSV41_MOE_B12X_NEXT_PLAN_TABLE", "DSV41_MOE_B12X_NEXT_SMALL_PLAN"):
+        if _user_set(name):
+            return _user_val(name)
+    return None
+
+
+PLAN_TABLE = parse_plan_table(_PLAN_TABLE_SPEC, DETERMINISTIC and not DET_TRITON, _plan_table_source())
 
 
 def _det_triton_supported(fimpl):
@@ -213,7 +275,16 @@ def table_plan(cap, topk):
             return plan
     return None
 _CHUNK_ENV = int(_env("CHUNKED_PREFILL_SIZE", "0") or 0)
+# OVERRIDE: a prefill chunk larger than the top ladder capacity adds that capacity to the ladder. An
+# operator-set DSV41_MOE_B12X_NEXT_LADDER that lacks it would be changed: refuse to boot (add the chunk size
+# to the ladder). The default ladder is extended with a WARNING.
 if _CHUNK_ENV > max(LADDER):
+    if _user_set("DSV41_MOE_B12X_NEXT_LADDER"):
+        raise RuntimeError(f"DSV41_MOE_B12X_NEXT: {_user_val('DSV41_MOE_B12X_NEXT_LADDER')} tops out below "
+                           f"CHUNKED_PREFILL_SIZE={_CHUNK_ENV}, and the adapter would add {_CHUNK_ENV} to it; "
+                           f"refusing to boot (add {_CHUNK_ENV} to the ladder)")
+    print(f"{_TAG} WARNING: DSV41_MOE_B12X_NEXT_LADDER (default) extended with CHUNKED_PREFILL_SIZE="
+          f"{_CHUNK_ENV}", flush=True)
     LADDER.append(_CHUNK_ENV)
 TUNE_ROWS = {int(k): int(v) for k, v in (p.split(":") for p in
              _env("DSV41_MOE_B12X_NEXT_TUNE_ROWS", "6:6,3:5").split(",") if p)}
@@ -246,8 +317,11 @@ def _b12x():
         try:
             os.makedirs(root, exist_ok=True)
             os.environ["B12X_NEXT_COMPILE_CACHE_DIR"] = root
-        except OSError:
-            pass
+        # FALL-THROUGH: the default compile cache directory cannot be created; b12x_next keeps its own
+        # default location. Not operator-set (this branch runs only when the variable is unset): WARNING.
+        except OSError as exc:
+            print(f"{_TAG} WARNING: B12X_NEXT_COMPILE_CACHE_DIR (default) {root} cannot be created ({exc!r}); "
+                  f"b12x_next uses its built-in cache location", flush=True)
     if os.environ.get("B12X_NEXT_COMPILE_CACHE_DIR") == os.environ.get("B12X_COMPILE_CACHE_DIR"):
         _die("B12X_NEXT_COMPILE_CACHE_DIR must differ from the SG17 B12X_COMPILE_CACHE_DIR")
     try:
@@ -277,9 +351,16 @@ def _b12x():
         from b12x_next.moe.fused_moe import _impl as fimpl
     except ImportError:
         fimpl = None
+    # OVERRIDE: DET_TRITON=1 under DETERMINISTIC needs the det-triton-planner runtime patch; without it the
+    # pinned plans move to the internal route planner. Operator-set DET_TRITON=1, or an operator-set triton
+    # plan (PLAN_TABLE / SMALL_PLAN), is then masked: refuse to boot. The default falls back with a WARNING.
     if DETERMINISTIC and DET_TRITON and not _det_triton_supported(fimpl):
+        if _user_set("DSV41_MOE_B12X_NEXT_DET_TRITON"):
+            _die(f"{_user_val('DSV41_MOE_B12X_NEXT_DET_TRITON')} with DSV41_MOE_B12X_NEXT_DETERMINISTIC=1 needs the "
+                 f"det-triton-planner patch (scripts/b12x_next-det-triton-planner.patch), which this b12x_next lacks")
         global PLAN_TABLE
-        PLAN_TABLE = parse_plan_table(_PLAN_TABLE_SPEC, True)
+        PLAN_TABLE = parse_plan_table(_PLAN_TABLE_SPEC, True, _plan_table_source(),
+                                      "a b12x_next runtime that lacks the det-triton-planner patch")
         print(f"{_TAG} WARNING: DSV41_MOE_B12X_NEXT_DET_TRITON=1 but this b12x_next lacks the "
               f"det-triton-planner patch; deterministic plans use the internal planner", flush=True)
     _B.update(fm=fm, prep=prep, pkg=b12x_next,
@@ -400,7 +481,21 @@ class _Geometry:
         self.key = key
         self.E, self.K, self.N, self.topk = num_experts, hidden, inter, topk
         self.offset = ep_rank * num_experts
+        # OVERRIDE: DETERMINISTIC is documented as EP1 only (N=1152 at EP>1). The adapter had no check, so an
+        # operator-set DETERMINISTIC=1 at EP>1 was left to b12x; refuse to boot instead.
+        if DETERMINISTIC and int(ep_size) != 1:
+            _die(f"{_user_val('DSV41_MOE_B12X_NEXT_DETERMINISTIC')} at EP_SIZE={ep_size} (N={inter}): the "
+                 f"deterministic reduction is EP1 only")
+        # OVERRIDE: DIRECT_IDS (router ids straight to b12x) needs EP_SIZE=1 and the atomic reduction; otherwise
+        # the remap kernel runs. Operator-set DIRECT_IDS=1 is then masked: refuse to boot. Default: WARNING.
         self.direct = DIRECT_IDS and int(ep_size) == 1 and not DETERMINISTIC
+        if DIRECT_IDS and not self.direct:
+            why = f"EP_SIZE={ep_size}" if int(ep_size) != 1 else "DSV41_MOE_B12X_NEXT_DETERMINISTIC=1"
+            if _user_set("DSV41_MOE_B12X_NEXT_DIRECT_IDS"):
+                _die(f"{_user_val('DSV41_MOE_B12X_NEXT_DIRECT_IDS')} cannot apply with {why}; the remap kernel "
+                     f"would run instead")
+            _warn_once(("direct_ids", why), f"DSV41_MOE_B12X_NEXT_DIRECT_IDS (default 1) -> remap kernel "
+                       f"because {why}")
         self.device = device
         self.limit = limit
         self.weight_plan = fm.plan_weights(
@@ -429,6 +524,7 @@ class _Geometry:
         # DETERMINISTIC: no race. b12x does not declare the deterministic top-k sum kernel among a
         # plan's programs, so its race refuses to compile it ("unplanned CuTe program"); the
         # heuristic plans compile it in _warm instead.
+        # (TUNE under DETERMINISTIC: install_method raises for an operator-set TUNE and warns for the default)
         if not TUNE or DETERMINISTIC:
             return set()
         r = TUNE_ROWS.get(self.topk)
@@ -445,6 +541,8 @@ class _Geometry:
         t0 = time.time()
         session = _session()
         tuned = self.tuned_caps()
+        # raced capacities (TUNE_ROWS x GRAPH_BS) that are not prepared capacities are never raced
+        unraced = sorted(c for c in tuned if c not in set(self.capacities()))
 
         def noop(state):
             return prep.PreparedCall(run=lambda: None)
@@ -477,6 +575,8 @@ class _Geometry:
             plan = fm.plan_execution(experts=experts, routing=routing,
                                      capacity=fm.ExecutionCapacity(max_tokens=cap, top_k=self.topk), **kw)
             race = self._race_call(cap) if cap in tuned and not kw else None
+            if cap in tuned and kw:
+                unraced.append(cap)          # a pinned plan (PLAN_TABLE / M64 tile) wins over the race
             req = plan.request(name=f"dsv41-moe-E{self.E}-N{self.N}-k{self.topk}-M{cap}",
                                prepare_call=noop, benchmark_call=race)
             session.prepare((req,), autotune=race is not None and TUNE)
@@ -487,7 +587,23 @@ class _Geometry:
                 cap=cap, plan=plan, state=state, specs=tuple(plan.scratch_specs()), tuned=race is not None,
                 source=str(getattr(sel, "source", "")), config=str(getattr(sel, "config", "")),
                 max_per_launch=int(getattr(lp, "max_tokens_per_launch", cap) or cap))
+        # OVERRIDE: a capacity named by TUNE_ROWS that has a pinned plan, or is not a prepared capacity, is not
+        # raced. Operator-set DSV41_MOE_B12X_NEXT_TUNE_ROWS is then masked: refuse to boot. Default: WARNING.
+        if unraced:
+            msg = (f"top-k {self.topk}: capacities {sorted(unraced)} of DSV41_MOE_B12X_NEXT_TUNE_ROWS x GRAPH_BS are "
+                   f"not raced (pinned plan, or not a prepared capacity)")
+            if _user_set("DSV41_MOE_B12X_NEXT_TUNE_ROWS"):
+                _die(f"{_user_val('DSV41_MOE_B12X_NEXT_TUNE_ROWS')}: {msg}")
+            _warn_once(("unraced", self.topk), f"DSV41_MOE_B12X_NEXT_TUNE_ROWS (default): {msg}")
         self.chunk, self.caps, dropped = select_chunk({c: e.max_per_launch for c, e in self.plans.items()})
+        # OVERRIDE: capacities above b12x's per-launch token limit are dropped and larger batches run in chunks.
+        # A dropped capacity that the operator listed in DSV41_MOE_B12X_NEXT_LADDER is masked: refuse to boot.
+        # A dropped default-ladder or CHUNKED_PREFILL_SIZE capacity keeps the WARNING below.
+        if dropped and _user_set("DSV41_MOE_B12X_NEXT_LADDER"):
+            asked = sorted(set(dropped) & set(_ints(os.environ["DSV41_MOE_B12X_NEXT_LADDER"])))
+            if asked:
+                _die(f"{_user_val('DSV41_MOE_B12X_NEXT_LADDER')}: capacities {asked} exceed b12x's per-launch "
+                     f"limit of {min(self.plans[c].max_per_launch for c in asked)} tokens and would be dropped")
         if dropped:
             limit = min(self.plans[c].max_per_launch for c in dropped)
             print(f"{_TAG} WARNING: E={self.E} K={self.K} N={self.N} top-k {self.topk}: capacities {dropped} "
@@ -580,7 +696,13 @@ class _Geometry:
         """(q [m, K] uint8, scales [m, K/32] uint8): where the front-end of the plan that runs m
         rows reads its MXFP8 input rows. None when m needs more than one launch, the runtime lacks
         the pre-quantized patch, or the plan does not expose token-major input storage."""
-        if _B.get("impl") is None or not self.ready or not 1 <= m <= self.chunk:
+        if _B.get("impl") is None or not self.ready:
+            return None
+        # FALL-THROUGH: a batch above one launch (chunk) gets no pre-quantized views; the caller keeps the bf16
+        # MoE gather for that batch. Per-batch eligibility, the setting stays armed: WARNING once.
+        if not 1 <= m <= self.chunk:
+            _warn_once(("prequant_rows", self.topk), f"DSV41_PREFILL_SP_FP8_MOE: a batch of {m} rows exceeds one "
+                       f"launch ({self.chunk} rows); such batches keep the bf16 MoE gather")
             return None
         cap = self.cap_for(m)
         v = self.pq_views.get(cap)
@@ -612,11 +734,20 @@ class _Geometry:
                   and pin.dtype == torch.uint8 and psc.dtype == torch.uint8
                   and pin.dim() == 3 and pin.shape[0] == 1 and pin.shape[1] >= cap and pin.shape[2] == self.K
                   and pin.is_contiguous() and psc.is_contiguous() and psc.numel() >= cap * kb)
+        # OVERRIDE: a capacity whose plan cannot expose token-major MXFP8 input storage runs prefill SP with the
+        # bf16 MoE gather. With DSV41_PREFILL_SP_FP8_MOE set by the operator that is a downgrade: refuse to boot.
         except Exception as exc:  # noqa: BLE001
+            if _user_set("DSV41_PREFILL_SP_FP8_MOE"):
+                _die(f"{_user_val('DSV41_PREFILL_SP_FP8_MOE')}: capacity {cap}: cannot bind the pre-quantized "
+                     f"input views ({exc!r})")
             print(f"{_TAG} WARNING: capacity {cap}: cannot bind the pre-quantized input views ({exc!r})",
                   flush=True)
             return False
         if not ok:
+            if _user_set("DSV41_PREFILL_SP_FP8_MOE"):
+                _die(f"{_user_val('DSV41_PREFILL_SP_FP8_MOE')}: capacity {cap}: packed_input "
+                     f"{getattr(pin, 'shape', None)} / scale {getattr(psc, 'shape', None)} are not token-major "
+                     f"MXFP8 storage")
             print(f"{_TAG} WARNING: capacity {cap}: packed_input {getattr(pin, 'shape', None)} / scale "
                   f"{getattr(psc, 'shape', None)} are not token-major MXFP8 storage; no pre-quantized "
                   f"input at this capacity", flush=True)
@@ -632,6 +763,8 @@ class _Geometry:
                                f"<= {self.chunk})")
         direct = (self.direct and topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
                   and topk_ids.is_contiguous() and topk_weights.is_contiguous())
+        if self.direct and not direct:
+            _warn_direct_fallback(topk_ids, topk_weights)
         if direct:
             ids, w = topk_ids, topk_weights
         else:
@@ -646,10 +779,11 @@ class _Geometry:
 
     def _warm_prequant(self, experts):
         """Compile the pre-quantized front-end variant of every prefill capacity at load."""
+        # OVERRIDE: without the prequant-input runtime patch, prefill SP keeps the bf16 MoE gather. This runs only
+        # when the operator set DSV41_PREFILL_SP_FP8_MOE on (default 0), so the downgrade refuses to boot.
         if _B.get("impl") is None:
-            print(f"{_TAG} WARNING: DSV41_PREFILL_SP_FP8_MOE=1 but b12x_next lacks the prequant-input "
-                  f"patch; prefill SP keeps the bf16 MoE gather", flush=True)
-            return
+            _die(f"{_user_val('DSV41_PREFILL_SP_FP8_MOE')} but b12x_next lacks the prequant-input patch "
+                 f"(scripts/b12x_next-prequant-input.patch); prefill SP would keep the bf16 MoE gather")
         t0 = time.time()
         done = []
         for cap in self.prequant_caps(PREQUANT_MIN_ROWS):
@@ -691,6 +825,8 @@ class _Geometry:
         # contiguous. Any other dtype / layout takes the remap kernel (it also casts).
         direct = (self.direct and topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
                   and topk_ids.is_contiguous() and topk_weights.is_contiguous())
+        if self.direct and not direct:
+            _warn_direct_fallback(topk_ids, topk_weights)
         s = 0
         while s < m_all:
             e = min(m_all, s + self.chunk)
@@ -731,11 +867,26 @@ def _m64_admitted():
                 type("Q", (), {"num_tokens": 1 << 20})())
         except Exception:  # noqa: BLE001
             ok = False
+        # OVERRIDE: without the compact-N64 M64 runtime patch, prefill capacities >= M64_MIN_CAP stay on the M16
+        # tile. Operator-set DSV41_MOE_B12X_NEXT_M64_MIN_CAP (non-zero; 0 never reaches here) is then masked:
+        # refuse to boot. The default 2048 falls back with a WARNING.
         if not ok:
-            print(f"{_TAG} WARNING: b12x_next lacks the compact-N64 M64 patch; prefill stays on M16",
-                  flush=True)
+            if _user_set("DSV41_MOE_B12X_NEXT_M64_MIN_CAP"):
+                _die(f"{_user_val('DSV41_MOE_B12X_NEXT_M64_MIN_CAP')} needs the compact-N64 M64 patch "
+                     f"(scripts/b12x_next-compact-n64-m64.patch), which this b12x_next lacks; prefill would stay on M16")
+            print(f"{_TAG} WARNING: DSV41_MOE_B12X_NEXT_M64_MIN_CAP (default {M64_MIN_CAP}): b12x_next lacks the "
+                  f"compact-N64 M64 patch; prefill stays on M16", flush=True)
         _M64_STATE.append(ok)
     return _M64_STATE[0]
+
+
+def _warn_direct_fallback(topk_ids, topk_weights):
+    # FALL-THROUGH: DIRECT_IDS is armed, but these router outputs are not contiguous int32 ids / fp32 weights, so
+    # the remap kernel runs for them (it also casts). Per-call eligibility: WARNING once per dtype pair.
+    _warn_once(("direct_dtype", topk_ids.dtype, topk_weights.dtype),
+               f"DSV41_MOE_B12X_NEXT_DIRECT_IDS=1: router ids {topk_ids.dtype} / weights {topk_weights.dtype} "
+               f"(contiguous {topk_ids.is_contiguous()} / {topk_weights.is_contiguous()}) are not contiguous "
+               f"int32 / fp32; the remap kernel runs for these calls")
 
 
 def _align(n, a=256):
@@ -776,6 +927,14 @@ def install_method(module):
     for other in ("DSV41_MOE_SM12X", "DSV41_MOE_PAD"):
         if _env(other, "0") not in ("0", "", "off", "false"):
             _die(f"{other} patches the same method; enable only one")
+    # OVERRIDE: DETERMINISTIC races nothing (b12x's race cannot compile the deterministic top-k sum kernel), so
+    # TUNE is ignored. Operator-set TUNE on is then masked: refuse to boot. The default TUNE=1: WARNING.
+    if DETERMINISTIC and TUNE:
+        if _user_set("DSV41_MOE_B12X_NEXT_TUNE"):
+            _die(f"{_user_val('DSV41_MOE_B12X_NEXT_TUNE')} is ignored under DSV41_MOE_B12X_NEXT_DETERMINISTIC=1 "
+                 f"(no autotune race with the deterministic reduction)")
+        print(f"{_TAG} WARNING: DSV41_MOE_B12X_NEXT_TUNE (default 1) has no effect: "
+              f"DSV41_MOE_B12X_NEXT_DETERMINISTIC=1 races nothing", flush=True)
     cls = getattr(module, "Mxfp4FlashinferCutlassMoEMethod", None)
     if cls is None:
         _die("Mxfp4FlashinferCutlassMoEMethod is gone")
@@ -821,6 +980,8 @@ def install_method(module):
     if DETERMINISTIC:
         print(f"{_TAG} deterministic reduction: plan table {PLAN_TABLE} (det_triton={DET_TRITON}), no "
               f"autotune race (heuristic plans elsewhere)", flush=True)
+    # FALL-THROUGH: decode/verify row counts above the graph bs list run on the next capacity up (correct,
+    # slower). The operator's GRAPH_BS is honoured as given, so this stays a WARNING.
     rows = uncovered_rows()
     if rows:
         print(f"{_TAG} WARNING: CUDA_GRAPH_MAX_BS_DECODE={_MAX_BS} exceeds the adapter's graph bs list (max "

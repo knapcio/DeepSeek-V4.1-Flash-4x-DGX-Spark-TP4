@@ -85,13 +85,21 @@ def block_accept_probs(X, target_probs, draft_probs, eta=None, gumbel=None, live
 try:  # DSV41_BLOCK_VERIFY_FOLD (adapter/block_verify_fold.py): the same rule in 4 Triton launches
     import block_verify_fold as _fold_mod
     _fold = _fold_mod if _fold_mod.ENABLED else None
-except ImportError:  # pragma: no cover
+except ImportError as _fold_exc:  # pragma: no cover
+    # Override site: a missing block_verify_fold module used to leave the torch path in place
+    # silently. A user-set DSV41_BLOCK_VERIFY_FOLD that cannot take effect now raises.
+    _fold_raw = os.environ.get("DSV41_BLOCK_VERIFY_FOLD", "0").strip().lower()
+    if _fold_raw not in ("0", "", "off", "false", "no"):
+        raise RuntimeError(
+            f"DSV41_BLOCK_VERIFY_FOLD={_fold_raw!r} is set but block_verify_fold cannot be imported "
+            f"({_fold_exc!r})") from _fold_exc
     _fold_mod = _fold = None
 try:  # DSV41_AB_VARIANTS in-boot A/B (test only): the fold is eager, so it switches per call
     import ab_variant as _ab
 except ImportError:  # pragma: no cover
     _ab = None
 _FOLD_CPU = os.environ.get("DSV41_BLOCK_VERIFY_FOLD_CPU", "0") == "1"   # tests only (Triton interpreter)
+_warned: set = set()   # once-per-site guard for the WARNING lines of the fall-throughs
 
 
 def _fold_mode():
@@ -140,6 +148,13 @@ def install(accept_module):
     def execute(*, candidates, target_logits, draft_probs, sampling_info, draft_input, gamma,
                 verify_num_draft_tokens, cutoff_verify_lens=None):
         if cutoff_verify_lens is not None and os.environ.get("DSV41_VERIFY_CAP", "").strip() in ("", "0", "off"):
+            # Override site: verify lengths cut by something other than DSV41_VERIFY_CAP make this
+            # call run the stock AcceptSampling.execute instead of block verification. The
+            # fall-through is kept and logged once.
+            if "stock_cutoff" not in _warned:
+                _warned.add("stock_cutoff")
+                print("WARNING [block_verify] DSV41_BLOCK_VERIFY falls back to the stock AcceptSampling.execute: "
+                      "cutoff_verify_lens is given while DSV41_VERIFY_CAP is off", flush=True)
             return cls._dsv41_orig_execute(candidates=candidates, target_logits=target_logits,
                                            draft_probs=draft_probs, sampling_info=sampling_info,
                                            draft_input=draft_input, gamma=gamma,
@@ -161,6 +176,13 @@ def install(accept_module):
                                 cutoff_verify_lens, check=mode == "check")
             _fold_mod.receipt("check" if mode == "check" else "fold", bs)
             return tau.to(torch.int32), corr, torch.zeros(bs, dtype=torch.int32, device=candidates.device)
+        # Override site: with the fold mode on, candidates off CUDA (and the CPU interpreter switch
+        # DSV41_BLOCK_VERIFY_FOLD_CPU off) run the torch path instead of the Triton fold kernels.
+        # The fall-through is kept and logged once.
+        if mode is not None and "fold_not_cuda" not in _warned:
+            _warned.add("fold_not_cuda")
+            print(f"WARNING [block_verify] DSV41_BLOCK_VERIFY_FOLD={mode} falls back to the torch path: "
+                  f"candidates are on {candidates.device}, not CUDA", flush=True)
         if _fold_mod is not None:
             _fold_mod.receipt("torch", bs)
         X = candidates.view(bs, verify_num_draft_tokens)[:, 1:gamma + 1].long()

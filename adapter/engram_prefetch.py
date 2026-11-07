@@ -83,7 +83,16 @@ def _prefetch(self, indices):
     self._pending = (indices.data_ptr(), tuple(indices.shape), count, dw, ds, sequential)
 
 
+_WARNED = set()     # once-per-site guard for the WARNING line of the hash_ids shape fall-through
+
+
 def _prefetch_all(hash_ids):
+    # Override site: hash_ids that are not 3-D skip the side-stream prefetch, and the Engram
+    # lookup runs synchronously. The per-batch fall-through is kept and logged once as WARNING.
+    if hash_ids.dim() != 3 and "dim" not in _WARNED:
+        _WARNED.add("dim")
+        logger.warning("WARNING DSV41_ENGRAM_PREFETCH skips hash_ids with %d dims (expects 3); "
+                       "the Engram lookup runs synchronously", hash_ids.dim())
     if _state["disabled"] or hash_ids.dim() != 3 or hash_ids.shape[0] == 0:
         return
     for emb in _EMBEDS:
@@ -142,14 +151,17 @@ def install(module):
 
     def forward(self, input_ids, forward_batch):
         hash_ids = orig_forward(self, input_ids, forward_batch)
+        # Override site: an error in the side-stream prefetch used to disable DSV41_ENGRAM_PREFETCH for
+        # the rest of the process and fall back to the synchronous lookup. The user-set gate that
+        # stops taking effect now raises.
         try:
             _prefetch_all(hash_ids)
         except Exception as exc:
-            if not _state["disabled"]:
-                _state["disabled"] = True
-                logger.warning("DSV41 Engram prefetch disabled after error: %r", exc)
             for emb in _EMBEDS:
                 emb._pending = None
+            raise RuntimeError(
+                f"DSV41_ENGRAM_PREFETCH={os.environ.get('DSV41_ENGRAM_PREFETCH', '')!r} is set but the "
+                f"Engram side-stream prefetch failed: {exc!r}") from exc
         return hash_ids
 
     Hasher.forward = forward

@@ -154,28 +154,31 @@ def apply_solo(source):
 
 def install(module):
     raw = os.environ.get('DSV41_PREFILL_BYPASS', '').strip()
-    if not raw:
+    if not raw or raw.lower() in ('0', 'off', 'false', 'no'):
         return False
+    # Override sites: a set DSV41_PREFILL_BYPASS that is not a positive int, a bad
+    # DSV41_PREFILL_BYPASS_SCAN or DSV41_PREFILL_BYPASS_SOLO, or engine source drift used to log
+    # "refusing to arm" and serve without the bypass. The gate is set by the user (raw is not empty),
+    # so a gate that would not take effect now stops the boot. DSV41_PREFILL_BYPASS=0 still disables.
     try:
         limit = int(raw)
         if limit <= 0:
             raise ValueError
     except ValueError:
-        logger.warning('DSV41_PREFILL_BYPASS: refusing to arm; expected a positive fresh-token limit')
-        return False
+        raise RuntimeError(f'DSV41_PREFILL_BYPASS={raw!r}: expected a positive fresh-token limit; the bypass '
+                           f'would not arm; refusing to boot') from None
     scan_raw = os.environ.get('DSV41_PREFILL_BYPASS_SCAN', '32').strip()
     try:
         scan_limit = int(scan_raw)
         if scan_limit <= 0:
             raise ValueError
     except ValueError:
-        logger.warning('DSV41_PREFILL_BYPASS: refusing to arm; '
-                       'DSV41_PREFILL_BYPASS_SCAN must be a positive candidate limit')
-        return False
+        raise RuntimeError(f'DSV41_PREFILL_BYPASS_SCAN={scan_raw!r}: must be a positive candidate limit; '
+                           f'DSV41_PREFILL_BYPASS={raw!r} would not arm; refusing to boot') from None
     solo = solo_requested()
     if solo is None:
-        logger.warning('DSV41_PREFILL_BYPASS: refusing to arm; DSV41_PREFILL_BYPASS_SOLO must be 0 or 1')
-        return False
+        raise RuntimeError(f'DSV41_PREFILL_BYPASS_SOLO={os.environ.get("DSV41_PREFILL_BYPASS_SOLO")!r}: must be 0 '
+                           f'or 1; DSV41_PREFILL_BYPASS={raw!r} would not arm; refusing to boot')
     cls = getattr(module, 'Scheduler', None)
     adder_cls = getattr(module, 'PrefillAdder', None)
     if getattr(cls, '_dsv41_prefill_bypass', False):
@@ -240,8 +243,10 @@ def install(module):
         original_add = adder_cls.add_one_req
         original_select = adder_cls._select_prefill_admission
     except (AttributeError, TypeError, OSError, ValueError, SyntaxError) as exc:
-        logger.warning('DSV41_PREFILL_BYPASS: refusing to arm; %s', exc)
-        return False
+        # Override site: engine source drift used to log "refusing to arm" and serve without the
+        # bypass; the user-set gate must take effect, so this now stops the boot.
+        raise RuntimeError(f'DSV41_PREFILL_BYPASS={raw!r}: refusing to arm ({exc}); the bypass would not '
+                           f'take effect; refusing to boot') from exc
 
     def select(self, *args, **kwargs):
         admission = original_select(self, *args, **kwargs)

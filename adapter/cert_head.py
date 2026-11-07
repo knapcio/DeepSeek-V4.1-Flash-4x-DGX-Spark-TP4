@@ -137,6 +137,18 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+_warned: set = set()   # once-per-site guard for the WARNING lines of the fall-throughs
+
+
+def _warn_once(key, msg: str) -> None:
+    """One line starting with WARNING per key (fall-through sites on the step path)."""
+    if key in _warned:
+        return
+    _warned.add(key)
+    sys.stderr.write(f"WARNING [cert_head] {msg}\n")
+    sys.stderr.flush()
+
+
 def next_pow2(n: int) -> int:
     p = 1
     while p < n:
@@ -562,15 +574,21 @@ def install_model(dsv4_module):
             return out
         try:
             st = _build_for_model(self)
-        except Exception as e:  # noqa: BLE001  never take the boot down; stock stays
+        except Exception as e:  # noqa: BLE001  the reason is raised below, after every rank agreed
             st = f"build failed: {e!r}"
         ok, why = tp_agree(isinstance(st, State))
+        # Override site: a failed table build or a TP-rank disagreement (including an empty
+        # DSV41_CERT_HEAD_M, DSV41_DRAFT_CAPTURE on, a quantized / LoRA / fp32 lm_head) used to log
+        # "disabled" and keep the stock head. DSV41_CERT_HEAD is set on whenever this runs, so the
+        # gate that does not take effect now raises on every rank after tp_agree.
         if not ok:
             reason = st if isinstance(st, str) else f"disabled on every rank: {why}"
             _S["why"] = reason
             _log(f"disabled: {reason}")
             torch.cuda.empty_cache()
-            return out
+            raise RuntimeError(
+                f"cert_head: DSV41_CERT_HEAD={os.environ.get('DSV41_CERT_HEAD', '')!r} is set but the certified "
+                f"head cannot be built ({reason}; DSV41_CERT_HEAD_M={os.environ.get('DSV41_CERT_HEAD_M', '')!r})")
         _S["st"], _S["lp"] = st, self.logits_processor
         _S["bufs"] = Buffers(st.W.device, MAX_M)
         _S["bufs"].need_per_full = (st.V + XBV - 1) // XBV
@@ -612,8 +630,19 @@ def install_logits(lp_module):
         st = _S["st"]
         md = mode()
         M = int(hidden_states.shape[0])
-        if (not ctx["on"] or embedding_bias is not None or md == "0" or M not in QUALIFIED_M
+        if not ctx["on"] or md == "0":
+            return orig_head(self, hidden_states, lm_head, embedding_bias)
+        if (embedding_bias is not None or M not in QUALIFIED_M
                 or hidden_states.dim() != 2 or lm_head.weight is not st.lm_head.weight):
+            # Override site: a target-verify call that the certified head does not cover (M outside
+            # DSV41_CERT_HEAD_M, an embedding bias, a non-2-D input, another lm_head weight) runs the
+            # stock matmul head. The fall-through is kept and logged once per reason.
+            reason = ("M not in DSV41_CERT_HEAD_M" if M not in QUALIFIED_M else
+                      "embedding_bias" if embedding_bias is not None else
+                      f"hidden_states dim {hidden_states.dim()}" if hidden_states.dim() != 2 else
+                      "lm_head weight differs from the built tables")
+            _warn_once(("head", reason, M if M not in QUALIFIED_M else None),
+                       f"verify head M={M}: DSV41_CERT_HEAD={md} falls back to the stock lm_head ({reason})")
             return orig_head(self, hidden_states, lm_head, embedding_bias)
         key = (md, M)
         if key not in _S["logged_modes"] and _rank() == 0:
@@ -667,23 +696,37 @@ def step_armed(executor, batch):
     penalizer other than min_new_tokens (its -inf stop ids are handled by the stop-id rule of the screen).
     Everything read here is per-batch scheduler state, identical on every TP rank."""
     del executor
+    # Override sites in this function: a batch whose verify logits have a consumer other than the
+    # greedy argmax (logprobs, grammar, non-greedy rows, custom logit processor, logit bias, a
+    # penalizer other than min_new_tokens, more than NSTOP stop ids) is not armed, so the step
+    # runs the certified head in full mode. Each per-batch fall-through is kept and logged once
+    # per reason.
     if getattr(batch, "return_logprob", False) or getattr(batch, "has_grammar", False):
+        _warn_once(("unarmed", "logprob/grammar"),
+                   "step not armed: batch returns logprobs or has a grammar; certified head runs in full mode")
         return False, ()
     si = getattr(batch, "sampling_info", None)
     if si is None:
         return True, ()
     if (not getattr(si, "is_all_greedy", False) or getattr(si, "has_custom_logit_processor", False)
             or getattr(si, "logit_bias", None) is not None or getattr(si, "grammar_mask", None) is not None):
+        _warn_once(("unarmed", "sampling"),
+                   "step not armed: batch is not all greedy or has a custom logit processor, logit bias or grammar "
+                   "mask; certified head runs in full mode")
         return False, ()
     stops = set()
     pen = getattr(si, "penalizer_orchestrator", None)
     if pen is not None and getattr(pen, "is_required", False):
         for p in pen.penalizers.values():
             if p.is_prepared() and type(p).__name__ != "BatchedMinNewTokensPenalizer":
+                _warn_once(("unarmed", type(p).__name__),
+                           f"step not armed: penalizer {type(p).__name__} is active; certified head runs in full mode")
                 return False, ()
         for req in batch.reqs:
             stops |= _req_stop_ids(req)
         if len(stops) > NSTOP:
+            _warn_once(("unarmed", "nstop"),
+                       f"step not armed: {len(stops)} stop ids exceed NSTOP={NSTOP}; certified head runs in full mode")
             return False, ()
     return True, tuple(sorted(stops))
 
