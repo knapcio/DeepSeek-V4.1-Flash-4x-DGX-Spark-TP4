@@ -380,10 +380,13 @@ docker_common_args() {
   fi
   if [[ "$NCCL_SWITCHLESS_RING_ONLY" == "1" ]]; then
     switchless_ring_args _a
-    nccl_mount_args _a || die "NCCL setup for the switchless ring failed"
-  elif [[ -f "$NCCL_HOST_DIR/libnccl.so.2.30.7" || -f "$NCCL_HOST_DIR/libnccl.so.2" ]]; then
-    _a+=(-v "$NCCL_HOST_DIR:$NCCL_CONTAINER_DIR:ro" -e "LD_LIBRARY_PATH=$NCCL_CONTAINER_DIR")
   fi
+  # The head mounts NCCL exactly as every worker does (nccl_mount_args, files/nccl.sh): with NCCL_OVERLAY_PIP=1 the
+  # library is mounted over the image's pip NCCL, with or without the ring switch (until v2.6.5 the head honoured the
+  # overlay only with the switch on and put NCCL_HOST_DIR on LD_LIBRARY_PATH otherwise, which torch's RPATH ignores,
+  # so the workers ran the overlaid library and the head the image's); else NCCL_HOST_DIR goes on LD_LIBRARY_PATH when
+  # it holds a library, as before.
+  nccl_mount_args _a || die "NCCL setup failed (NCCL_HOST_DIR=$NCCL_HOST_DIR, NCCL_OVERLAY_PIP=$NCCL_OVERLAY_PIP)"
 }
 
 # Every rank builds its own planner, so the SPS/STS calibration has to exist on
@@ -753,9 +756,10 @@ cmd_serve() {
   fi
 
   # Fatal here, unlike doctor: a ring that fails its preflight would die at NCCL
-  # init anyway, after replacing four containers.
+  # init anyway, after replacing four containers. The NCCL switches are checked with
+  # the ring off too (an overlay value other than 0 / 1 must not pass as "off").
+  nccl_validate_config || die "NCCL: invalid configuration (./start.sh doctor)"
   if switchless_ring_enabled; then
-    nccl_validate_config || die "switchless ring: invalid configuration (./start.sh doctor)"
     nccl_preflight "$HEAD_IP" >/dev/null || die "switchless ring: head preflight failed (./start.sh doctor)"
   fi
 

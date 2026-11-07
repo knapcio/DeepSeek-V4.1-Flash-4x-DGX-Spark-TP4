@@ -291,7 +291,10 @@ With `NCCL_SWITCHLESS_RING_ONLY=1`:
   `serve` — the check sits before any container is replaced.
 
 `NCCL_OVERLAY_PIP` defaults to following the switch, so the overlay can also be
-enabled on a switched fabric on its own (`NCCL_OVERLAY_PIP=1`, switch off).
+enabled on a switched fabric on its own (`NCCL_OVERLAY_PIP=1`, switch off). The head
+and every worker then mount the same library over the pip NCCL. Until v2.6.5 only the
+workers did: the head put `NCCL_HOST_DIR` on `LD_LIBRARY_PATH`, which torch ignores
+(it resolves `libnccl.so.2` through its RPATH), so the head ran the image's NCCL.
 
 ## Expected logs
 

@@ -207,6 +207,106 @@ class SwitchOnTests(unittest.TestCase):
         self.assertIn("no readable library", result.stderr)
 
 
+
+class OverlayWithoutTheRingTests(unittest.TestCase):
+    """NCCL_OVERLAY_PIP=1 on a switched fabric (ring off): head and workers mount the same library.
+
+    Until v2.6.5 docker_common_args honoured the overlay only with NCCL_SWITCHLESS_RING_ONLY=1 and put
+    NCCL_HOST_DIR on LD_LIBRARY_PATH otherwise (inert for torch, which resolves libnccl through its RPATH),
+    while every worker's nccl_mount_args mounted the library over the pip NCCL: the ranks ran two different
+    NCCL builds. With the overlay off the head's arguments must stay byte-identical to v2.6.5's.
+    """
+    PIP = "/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=ROOT / "tests")
+        self.dir = Path(self.tmp.name)
+        self.nccl = self.dir / "nccl"
+        self.nccl.mkdir()
+        (self.nccl / "libnccl.so.2.30.7").write_text("stock or patched, the launcher does not care\n")
+        self.off = dict(BASE_SETTINGS, NCCL_HOST_DIR=str(self.nccl))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def head(self, settings):
+        return shell("a=(); docker_common_args a \"$HEAD_IP\" 3; printf 'ARG %s\\n' \"${a[@]}\"",
+                     self.dir, settings)
+
+    def nccl_tokens(self, out):
+        args = lines_after(out, "ARG ")
+        keep = []
+        for i, a in enumerate(args):
+            if a == "-v" and "nccl" in args[i + 1]:
+                keep += [a, args[i + 1]]
+            if a == "-e" and args[i + 1].startswith(("LD_LIBRARY_PATH=", "NCCL_SWITCHLESS_RING_ONLY=")):
+                keep += [a, args[i + 1]]
+        return keep
+
+    def worker_tokens(self, settings):
+        # what the generated worker script runs: the launcher's nccl_worker_settings payload (variables + functions)
+        # in a fresh shell, then nccl_mount_args, as in cmd_serve's worker heredoc
+        out = check(shell("""payload="$(nccl_worker_settings)"
+          env -i HOME="$HOME" PATH="$PATH" bash -c "set -e
+          $payload
+          nccl_args=(); nccl_mount_args nccl_args; printf 'ARG %s\\n' \\"\\${nccl_args[@]}\\"" """, self.dir, settings))
+        return lines_after(out, "ARG ")
+
+    def test_head_overlays_with_the_switch_off(self):
+        on = dict(self.off, NCCL_OVERLAY_PIP="1")
+        out = check(self.head(on))
+        lib = str(self.nccl / "libnccl.so.2.30.7")
+        self.assertEqual(self.nccl_tokens(out), ["-v", f"{lib}:{self.PIP}:ro"])
+        self.assertNotIn("LD_LIBRARY_PATH", out)
+        self.assertNotIn("NCCL_SWITCHLESS_RING_ONLY", out)
+
+    def test_head_and_workers_mount_the_same_library(self):
+        for overlay in ("0", "1"):
+            settings = dict(self.off, NCCL_OVERLAY_PIP=overlay)
+            head = self.nccl_tokens(check(self.head(settings)))
+            self.assertEqual(head, self.worker_tokens(settings), overlay)
+
+    def test_overlay_off_is_unchanged(self):
+        # v2.6.5's head branch: NCCL_HOST_DIR on LD_LIBRARY_PATH when it holds a library, else nothing
+        out = check(self.head(self.off))
+        self.assertEqual(self.nccl_tokens(out),
+                         ["-v", f"{self.nccl}:/nccl:ro", "-e", "LD_LIBRARY_PATH=/nccl"])
+        empty = self.dir / "empty"
+        empty.mkdir()
+        out = check(self.head(dict(self.off, NCCL_HOST_DIR=str(empty))))
+        self.assertEqual(self.nccl_tokens(out), [])
+
+    def test_head_refuses_an_overlay_without_a_library(self):
+        empty = self.dir / "empty"
+        empty.mkdir()
+        result = self.head(dict(self.off, NCCL_HOST_DIR=str(empty), NCCL_OVERLAY_PIP="1"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no readable library", result.stderr)
+        self.assertIn("NCCL setup failed", result.stderr)
+
+    def test_validation_checks_the_overlay_with_the_switch_off(self):
+        check(nccl_shell("nccl_validate_config", {"NCCL_OVERLAY_PIP": "1", "NCCL_PIP_SO": self.PIP}))
+        for bad in ({"NCCL_OVERLAY_PIP": "yes"},
+                    {"NCCL_OVERLAY_PIP": "1", "NCCL_PIP_SO": "relative/libnccl.so.2"},
+                    {"NCCL_OVERLAY_PIP": "1", "NCCL_PIP_SO": self.PIP, "NCCL_HOST_DIR": "/a:b"}):
+            result = nccl_shell("nccl_validate_config", bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+
+    def test_serve_validates_the_switches_with_the_ring_off(self):
+        source = (ROOT / "start.sh").read_text()
+        serve = source[source.index("cmd_serve()"):]
+        serve = serve[:serve.index("\n}\n")]
+        gate = serve.index("nccl_validate_config")
+        self.assertLess(gate, serve.index("if switchless_ring_enabled"))
+        self.assertLess(gate, serve.index("docker rm"))
+
+    def test_default_follows_the_switch(self):
+        out = check(shell('echo "overlay=$NCCL_OVERLAY_PIP"', self.dir, self.off))
+        self.assertIn("overlay=0", out)
+        out = check(shell('echo "overlay=$NCCL_OVERLAY_PIP"', self.dir, dict(self.off, NCCL_SWITCHLESS_RING_ONLY="1")))
+        self.assertIn("overlay=1", out)
+
+
 class ValidationTests(unittest.TestCase):
     def run_validation(self, settings):
         return nccl_shell("nccl_validate_config", dict(BASE_SETTINGS, **settings))
