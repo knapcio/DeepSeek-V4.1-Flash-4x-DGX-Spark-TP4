@@ -125,7 +125,8 @@ def install(scheduler_module):
         if mode is None or not mode.is_extend() or mode.is_target_verify() or not torch.cuda.is_available():
             return orig(self, batch, *a, **kw)
         sites = {}
-        inflight = not torch.cuda.current_stream().query()
+        fwd = getattr(self, "forward_stream", None)
+        inflight = not (fwd if fwd is not None else torch.cuda.current_stream()).query()
         prev_mode = torch.cuda.get_sync_debug_mode()
         t0 = time.perf_counter()
         with warnings.catch_warnings():
