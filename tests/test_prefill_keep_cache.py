@@ -357,6 +357,22 @@ def test_policy_mixed_batch_does_not_carry_a_into_b():
     assert not eb and why == "keep"                # B's own first kept chunk, from the emptied cache
 
 
+def test_policy_pads_only_when_every_request_continues():
+    """Re-review P2: a mixed batch (A last + B first) must not pad to the largest final width."""
+    p = keep.Policy(slack=100)
+    p.emptied(_st())
+    p.begin(B(["a"], [300000], [8192], [8192]), _st())
+    assert p.pad_ok()
+    p.before(_st())
+    p.after(B(["a"], [300000], [8192], [8192]), _st(1000, 990, 9))
+    p.begin(B(["a", "b"], [300000, 1 << 20], [300000, 4000], [4192, 4000]), _st(1000, 0, 9))
+    assert not p.pad_ok()
+    p.begin(B(["c"], [50000], [50000], [8192]), _st(0, 0, 9))      # a last chunk alone: ends, no reason to pad
+    assert not p.pad_ok()
+    p.begin(B(None, None, [9000], None), _st(0, 0, 9))
+    assert not p.pad_ok()
+
+
 def test_policy_row_change_gap_and_rewind_empty_before():
     """P1-1: more rows than the session's first chunk (bypass without solo), a gap, a rewind: empty first."""
     for nxt in (B(["a"], [100000], [16384 + 256], [8192 + 256]),     # +256 rows

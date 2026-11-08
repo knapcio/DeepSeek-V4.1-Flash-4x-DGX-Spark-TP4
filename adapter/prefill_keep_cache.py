@@ -296,6 +296,9 @@ class Policy:
         return ignore_rows or s["rows"] is None or batch.rows(ends) <= s["rows"]
 
     def begin(self, batch, stats):
+        # padding needs every request of the batch to continue (a batch where some request ends is emptied after it,
+        # so padding it to the largest final width would only raise its own peak: A last + B first)
+        self._all_continue = batch.more() is True
         out = self._begin(batch, stats)
         s = self.session
         if s is not None and batch.rows(s["ends"] if self.continues(batch, need_holding=False) else None) \
@@ -304,7 +307,10 @@ class Policy:
         return out
 
     def pad_ok(self):
-        """The indexer may pad this forward to the final width (False for a wider-than-chunk batch)."""
+        """The indexer may pad this forward to the final width: every request of the batch continues (begin) and the
+        batch is not wider than a chunk."""
+        if not getattr(self, "_all_continue", False):
+            return False
         return self.session is None or not self.session.get("wide", False)
 
     def _begin(self, batch, stats):

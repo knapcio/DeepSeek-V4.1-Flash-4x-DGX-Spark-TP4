@@ -117,7 +117,8 @@ def _run_steps(env, steps):
             chunk = model.CHUNK
             model.CHUNK = int(sum(fb.extend_seq_lens_cpu))
             try:
-                model.run_chunk(alloc, model.chunk_events(int(fb.seq_lens_cpu[0]), fb.dsv41_final_lens[0],
+                # a padded forward pads to the largest final width of the batch (split path: max over requests)
+                model.run_chunk(alloc, model.chunk_events(int(fb.seq_lens_cpu[0]), max(fb.dsv41_final_lens),
                                                           pad and getattr(fb, "dsv41_pad_ok", True)))
             finally:
                 model.CHUNK = chunk
@@ -162,6 +163,18 @@ def test_mixed_batch_a_last_b_first_does_not_carry_a_into_b():
     stock = _run_steps({}, steps)
     keep = _run_steps({"DSV41_PREFILL_KEEP_CACHE": "1"}, steps)
     assert keep["b"] <= stock["b"] + 16 * MIB, (stock["b"] / GIB, keep["b"] / GIB)
+
+
+def test_mixed_batch_in_split_regime_is_not_padded_to_the_largest_final():
+    """Re-review P2: A=300K last chunk + B=1M first chunk; the mixed batch must cost what stock costs."""
+    a_final, b_final = 300000, 1 << 20
+    steps = _prompt_steps("a", "a", a_final)[:-1]
+    last_a = (a_final // model.CHUNK) * model.CHUNK
+    b_first = model.CHUNK - (a_final - last_a)
+    steps.append(("mixed", ["a", "b"], [a_final, b_first], [a_final, b_final], [a_final - last_a, b_first]))
+    stock = _run_steps({}, steps)
+    keep = _run_steps({"DSV41_PREFILL_KEEP_CACHE": "1"}, steps)
+    assert keep["mixed"] <= stock["mixed"] + 16 * MIB, (stock["mixed"] / GIB, keep["mixed"] / GIB)
 
 
 def test_more_rows_mid_prompt_empties_before_the_wider_chunk():

@@ -83,6 +83,7 @@ def install(module):
                 logger.warning('DSV41 prefill empty_cache hook: %s', exc)
             return output
         policy = keep.policy()
+        forward_batch.dsv41_pad_ok = False    # stock widths unless the bookkeeping below completes
         try:
             batch = keep.batch_of(forward_batch)
             if batch.finals is None and not state['warned']:
@@ -99,6 +100,7 @@ def install(module):
             policy.before(keep.read_stats(torch))
         except Exception as exc:  # noqa: BLE001 - fall back to today's behaviour for this forward
             logger.warning('DSV41 prefill keep-cache stats: %s', exc)
+            forward_batch.dsv41_pad_ok = False
             batch = None
         output = original(self, forward_batch, *args, **kwargs)
         try:

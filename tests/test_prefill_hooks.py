@@ -114,6 +114,36 @@ def test_keep_cache_without_final_lengths_is_the_old_hook():
         _restore(saved)
 
 
+def test_pad_ok_false_when_bookkeeping_raises():
+    """Re-review P2: an exception in the pre-forward bookkeeping must leave the forward at stock widths."""
+    fake, runner, saved = _install_hook({"DSV41_PREFILL_KEEP_CACHE": "1"})
+    try:
+        import prefill_keep_cache as keep
+        fb = _fb(8192, 40000)
+        fb.dsv41_pad_ok = True
+        boom = keep.read_stats
+
+        def raising(torch_):
+            raise RuntimeError("stats unavailable")
+
+        keep.read_stats = raising
+        try:
+            assert runner.forward(fb) == "out"
+        finally:
+            keep.read_stats = boom
+        assert fb.dsv41_pad_ok is False
+        ok = _fb(8192, 40000)
+        runner.forward(ok)
+        assert ok.dsv41_pad_ok is True
+        mixed = types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(is_extend_without_speculative=lambda: True),
+            seq_lens_cpu=torch.tensor([40000, 4000]), dsv41_final_lens=[40000, 1 << 20])
+        runner.forward(mixed)
+        assert mixed.dsv41_pad_ok is False
+    finally:
+        _restore(saved)
+
+
 def test_forward_batch_plumbing():
     import prefill_keep_cache as keep
 
