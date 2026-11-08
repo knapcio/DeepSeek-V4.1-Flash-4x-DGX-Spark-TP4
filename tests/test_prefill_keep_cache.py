@@ -240,7 +240,15 @@ def simulate(prompt, regime, slack=256 * MIB):
     if seqs[-1] != prompt:
         seqs.append(prompt)
     out = {"reserved_max": 0, "kept": 0, "new_segments_kept": 0, "empties": 0, "trips": 0}
+    prev = 0
     for seq in seqs:
+        batch = keep.Batch(("A",), (prompt,), (seq,), (seq - prev,))
+        prev = seq
+        if regime == "C":
+            first_empty, _ = pol.begin(batch, alloc.stats())
+            if first_empty:
+                alloc.empty_cache()
+                pol.emptied(alloc.stats())
         alloc.reset_peak()
         before = alloc.stats()
         pol.before(before)
@@ -252,7 +260,8 @@ def simulate(prompt, regime, slack=256 * MIB):
         elif regime == "B":
             pass
         else:
-            empty, reason = pol.after(seq < prompt, alloc.stats())
+            remeasure = pol.session.get("remeasure", False) or pol.session["chunks"] == 0
+            empty, reason = pol.after(batch, alloc.stats())
             if empty:
                 alloc.empty_cache()
                 pol.emptied(alloc.stats())
@@ -260,7 +269,7 @@ def simulate(prompt, regime, slack=256 * MIB):
                 out["trips"] += reason.startswith("trip")
             else:
                 out["kept"] += 1
-                if not pol.fresh:
+                if not remeasure:
                     out["new_segments_kept"] += alloc.stats()["allocs"] - before["allocs"]
     alloc.release(persistent)
     out["policy_sessions"] = pol.sessions
@@ -268,56 +277,124 @@ def simulate(prompt, regime, slack=256 * MIB):
 
 
 # ------------------------------------------------------------------ tests
+def _st(reserved=0, peak=0, allocs=0):
+    return {"reserved": reserved, "peak": peak, "allocs": allocs, "frees": 0}
+
+
+def _chunk(p, batch, stats_before, stats_after):
+    """begin + before + after; returns (empty_before, empty_after, reason_after)."""
+    eb, _ = p.begin(batch, stats_before)
+    if eb:
+        p.emptied(stats_before)
+    p.before(stats_before)
+    ea, why = p.after(batch, stats_after)
+    if ea:
+        p.emptied(stats_after)
+    return eb, ea, why
+
+
+B = keep.Batch
+
+
 def test_policy_keeps_middle_chunks_and_empties_at_end():
     p = keep.Policy(slack=100)
-    p.emptied({"reserved": 0, "peak": 0, "allocs": 5, "frees": 0})
-    p.before({"reserved": 0, "peak": 0, "allocs": 5, "frees": 0})          # fresh
-    assert p.after(True, {"reserved": 1000, "peak": 990, "allocs": 9, "frees": 0}) == (False, "keep")
-    assert p.frag_ref == 10
-    p.before({"reserved": 1000, "peak": 0, "allocs": 9, "frees": 0})
-    assert p.after(True, {"reserved": 1000, "peak": 995, "allocs": 9, "frees": 0}) == (False, "keep")
-    p.before({"reserved": 1000, "peak": 0, "allocs": 9, "frees": 0})
-    assert p.after(False, {"reserved": 1000, "peak": 999, "allocs": 9, "frees": 0}) == (True, "end")
+    p.emptied(_st(allocs=5))
+    assert _chunk(p, B(["a"], [20000], [8192], [8192]), _st(allocs=5), _st(1000, 990, 9)) == (False, False, "keep")
+    assert p.frag_ref == 10 and p.holding
+    assert _chunk(p, B(["a"], [20000], [16384], [8192]), _st(1000, 0, 9), _st(1000, 995, 9)) == (False, False, "keep")
+    assert _chunk(p, B(["a"], [20000], [20000], [3616]), _st(1000, 0, 9), _st(1000, 999, 9)) == (False, True, "end")
     s = p.sessions[-1]
     assert s["chunks"] == 3 and s["kept"] == 2 and s["new_segments_kept"] == 0 and s["empty"] == {"end": 1}
+    assert not p.holding
 
 
-def test_policy_first_chunk_without_reference_empties():
+def test_policy_new_prompt_starts_from_an_empty_cache_and_its_own_reference():
     p = keep.Policy(slack=100)
-    p.before({"reserved": 50, "peak": 0, "allocs": 3, "frees": 0})          # boot state unknown
-    assert p.after(True, {"reserved": 1000, "peak": 990, "allocs": 9, "frees": 0}) == (True, "no-reference")
-    p.emptied({"reserved": 0, "peak": 0, "allocs": 9, "frees": 9})
-    p.before({"reserved": 0, "peak": 0, "allocs": 9, "frees": 9})
-    assert p.fresh
-    assert p.after(True, {"reserved": 1000, "peak": 990, "allocs": 14, "frees": 9}) == (False, "keep")
+    # first prefill after boot: cache state unknown -> empty BEFORE chunk 1, which becomes the reference
+    eb, ea, why = _chunk(p, B(["a"], [20000], [8192], [8192]), _st(50, 0, 3), _st(1000, 990, 9))
+    assert eb and not ea and why == "keep" and p.frag_ref == 10
+    _chunk(p, B(["a"], [20000], [20000], [11808]), _st(1000, 0, 9), _st(1000, 990, 9))
+    p.frag_ref = 777                                  # stale value from prompt a
+    # decode mallocs between prompts -> prompt b empties first and measures its own reference
+    eb, _, _ = _chunk(p, B(["b"], [30000], [8192], [8192]), _st(200, 0, 12), _st(1000, 950, 20))
+    assert eb and p.frag_ref == 50
 
 
 def test_policy_unknown_final_length_is_todays_behaviour():
     p = keep.Policy()
-    p.emptied({"reserved": 0, "peak": 0, "allocs": 0, "frees": 0})
-    p.before({"reserved": 0, "peak": 0, "allocs": 0, "frees": 0})
-    assert p.after(None, {"reserved": 10, "peak": 9, "allocs": 1, "frees": 0}) == (True, "unknown-final")
+    p.emptied(_st())
+    assert _chunk(p, B(None, None, [9000], None), _st(), _st(10, 9, 1))[1:] == (True, "unknown-final")
+
+
+def test_policy_switch_to_another_prompt_empties_before():
+    """P0-1 / P1-1: a cancelled prompt's held cache is emptied before any long chunk that does not continue it."""
+    p = keep.Policy(slack=100)
+    p.emptied(_st())
+    _chunk(p, B(["a"], [1 << 20], [8192], [8192]), _st(), _st(1000, 990, 9))
+    _chunk(p, B(["a"], [1 << 20], [16384], [8192]), _st(1000, 0, 9), _st(1000, 990, 9))
+    assert p.holding
+    # a cancelled, then prompt b
+    assert p.begin(B(["b"], [40000], [8192], [8192]), _st(1000, 0, 9)) == (True, "switch")
+    assert p.sessions[-1]["empty"] == {"switch": 1}
+    # without request ids the final lengths stand in for them
+    p = keep.Policy(slack=100)
+    p.emptied(_st())
+    _chunk(p, B(None, [1 << 20], [8192], None), _st(), _st(1000, 990, 9))
+    assert p.begin(B(None, [40000], [8192], None), _st(1000, 0, 9))[0]
+
+
+def test_policy_mixed_batch_does_not_carry_a_into_b():
+    """P1-1: A's last chunk shares a batch with B's first chunk -> empty after it; B starts on an empty cache."""
+    p = keep.Policy(slack=100)
+    p.emptied(_st())
+    _chunk(p, B(["a"], [20000], [8192], [8192]), _st(), _st(1000, 990, 9))
+    _chunk(p, B(["a"], [20000], [16384], [8192]), _st(1000, 0, 9), _st(1000, 990, 9))
+    eb, ea, why = _chunk(p, B(["a", "b"], [20000, 50000], [20000, 4576], [3616, 4576]), _st(1000, 0, 9),
+                         _st(1000, 990, 9))
+    assert eb and ea and why == "mixed"            # not a continuation (empty before) and A ends (empty after)
+    assert not p.holding
+    eb, ea, why = _chunk(p, B(["b"], [50000], [12768], [8192]), _st(0, 0, 9), _st(1000, 990, 15))
+    assert not eb and why == "keep"                # B's own first kept chunk, from the emptied cache
+
+
+def test_policy_row_change_gap_and_rewind_empty_before():
+    """P1-1: more rows than the session's first chunk (bypass without solo), a gap, a rewind: empty first."""
+    for nxt in (B(["a"], [100000], [16384 + 256], [8192 + 256]),     # +256 rows
+                B(["a"], [100000], [24576], [8192]),                 # gap: prefix 16384 != 8192
+                B(["a"], [100000], [8192], [8192]),                  # rewind / re-prefill
+                B(["a"], [90000], [16384], [8192])):                 # same rid, other final length
+        p = keep.Policy(slack=100)
+        p.emptied(_st())
+        _chunk(p, B(["a"], [100000], [8192], [8192]), _st(), _st(1000, 990, 9))
+        assert p.begin(nxt, _st(1000, 0, 9)) == (True, "switch"), (nxt.seqs, nxt.extends, nxt.finals)
+    p = keep.Policy(slack=100)
+    p.emptied(_st())
+    _chunk(p, B(["a"], [100000], [8192], [8192]), _st(), _st(1000, 990, 9))
+    assert p.begin(B(["a"], [100000], [12000], [3808]), _st(1000, 0, 9)) == (False, "continue")   # short last chunk
+
+
+def test_policy_release():
+    p = keep.Policy(slack=100)
+    assert not p.release()
+    p.emptied(_st())
+    _chunk(p, B(["a"], [100000], [8192], [8192]), _st(), _st(1000, 990, 9))
+    assert p.release() and not p.holding and p.sessions[-1]["empty"] == {"released": 1}
+    assert not p.release()
 
 
 def test_policy_trip_and_big_trip():
     p = keep.Policy(slack=100)
-    p.emptied({"reserved": 0, "peak": 0, "allocs": 0, "frees": 0})
-    p.before({"reserved": 0, "peak": 0, "allocs": 0, "frees": 0})
-    p.after(True, {"reserved": 1000, "peak": 990, "allocs": 4, "frees": 0})            # frag_ref 10
-    p.before({"reserved": 1000, "peak": 0, "allocs": 4, "frees": 0})
-    assert p.after(True, {"reserved": 1200, "peak": 1000, "allocs": 5, "frees": 0}) == (True, "trip")  # slack 200
-    p.emptied({"reserved": 0, "peak": 0, "allocs": 5, "frees": 3})
-    p.before({"reserved": 0, "peak": 0, "allocs": 5, "frees": 3})
-    p.after(True, {"reserved": 1000, "peak": 990, "allocs": 9, "frees": 3})
-    p.before({"reserved": 1000, "peak": 0, "allocs": 9, "frees": 3})
-    assert p.after(True, {"reserved": 2000, "peak": 1000, "allocs": 10, "frees": 3}) == (True, "trip-big")
-    p.emptied({"reserved": 0, "peak": 0, "allocs": 10, "frees": 6})
-    p.before({"reserved": 0, "peak": 0, "allocs": 10, "frees": 6})
-    assert p.after(True, {"reserved": 1000, "peak": 990, "allocs": 14, "frees": 6}) == (True, "disabled")
-    p.before({"reserved": 0, "peak": 0, "allocs": 14, "frees": 6})
-    assert p.after(False, {"reserved": 1000, "peak": 990, "allocs": 14, "frees": 6}) == (True, "end")
-    p.before({"reserved": 0, "peak": 0, "allocs": 14, "frees": 6})
-    assert p.session["disabled"] is False                                              # next prefill starts clean
+    p.emptied(_st())
+    a = lambda seq: B(["a"], [100000], [seq], [8192])  # noqa: E731
+    _chunk(p, a(8192), _st(), _st(1000, 990, 4))                                        # frag_ref 10
+    assert _chunk(p, a(16384), _st(1000, 0, 4), _st(1200, 1000, 5))[1:] == (True, "trip")  # slack 200
+    # after a trip the next chunk starts from the empty cache: no empty before, a new reference
+    assert _chunk(p, a(24576), _st(0, 0, 5), _st(1000, 990, 9)) == (False, False, "keep")
+    assert _chunk(p, a(32768), _st(1000, 0, 9), _st(2000, 1000, 10))[1:] == (True, "trip-big")
+    assert _chunk(p, a(40960), _st(0, 0, 10), _st(1000, 990, 14))[1:] == (True, "disabled")
+    assert _chunk(p, B(["a"], [100000], [100000], [8192]), _st(0, 0, 14), _st(1000, 990, 14))[1:] == (True, "end")
+    eb, _, _ = _chunk(p, B(["b"], [50000], [8192], [8192]), _st(0, 0, 14), _st(1000, 990, 18))
+    assert not p.session["disabled"]                                                    # next prompt starts clean
 
 
 def test_final_lens_and_continuation():

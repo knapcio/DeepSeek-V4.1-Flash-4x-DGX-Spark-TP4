@@ -28,8 +28,12 @@ def _as_int_list(x):
 WIDTHS = []  # (max_seqlen_k, kv rows) of every scorer call: the PAD runs must really be wider
 
 
+WIDER = [0]  # extra columns the fake scorer returns beyond max_seqlen_k (a wider DeepGEMM output must not crash)
+
+
 def _dense_fp4_mqa_logits(q_fp4, kv_fp4, weights, ks, ke, max_seqlen_k):
     WIDTHS.append((max_seqlen_k, kv_fp4[0].shape[0]))
+    max_seqlen_k += WIDER[0]
     q, _ = q_fp4
     rows = q.shape[0]
     # score depends only on the row's own token id (q[:,0,0]) and the column: row-invariant
@@ -175,6 +179,7 @@ def build(seq_lens, q_lens, ratio, source, consume_masks=None, tail_lens=None, t
     fb = SimpleNamespace(seq_lens_cpu=torch.tensor(seq_lens), req_pool_indices=torch.arange(len(seq_lens)), forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True))
     # DSV41_PREFILL_KEEP_CACHE_PAD: the requests' final prompt lengths (ForwardBatch.init_new attaches them)
     fb.dsv41_final_lens = None if FINAL_EXTRA[0] is None else [s + FINAL_EXTRA[0] * (b + 1) for b, s in enumerate(seq_lens)]
+    fb.dsv41_pad_ok = PAD_OK[0]
     tail = None
     if tail_lens is not None:
         tail = SimpleNamespace(late_layer_tail=SimpleNamespace(cp_metadata=None, extend_seq_lens_cpu=list(tail_lens)))
@@ -200,6 +205,7 @@ def run(fn, budget, **kw):
 
 SPLIT = [None]
 FINAL_EXTRA = [None]    # None = no final lengths on the batch (padding off)
+PAD_OK = [True]         # ForwardBatch.dsv41_pad_ok
 
 
 class FakeGroup:
@@ -285,6 +291,21 @@ for extra in (1, 5, 257):
     check(f"PAD +{extra} unsplit under an enabled split: publish masks", small, seq_lens=[200, 150], q_lens=[40, 30], ratio=1, source=True)
     SPLIT[0] = None
 assert any(w > kv + 3 for w, kv in WIDTHS), "PAD runs never widened a logits row"
+# a scorer returning more columns than asked: the masks follow the tensor's real width
+WIDER[0] = 8
+FINAL_EXTRA[0] = 5
+check("PAD, scorer 8 columns wider: publish masks", small, seq_lens=[40, 25], q_lens=[10, 7], ratio=1, source=True)
+for world in (1, 4):
+    SPLIT[0] = make_split(world)
+    check(f"PAD, scorer 8 columns wider, SPLIT world={world}: publish", [64, 1 << 31], seq_lens=[300, 260], q_lens=[140, 130], ratio=1, source=True)
+SPLIT[0] = None
+WIDER[0] = 0
+# dsv41_pad_ok False (a wider-than-chunk batch): stock widths
+PAD_OK[0] = False
+WIDTHS.clear()
+check("PAD off for this forward (pad_ok False)", small, seq_lens=[40, 25], q_lens=[10, 7], ratio=1, source=True)
+assert all(w <= kv + 3 for w, kv in WIDTHS), "pad_ok False still widened"
+PAD_OK[0] = True
 os.environ.pop("DSV41_PREFILL_KEEP_CACHE")
 FINAL_EXTRA[0] = None
 print("all passed")

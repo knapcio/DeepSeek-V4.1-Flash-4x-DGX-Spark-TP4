@@ -87,10 +87,19 @@ def _pad_reader():
     return keep.pad_enabled
 
 
+def pad_mask(rows, width, row_width, row_lens, device):
+    """(arange(width)[None, :] >= row_lens) as a contiguous [rows, width] view of a [rows * row_width] bool buffer:
+    the allocation keeps the padded size from chunk to chunk, the work and the values are the stock mask's."""
+    buf = torch.empty(rows * row_width, dtype=torch.bool, device=device)
+    out = buf[: rows * width].view(rows, width)
+    cols = torch.arange(row_width, device=device)[:width]
+    return torch.ge(cols[None, :], row_lens, out=out)
+
+
 def final_lcs(forward_batch, ratio, n):
     """Per request: the compressed width this prefill ends at, or None (no padding)."""
     finals = getattr(forward_batch, "dsv41_final_lens", None)
-    if finals is None or len(finals) != n:
+    if finals is None or len(finals) != n or not getattr(forward_batch, "dsv41_pad_ok", True):
         return None
     return [int(f) // ratio for f in finals]
 
@@ -191,14 +200,17 @@ def _split_local(indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, lengths, 
                 row_lens = local_lens[take, None]
                 nblocks = min(indexer.candidate_topk_blocks,
                               (width + indexer.candidate_block_size - 1) // indexer.candidate_block_size)
-                if pad_width is not None:
-                    # columns >= the row's length (incl. [width, padded)) to -inf on the whole padded row: the same
-                    # values below width, and the block maxima need no F.pad copy of the growing width
+                bs = indexer.candidate_block_size
+                wb = (width + bs - 1) // bs * bs
+                if pad_width is not None and wb <= logits.shape[-1]:
+                    # the stock fill (columns >= the row's length, below width) through a mask carved from a
+                    # fixed-size buffer (the real row width of the tensor), then [width, wb) to -inf: exactly what
+                    # F.pad(-inf) appends, so the block maxima come from the padded row without the growing copy
                     padded_rows = logits[take]
-                    padded_rows.masked_fill_(torch.arange(lc_aligned, device=logits.device)[None, :] >= row_lens,
-                                             -torch.inf)
-                    bs = indexer.candidate_block_size
-                    ids = candidate_block_ids_padded(padded_rows[:, :(width + bs - 1) // bs * bs], row_lens,
+                    mask = pad_mask(padded_rows.shape[0], width, logits.shape[-1], row_lens, logits.device)
+                    scores.masked_fill_(mask, -torch.inf)
+                    padded_rows[:, width:wb].fill_(-torch.inf)
+                    ids = candidate_block_ids_padded(padded_rows[:, :wb], row_lens,
                                                      indexer.candidate_topk_blocks, bs)
                 else:
                     scores.masked_fill_(torch.arange(width, device=logits.device)[None, :] >= row_lens, -torch.inf)
@@ -424,7 +436,7 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
                 first_pub = t_len - pub_rows
                 mask_b = torch.empty((pub_rows, lc), dtype=torch.bool, device=device)
             j = torch.arange(lc, device=device)
-            jp = torch.arange(lc_aligned, device=device) if _finals is not None else None
+            pad_on = _finals is not None
             for c0 in range(0, t_len, rows_per_chunk):
                 c1 = min(c0 + rows_per_chunk, t_len)
                 rows = slice(rows_b.start + c0, rows_b.start + c1)
@@ -439,8 +451,9 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
                 )
                 scores = logits[:, :lc]
                 if publish is not None:
-                    if jp is not None:  # ds41 PAD: same fill below lc, a fixed-size mask
-                        logits.masked_fill_(jp[None, :] >= lens[:, None], -torch.inf)
+                    if pad_on:  # ds41 PAD: the stock fill below lc through a fixed-size mask buffer
+                        scores.masked_fill_(pad_mask(logits.shape[0], lc, logits.shape[-1], lens[:, None], device),
+                                            -torch.inf)
                     else:
                         scores.masked_fill_(j[None, :] >= lens[:, None], -torch.inf)
                     p0 = max(c0, first_pub)

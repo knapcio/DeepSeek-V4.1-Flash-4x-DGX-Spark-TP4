@@ -338,6 +338,13 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DECODE_YIELD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from decode_yield import install as install_decode_yield
                 install_decode_yield(module)
+            # DSV41_PREFILL_KEEP_CACHE=1 (or named by an armed in-boot A/B): a cache held for a prompt that can no
+            # longer continue (abort, retraction, pause, idle) is emptied; AFTER decode_yield, which pins the source
+            # of get_next_batch_to_run (adapter/prefill_keep_cache.py).
+            from prefill_keep_cache import wanted_at_install as _keep_wanted_s
+            if _keep_wanted_s():
+                from prefill_keep_cache import install_scheduler as install_keep_cache_scheduler
+                install_keep_cache_scheduler(module)
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)

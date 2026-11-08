@@ -94,9 +94,9 @@ def test_old_hook_unchanged_when_off():
 def test_keep_cache_empties_only_at_the_end():
     fake, runner, saved = _install_hook({"DSV41_PREFILL_KEEP_CACHE": "1"})
     try:
-        _prefill(runner, 40000)                      # first prefill after boot: chunk 1 has no reference
+        _prefill(runner, 40000)                      # first prefill after boot: emptied before chunk 1 (reference)
         first = fake.empties
-        assert first == 2, first                     # no-reference after chunk 1, end after chunk 5
+        assert first == 2, first                     # before chunk 1 (unknown cache state), end after chunk 5
         allocs = fake.allocs
         _prefill(runner, 40000)
         assert fake.empties == first + 1             # only the end
@@ -121,15 +121,16 @@ def test_forward_batch_plumbing():
         @classmethod
         def init_new(cls, batch, model_runner, **kw):
             fb = cls()
-            fb.forward_mode = types.SimpleNamespace(is_extend=lambda: batch.extend)
+            fb.forward_mode = types.SimpleNamespace(is_extend_without_speculative=lambda: batch.extend)
             return fb
 
-    req = types.SimpleNamespace(extend_range=types.SimpleNamespace(end=8192), origin_input_ids=list(range(20024)))
+    req = types.SimpleNamespace(rid="r1", extend_range=types.SimpleNamespace(end=8192),
+                                origin_input_ids=list(range(20024)))
     mod = types.SimpleNamespace(ForwardBatch=FB)
     assert keep.install_forward_batch(mod)
     fb = FB.init_new(types.SimpleNamespace(reqs=[req], extend=True), types.SimpleNamespace(is_draft_worker=False),
                      return_hidden_states_before_norm=False)
-    assert fb.dsv41_final_lens == [20024]
+    assert fb.dsv41_final_lens == [20024] and fb.dsv41_rids == ["r1"]
     fb = FB.init_new(types.SimpleNamespace(reqs=[req], extend=False), types.SimpleNamespace(is_draft_worker=False))
     assert not hasattr(fb, "dsv41_final_lens")
     fb = FB.init_new(types.SimpleNamespace(reqs=[req], extend=True), types.SimpleNamespace(is_draft_worker=True))
@@ -142,6 +143,7 @@ def test_mxfp8_b12x_routes_eligible_calls_through_the_split():
     pgs.AGREE[0] = False
     pgs._DECIDED.clear()
     os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT"] = "4096"
+    os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT_N"] = "all"
     try:
         calls = []
         mod, original = t.make_fp8_utils(calls=calls)
@@ -166,6 +168,112 @@ def test_mxfp8_b12x_routes_eligible_calls_through_the_split():
         assert calls == [64], calls                  # decode-sized: the stock single launch
     finally:
         os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT")
+        os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT_N", None)
+
+
+class _Torch:
+    def __init__(self, fake):
+        self.cuda = fake
+
+
+def _holding_policy(keep, fake):
+    """keep.policy() holding a session for request 'a' (two kept chunks)."""
+    p = keep.policy()
+    p.emptied(keep.read_stats(_Torch(fake)))
+    for seq in (8192, 16384):
+        b = keep.Batch(["a"], [100000], [seq], [8192])
+        st = keep.read_stats(_Torch(fake))
+        p.begin(b, st)
+        p.before(st)
+        fake.reserved, fake.peak = 1000, 990
+        assert p.after(b, keep.read_stats(_Torch(fake))) == (False, "keep")
+    assert p.holding
+    return p
+
+
+def _scheduler_module():
+    class Scheduler:
+        def __init__(self):
+            self.chunked_req = None
+            self.next_batch = None
+
+        def get_next_batch_to_run(self, running_batch=None, last_batch=None):
+            return types.SimpleNamespace(batch_to_run=self.next_batch, running_batch=running_batch)
+
+        def process_pending_chunked_abort(self):
+            self.chunked_req = None
+
+        def pause_generation(self, recv_req=None):
+            self.chunked_req = None
+
+        def on_idle(self):
+            pass
+
+    return types.SimpleNamespace(Scheduler=Scheduler)
+
+
+def test_scheduler_releases_a_held_cache_when_its_prompt_cannot_continue():
+    """P0-1 part 2: abort / pause / idle / an orphaned session (chunked request gone) empty the held cache."""
+    import prefill_keep_cache as keep
+    importlib.reload(keep)
+    fake = FakeCuda()
+    mod = _scheduler_module()
+    assert keep.install_scheduler(mod, torch=_Torch(fake))
+    sch = mod.Scheduler()
+    req_a = types.SimpleNamespace(rid="a")
+    for action in ("next-other", "abort", "pause", "idle"):
+        importlib.reload(keep)
+        keep.install_scheduler(mod := _scheduler_module(), torch=_Torch(fake))
+        sch = mod.Scheduler()
+        _holding_policy(keep, fake)
+        fake.empties = 0
+        # still owned: the chunked request is the session's, or the batch about to run carries it
+        sch.chunked_req = req_a
+        sch.get_next_batch_to_run()
+        sch.chunked_req, sch.next_batch = None, types.SimpleNamespace(reqs=[req_a])
+        sch.get_next_batch_to_run()
+        assert fake.empties == 0 and keep.policy().holding
+        if action == "next-other":
+            sch.next_batch = types.SimpleNamespace(reqs=[types.SimpleNamespace(rid="b")])
+            sch.get_next_batch_to_run()
+        elif action == "abort":
+            sch.chunked_req = req_a
+            sch.process_pending_chunked_abort()
+        elif action == "pause":
+            sch.chunked_req = req_a
+            sch.pause_generation()
+        else:
+            sch.on_idle()
+        assert fake.empties == 1 and not keep.policy().holding, action
+        sch.on_idle()
+        assert fake.empties == 1                     # nothing held: no second empty
+
+
+def test_gate_off_releases_and_armed_ab_without_the_key_installs_nothing():
+    import prefill_keep_cache as keep
+    importlib.reload(keep)
+    fake_ab = types.SimpleNamespace(ACTIVE=True, KNOWN=frozenset({"DSV41_PREFILL_KEEP_CACHE"}),
+                                    _specs=[{}, {"DSV41_L2_PREFETCH_AHEAD": "1"}], env=lambda n, d=None: d)
+    saved = keep._ab
+    keep._ab = fake_ab
+    try:
+        os.environ.pop("DSV41_PREFILL_KEEP_CACHE", None)
+        assert not keep.wanted_at_install()
+        fake_ab._specs = [{"DSV41_PREFILL_KEEP_CACHE": "0"}, {"DSV41_PREFILL_KEEP_CACHE": "1"}]
+        assert keep.wanted_at_install()
+    finally:
+        keep._ab = saved
+    fake, runner, saved_cuda = _install_hook({"DSV41_PREFILL_KEEP_CACHE": "1"})
+    try:
+        import prefill_keep_cache as keep2
+        _holding_policy(keep2, fake)
+        fake.empties = 0
+        os.environ["DSV41_PREFILL_KEEP_CACHE"] = "0"   # what an A/B switch to the off variant reads
+        runner.forward(_fb(100, 100, extend=False))
+        assert fake.empties == 1 and not keep2.policy().holding
+    finally:
+        os.environ.pop("DSV41_PREFILL_KEEP_CACHE", None)
+        _restore(saved_cuda)
 
 
 if __name__ == "__main__":

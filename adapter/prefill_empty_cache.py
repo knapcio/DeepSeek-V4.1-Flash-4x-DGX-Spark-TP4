@@ -63,17 +63,18 @@ def install(module):
             logger.warning('DSV41 prefill empty_cache hook: %s', exc)
         return output
 
-    state = {'policy': None, 'warned': False}
+    state = {'warned': False}
 
     def _forward_keep(self, forward_batch, args, kwargs):
         try:
-            on = keep.enabled() and _long_extend(forward_batch)
+            gate = keep.enabled()
+            on = gate and _long_extend(forward_batch)
         except Exception as exc:  # noqa: BLE001
             logger.warning('DSV41 prefill keep-cache hook: %s', exc)
-            on = False
+            gate, on = False, False
         if not on:
-            if state['policy'] is not None and not keep.enabled():
-                state['policy'].reset()      # gate switched off (in-boot A/B): start clean next time
+            if not gate:
+                keep.release(torch, 'gate-off')   # in-boot A/B switched it off: nothing may stay held
             output = original(self, forward_batch, *args, **kwargs)
             try:
                 if _long_extend(forward_batch):
@@ -81,33 +82,39 @@ def install(module):
             except Exception as exc:  # noqa: BLE001
                 logger.warning('DSV41 prefill empty_cache hook: %s', exc)
             return output
-        policy = state['policy']
-        if policy is None:
-            policy = state['policy'] = keep.Policy(slack=keep.slack_bytes())
+        policy = keep.policy()
         try:
-            torch.cuda.reset_peak_memory_stats()
-            policy.before(keep.read_stats(torch))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning('DSV41 prefill keep-cache stats: %s', exc)
-        output = original(self, forward_batch, *args, **kwargs)
-        try:
-            lens = forward_batch.seq_lens_cpu
-            finals = getattr(forward_batch, 'dsv41_final_lens', None)
-            more = keep.prompt_continues(lens.tolist() if lens is not None else None, finals)
-            if finals is None and not state['warned']:
+            batch = keep.batch_of(forward_batch)
+            if batch.finals is None and not state['warned']:
                 state['warned'] = True
                 logger.warning('DSV41_PREFILL_KEEP_CACHE: no final prompt lengths on the batch; emptying every chunk')
-            empty, reason = policy.after(more, keep.read_stats(torch))
+            empty_first, why = policy.begin(batch, keep.read_stats(torch))
+            if empty_first:
+                # the held cache is not this prompt's (another prompt, a mixed batch, more rows, a gap), or a new
+                # prompt must start from an empty cache for its own guard reference
+                torch.cuda.empty_cache()
+                policy.emptied(keep.read_stats(torch))
+            forward_batch.dsv41_pad_ok = policy.pad_ok()
+            torch.cuda.reset_peak_memory_stats()
+            policy.before(keep.read_stats(torch))
+        except Exception as exc:  # noqa: BLE001 - fall back to today's behaviour for this forward
+            logger.warning('DSV41 prefill keep-cache stats: %s', exc)
+            batch = None
+        output = original(self, forward_batch, *args, **kwargs)
+        try:
+            if batch is None:
+                raise RuntimeError('no batch descriptor')
+            empty, reason = policy.after(batch, keep.read_stats(torch))
             if empty:
                 torch.cuda.empty_cache()
                 policy.emptied(keep.read_stats(torch))
-                if policy.sessions:
-                    s = policy.sessions.pop()
-                    if s['chunks'] > 1 or reason not in ('end', 'unknown-final'):
-                        print(keep.receipt(s), flush=True)
                 if reason.startswith('trip'):
                     logger.warning('DSV41_PREFILL_KEEP_CACHE guard %s: cache emptied (slack above frag_ref + %d MiB)',
                                    reason, keep.slack_bytes() >> 20)
+            while policy.sessions:
+                s = policy.sessions.pop()
+                if s['chunks'] > 1 or any(k not in ('end', 'unknown-final') for k in s['empty']):
+                    print(keep.receipt(s), flush=True)
         except Exception as exc:  # bookkeeping must never break a forward; fall back to emptying
             logger.warning('DSV41 prefill keep-cache hook: %s', exc)
             try:

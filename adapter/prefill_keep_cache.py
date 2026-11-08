@@ -25,22 +25,29 @@ What changes, three parts, all allocation-only (no value changes anywhere):
 2. Plumbing: ForwardBatch.init_new attaches dsv41_final_lens = [max(extend end, len(origin_input_ids))] per request
    (the expression ScheduleBatch uses for orig_seq_lens, on the host). Rank-invariant: every TP rank's scheduler
    holds the same requests. Missing -> no padding and the old per-chunk empty_cache.
-3. The policy (Policy below, pure and unit-tested). After a long extend forward:
-     - the prompt of some request in the batch continues and the guard passes -> keep the cache (no empty_cache);
-     - otherwise -> empty_cache() exactly as today: the last chunk of every prefill, an unknown final length,
-       the first long chunk whose starting cache state is unknown, and any guard trip.
+3. The policy (Policy below, pure and unit-tested). A kept cache belongs to ONE prompt (a session: request ids, final
+   lengths, sequence ends, first-chunk rows).
+     - before a long extend forward: a held cache that this batch does not continue (other requests or finals, a gap or
+       rewind, more rows than the first chunk) is emptied FIRST; a new prompt whose cache is not known to be empty is
+       emptied first too, so its first chunk measures the guard reference on this prompt;
+     - after it: keep only if every request continues and the guard passes; otherwise empty_cache() exactly as today
+       (last chunk, a mixed batch where some request ends, unknown final length, a wider-than-chunk batch, a trip);
+     - release: Scheduler hooks empty a held cache once its prompt can no longer continue (aborted / retracted chunked
+       request, pause, idle loop) and the hook does when the gate reads off. Rank-local by design: empty_cache decides
+       no shape and joins no collective.
    Guard (memory neutrality, measured every kept chunk from host-side allocator counters, no device sync):
      slack = reserved - peak_allocated of this forward = cached bytes this chunk did not need even at its peak.
-     A chunk that started from an emptied cache measures the allocator's own rounding/fragmentation, frag_ref.
+     The prompt's first chunk (from an emptied cache) measures the allocator's own rounding/fragmentation, frag_ref.
      Keep only while slack <= frag_ref + DSV41_PREFILL_KEEP_CACHE_SLACK_MB (default 256): then
      reserved <= peak_allocated + frag_ref + SLACK, i.e. what the same chunk would reserve from an empty cache
-     plus at most SLACK. A trip empties the cache (today's state); a trip by more than 4 x SLACK also stops keeping
-     for the rest of that prefill. Between prefills nothing is kept: the last chunk always empties, so decode and
-     the KV-pool budget see exactly today's memory.
-   What the guard cannot bound: the excess INSIDE a chunk whose cached blocks turn out not to fit (it is seen after
-   the chunk and then emptied). With part 1 the remaining growing allocations are small (k_slots / index-K gather /
-   tail masks, ~20-60 B per prefix token); the fleet receipts (num_device_alloc per kept chunk = 0, head
-   MemAvailable low-water vs A/A') are what proves it (diagnostics/prefill-fixed-20261108/DESIGN.md).
+     plus at most SLACK. A trip empties the cache (the next chunk re-measures); a trip by more than 4 x SLACK also stops
+     keeping for the rest of that prompt. Between prompts nothing is kept.
+   DSV41_PREFILL_KEEP_CACHE_PAD_MAX_ROWS (default 8192 = the chunk): a wider batch (bypass admitted beside a chunk
+   without solo) runs with stock widths (ForwardBatch.dsv41_pad_ok = False) and is emptied after.
+   What the guard cannot bound: the excess INSIDE a chunk whose cached blocks turn out not to fit (seen after the chunk,
+   then emptied). With part 1 the remaining growing allocations are small (k_slots / index-K gather / tail masks,
+   ~20-60 B per prefix token); the fleet receipts (new_segments_in_kept, head MemAvailable low-water vs A/A') decide
+   (diagnostics/prefill-fixed-20261108/DESIGN.md).
 
 Receipts: one line per long prefill per rank ("DSV41 keep-cache prefill: ..."): chunks, kept, empties by reason,
 new segments in kept chunks, reserved high-water, max slack, frag_ref.
@@ -61,7 +68,11 @@ except ImportError:  # CPU tests without the adapter dir
 
 
 def _ab_active(name):
-    return _ab is not None and getattr(_ab, "ACTIVE", False) and name in getattr(_ab, "KNOWN", ())
+    """The in-boot A/B is armed AND one of its variants names this key (an armed A/B that does not name it leaves the
+    process exactly as without the A/B: nothing installed, the base env read)."""
+    if _ab is None or not getattr(_ab, "ACTIVE", False) or name not in getattr(_ab, "KNOWN", ()):
+        return False
+    return any(name in spec for spec in getattr(_ab, "_specs", ()) or ())
 
 
 def env(name, default):
@@ -84,6 +95,15 @@ def pad_enabled():
 
 def wanted_at_install():
     return truthy(os.environ.get("DSV41_PREFILL_KEEP_CACHE", "0")) or _ab_active("DSV41_PREFILL_KEEP_CACHE")
+
+
+def pad_max_rows():
+    """Rows of a long extend up to which the indexer pads to the final width (the chunk size). A wider batch (a
+    bypass admitted beside a chunk without solo) runs with stock widths and is emptied after."""
+    try:
+        return int(env("DSV41_PREFILL_KEEP_CACHE_PAD_MAX_ROWS", "8192"))
+    except ValueError:
+        return 8192
 
 
 def slack_bytes():
@@ -113,8 +133,14 @@ def prompt_continues(seq_lens, final_lens):
     return any(int(s) < int(f) for s, f in zip(seq_lens, final_lens))
 
 
+def rids_of(reqs):
+    out = [getattr(r, "rid", None) for r in reqs]
+    return None if any(x is None for x in out) else out
+
+
 def install_forward_batch(module):
-    """ForwardBatch.init_new: attach dsv41_final_lens on extend batches of the target model."""
+    """ForwardBatch.init_new: attach dsv41_final_lens and dsv41_rids on prefill extend batches of the target model
+    (not on speculative verify / draft extends: is_extend_without_speculative)."""
     cls = getattr(module, "ForwardBatch", None)
     if cls is None or not hasattr(cls, "init_new"):
         logger.warning("DSV41_PREFILL_KEEP_CACHE: ForwardBatch.init_new not found; keep-cache inactive")
@@ -127,8 +153,11 @@ def install_forward_batch(module):
         fb = orig(klass, batch, model_runner, *args, **kwargs)
         try:
             mode = getattr(fb, "forward_mode", None)
-            if mode is not None and mode.is_extend() and not getattr(model_runner, "is_draft_worker", False):
-                fb.dsv41_final_lens = final_lens_of(getattr(batch, "reqs", None) or [])
+            if (mode is not None and mode.is_extend_without_speculative()
+                    and not getattr(model_runner, "is_draft_worker", False)):
+                reqs = getattr(batch, "reqs", None) or []
+                fb.dsv41_final_lens = final_lens_of(reqs)
+                fb.dsv41_rids = rids_of(reqs)
         except Exception as exc:  # noqa: BLE001 - bookkeeping never breaks a batch
             logger.warning("DSV41_PREFILL_KEEP_CACHE final lens: %r", exc)
         return fb
@@ -168,25 +197,137 @@ def last_unsplit_lc(seq, step, final_seq, ratio, split_min_lc):
 
 
 # ------------------------------------------------------------------ part 3: the policy
+class Batch:
+    """What the policy needs to know about one long extend forward (all host values).
+
+    ids: request ids (None = unknown, then the final lengths stand in for them); finals: final prompt lengths (None =
+    unknown); seqs: sequence end after this chunk; extends: rows of this chunk per request (None = unknown)."""
+    __slots__ = ("ids", "finals", "seqs", "extends")
+
+    def __init__(self, ids, finals, seqs, extends=None):
+        self.ids = None if ids is None else tuple(ids)
+        self.finals = None if finals is None else tuple(int(f) for f in finals)
+        self.seqs = tuple(int(x) for x in seqs)
+        self.extends = None if extends is None else tuple(int(x) for x in extends)
+        if self.finals is not None and len(self.finals) != len(self.seqs):
+            self.finals = None
+        if self.ids is not None and len(self.ids) != len(self.seqs):
+            self.ids = None
+        if self.extends is not None and len(self.extends) != len(self.seqs):
+            self.extends = None
+
+    def identity(self):
+        return self.ids if self.ids is not None else ("finals",) + (self.finals or ())
+
+    def rows(self, prev_ends=None):
+        if self.extends is not None:
+            return sum(self.extends)
+        if prev_ends is not None:
+            return sum(s - e for s, e in zip(self.seqs, prev_ends))
+        return sum(self.seqs)          # unknown: assume no prefix (first chunk)
+
+    def more(self):
+        """True if every request's prompt goes on after this chunk, False if every one ends here, 'mixed' if some end
+        and some go on, None if the final lengths are unknown."""
+        if self.finals is None or not self.seqs:
+            return None
+        cont = [s < f for s, f in zip(self.seqs, self.finals)]
+        if all(cont):
+            return True
+        return False if not any(cont) else "mixed"
+
+
 class Policy:
-    """Keep / empty decision per long extend forward, from host-side allocator counters.
+    """Keep / empty decisions for the long extend forwards of ONE prompt at a time, from host-side allocator counters.
 
-    stats: dict with reserved (bytes), peak (allocated high-water of this forward), allocs / frees (cumulative
-    cudaMalloc / cudaFree counts). before(): counters at forward start; after(): returns (empty: bool, reason)."""
+    A kept cache belongs to a session: the request ids, their final lengths, the sequence ends after the last chunk and
+    the rows of the session's first chunk. Per long extend forward:
+      begin(batch, stats) -> (empty_before, reason): the caller empties the cache first when it is True: the cache held
+          for a session that this batch does not continue (another prompt, a mixed batch, a gap or a rewind, more rows
+          than the first chunk), or a new session whose first chunk would not start from an empty cache (the guard's
+          reference must be measured on this prompt);
+      before(stats): counters at forward start (after any empty);
+      after(batch, stats) -> (empty_after, reason).
+    release() -> True if a cache is held (the caller empties it): an aborted / retracted / paused chunked request, an
+    idle scheduler, the gate switched off. Stats: reserved (bytes), peak (allocated high-water of this forward),
+    allocs / frees (cumulative cudaMalloc / cudaFree counts)."""
 
-    def __init__(self, slack=256 * MIB, big_factor=4):
+    def __init__(self, slack=256 * MIB, big_factor=4, max_rows=8192):
         self.slack = slack
+        self.max_rows = max_rows
         self.big = big_factor * slack
         self.frag_ref = None
         self.flushed_allocs = None   # num_device_alloc right after our last empty_cache
         self.session = None
         self.fresh = False
         self._start = None
-        self.sessions = []           # finished-session receipts (tests read them)
+        self.sessions = []           # finished-session receipts (the hook prints and pops them)
+
+    @property
+    def holding(self):
+        return self.session is not None and self.session["holding"]
 
     def _new_session(self):
+        self.frag_ref = None
         self.session = {"chunks": 0, "kept": 0, "empty": {}, "new_segments_kept": 0, "reserved_max": 0,
-                        "slack_max": 0, "disabled": False, "frag_ref": None}
+                        "slack_max": 0, "disabled": False, "frag_ref": None, "holding": False,
+                        "identity": None, "finals": None, "ends": None, "rows": None}
+
+    def _close(self, reason):
+        s = self.session
+        if s is not None:
+            s["empty"][reason] = s["empty"].get(reason, 0) + 1
+            s["holding"] = False
+            self.sessions.append(s)
+        self.session = None
+
+    def continues(self, batch, need_holding=True, ignore_rows=False):
+        s = self.session
+        if s is None or (need_holding and not s["holding"]) or batch.finals is None or s["ends"] is None:
+            return False
+        if batch.identity() != s["identity"] or batch.finals != s["finals"]:
+            return False
+        ends = s["ends"]
+        if batch.extends is not None:
+            if any(q - x != e for q, x, e in zip(batch.seqs, batch.extends, ends)):
+                return False        # not the next chunk of these requests (gap, rewind, re-prefill)
+        if any(q <= e for q, e in zip(batch.seqs, ends)):
+            return False
+        return ignore_rows or s["rows"] is None or batch.rows(ends) <= s["rows"]
+
+    def begin(self, batch, stats):
+        out = self._begin(batch, stats)
+        s = self.session
+        if s is not None and batch.rows(s["ends"] if self.continues(batch, need_holding=False) else None) \
+                > self.max_rows:
+            s["wide"] = True           # stock widths for this chunk (pad_ok False) and empty after it
+        return out
+
+    def pad_ok(self):
+        """The indexer may pad this forward to the final width (False for a wider-than-chunk batch)."""
+        return self.session is None or not self.session.get("wide", False)
+
+    def _begin(self, batch, stats):
+        if batch.finals is None and not self.holding:
+            return False, "no-final"   # cannot keep anyway: the forward runs as today and empties after
+        if self.holding:
+            if self.continues(batch):
+                return False, "continue"
+            wider = self.continues(batch, ignore_rows=True)
+            self._close("switch")
+            self._new_session()
+            if wider:
+                # more rows than the session's first chunk (bypass without solo): run it from an empty cache and
+                # empty after it too, so the following normal chunks do not carry the wider chunk's blocks
+                self.session["wide"] = True
+            return True, "switch"
+        if self.session is not None and self.session["chunks"] and not self.continues(batch, need_holding=False):
+            self._close("switch")      # the cache is already empty (the last chunk tripped); receipts per prompt
+        if self.session is None:
+            self._new_session()
+        if self.flushed_allocs is None or stats["allocs"] != self.flushed_allocs:
+            return True, "start"
+        return False, "start-fresh"
 
     def before(self, stats):
         self._start = dict(stats)
@@ -195,48 +336,172 @@ class Policy:
         if self.session is None:
             self._new_session()
 
-    def after(self, more, stats):
+    def after(self, batch, stats):
         s = self.session
         start = self._start or stats
         new_segments = stats["allocs"] - start["allocs"]
         slack = stats["reserved"] - stats["peak"]
+        first = s["chunks"] == 0
         s["chunks"] += 1
         s["reserved_max"] = max(s["reserved_max"], stats["reserved"])
-        if self.fresh:
+        remeasure = first or s.pop("remeasure", False)
+        if self.fresh and remeasure:
             self.frag_ref = slack
             s["frag_ref"] = slack
         else:
             s["slack_max"] = max(s["slack_max"], slack)
+        more = batch.more()
         if more is not True:
-            reason = "end" if more is False else "unknown-final"
+            reason = {False: "end", None: "unknown-final"}.get(more, "mixed")
+        elif s.pop("wide", False):
+            reason = "wide"
         elif s["disabled"]:
             reason = "disabled"
         elif self.frag_ref is None:
             reason = "no-reference"
-        elif not self.fresh and slack > self.frag_ref + self.slack:
+        elif not remeasure and slack > self.frag_ref + self.slack:
             reason = "trip"
             if slack > self.frag_ref + self.big:
                 s["disabled"] = True
                 reason = "trip-big"
         else:
             s["kept"] += 1
-            if not self.fresh:
+            if not remeasure:
                 s["new_segments_kept"] += new_segments
+            if s["rows"] is None:
+                s["rows"] = batch.rows(s["ends"])
+            s["identity"], s["finals"], s["ends"] = batch.identity(), batch.finals, batch.seqs
+            s["holding"] = True
             return False, "keep"
-        s["empty"][reason] = s["empty"].get(reason, 0) + 1
+        s["holding"] = False
         if more is not True:
-            self.sessions.append(s)
-            self.session = None
+            self._close(reason)
+        else:
+            s["empty"][reason] = s["empty"].get(reason, 0) + 1
+            s["remeasure"] = True      # the next chunk starts from the empty cache: a new reference
+            # after a trip the next chunk starts from an empty cache and continues the session; after a wider
+            # chunk the next normal chunk sets the row count
+            if first and reason != "wide":
+                s["rows"] = batch.rows()
+            s["identity"], s["finals"], s["ends"] = batch.identity(), batch.finals, batch.seqs
         return True, reason
 
     def emptied(self, stats):
         """Call right after torch.cuda.empty_cache() with fresh counters."""
         self.flushed_allocs = stats["allocs"]
 
+    def release(self):
+        """True if a cache is held for a session (the caller empties it and calls emptied())."""
+        if self.holding:
+            self._close("released")
+            return True
+        if self.session is not None and self.session["chunks"]:
+            self._close("released")
+        return False
+
     def reset(self):
         self.session = None
         self.fresh = False
         self.flushed_allocs = None
+        self.frag_ref = None
+
+
+# ------------------------------------------------------------------ one policy per process, shared by the hooks
+_POLICY = [None]
+
+
+def policy():
+    if _POLICY[0] is None:
+        _POLICY[0] = Policy(slack=slack_bytes(), max_rows=pad_max_rows())
+    return _POLICY[0]
+
+
+def batch_of(forward_batch):
+    lens = getattr(forward_batch, "seq_lens_cpu", None)
+    seqs = [] if lens is None else [int(x) for x in (lens.tolist() if hasattr(lens, "tolist") else lens)]
+    ext = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if ext is not None and hasattr(ext, "tolist"):
+        ext = ext.tolist()
+    return Batch(getattr(forward_batch, "dsv41_rids", None), getattr(forward_batch, "dsv41_final_lens", None),
+                 seqs, ext)
+
+
+def release(torch, why="released"):
+    """Empty the cache if a prompt's cache is held. Rank-local and allowed: empty_cache decides no shape and joins
+    no collective. Returns True if it emptied."""
+    p = _POLICY[0]
+    if p is None or not p.holding:
+        return False
+    p.release()
+    torch.cuda.empty_cache()
+    p.emptied(read_stats(torch))
+    while p.sessions:
+        print(receipt(p.sessions.pop(), why), flush=True)
+    return True
+
+
+def scheduler_owns_session(scheduler, batch):
+    """True while the held session may still continue: the scheduler's chunked request, or a request of the batch
+    about to run, is one of the session's requests."""
+    p = _POLICY[0]
+    if p is None or not p.holding:
+        return True
+    ids = set(p.session["identity"] or ())
+    chunked = getattr(scheduler, "chunked_req", None)
+    if chunked is not None and getattr(chunked, "rid", None) in ids:
+        return True
+    reqs = getattr(batch, "reqs", None) if batch is not None else None
+    return bool(reqs) and any(getattr(r, "rid", None) in ids for r in reqs)
+
+
+def install_scheduler(module, torch=None):
+    """Release a held cache when the prompt it belongs to can no longer continue: after get_next_batch_to_run (an
+    aborted, retracted or finished-elsewhere chunked request, an idle loop), after process_pending_chunked_abort,
+    pause_generation and on_idle. Installed after decode_yield (which pins get_next_batch_to_run's source)."""
+    if torch is None:
+        import torch
+    cls = getattr(module, "Scheduler", None)
+    if cls is None or getattr(cls, "_dsv41_keep_cache", False):
+        return cls is not None
+    done = []
+    if hasattr(cls, "get_next_batch_to_run"):
+        orig_next = cls.get_next_batch_to_run
+
+        def get_next_batch_to_run(self, *args, **kwargs):
+            plan = orig_next(self, *args, **kwargs)
+            try:
+                batch = getattr(plan, "batch_to_run", plan)
+                if not scheduler_owns_session(self, batch):
+                    release(torch, "orphaned")
+            except Exception as exc:  # noqa: BLE001 - bookkeeping never breaks the loop
+                logger.warning("DSV41_PREFILL_KEEP_CACHE release: %r", exc)
+            return plan
+
+        get_next_batch_to_run.__wrapped__ = orig_next
+        cls.get_next_batch_to_run = get_next_batch_to_run
+        done.append("get_next_batch_to_run")
+    for name, why in (("process_pending_chunked_abort", "abort"), ("pause_generation", "pause"), ("on_idle", "idle")):
+        orig = getattr(cls, name, None)
+        if orig is None:
+            continue
+
+        def wrap(orig=orig, why=why):
+            def fn(self, *args, **kwargs):
+                out = orig(self, *args, **kwargs)
+                try:
+                    if why == "idle" or getattr(self, "chunked_req", None) is None:
+                        release(torch, why)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("DSV41_PREFILL_KEEP_CACHE release (%s): %r", why, exc)
+                return out
+            fn.__wrapped__ = orig
+            return fn
+
+        setattr(cls, name, wrap())
+        done.append(name)
+    cls._dsv41_keep_cache = True
+    logger.warning("DSV41_PREFILL_KEEP_CACHE: held cache released from Scheduler.%s", ", ".join(done))
+    return True
 
 
 def read_stats(torch):
@@ -247,9 +512,10 @@ def read_stats(torch):
             "frees": int(st.get("num_device_free", 0))}
 
 
-def receipt(s):
+def receipt(s, why=None):
     empties = ",".join(f"{k}={v}" for k, v in sorted(s["empty"].items())) or "-"
     ref = "unknown" if s["frag_ref"] is None else f"{s['frag_ref'] / MIB:.0f} MiB"
     return (f"DSV41 keep-cache prefill: chunks={s['chunks']} kept={s['kept']} empties[{empties}] "
             f"new_segments_in_kept={s['new_segments_kept']} reserved_max={s['reserved_max'] / MIB:.0f} MiB "
-            f"slack_max={s['slack_max'] / MIB:.0f} MiB frag_ref={ref} disabled={s['disabled']}")
+            f"slack_max={s['slack_max'] / MIB:.0f} MiB frag_ref={ref} disabled={s['disabled']}"
+            + (f" released_by={why}" if why else ""))

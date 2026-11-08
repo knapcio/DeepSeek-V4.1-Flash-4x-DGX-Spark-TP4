@@ -11,8 +11,15 @@ view, and the 128x4 swizzled scales are row-tile-major (prefill_sp.swizzle_128x4
 are the contiguous bytes [r0 * Gp, (r0 + ceil128(r1 - r0)) * Gp) with Gp = ceil4(K / 32).
 
   DSV41_PREFILL_GEMM_ROW_SPLIT_MIN_K   default 5120: only GEMMs with K >= this (wo_b K=2048, q_b K=1280 keep L2)
-  DSV41_PREFILL_GEMM_ROW_SPLIT_MIN_M   default 2 x rows: only M >= this (decode, DSpark verify, short extends: stock)
-  DSV41_PREFILL_GEMM_ROW_SPLIT_N       optional comma list of N (per-rank output width) to restrict it to
+  DSV41_PREFILL_GEMM_ROW_SPLIT_MIN_M   default 2 x rows: only M >= this (decode, DSpark verify, short extends: stock);
+                                       and only M a multiple of rows (production chunks are 8192; an 8192 + x bypass
+                                       batch or a replay of another size keeps the stock call and never re-checks)
+  DSV41_PREFILL_GEMM_ROW_SPLIT_N       comma list of N (per-rank output width), default 1792,1152 = wqkv_a and the
+                                       shared FC1, the two measured shapes; "all" = every N
+
+Rank invariance of the check's all_reduce rests on (N, K, M) being the same on every rank for every eligible call:
+true for the replicated wqkv_a, the TP-even shared FC1 and SP's full-row gathers; a layer whose per-rank N differs must
+never be eligible (keep _N to replicated / even shapes).
 
 Each row of a GEMM output depends only on that row of A and on B: the kernel's K loop per output element does not
 change with M. That is the claim; it is checked, not assumed: the first eager call of every (N, K, M, pre-quantized,
@@ -46,7 +53,11 @@ AGREE = [True]       # CPU tests switch the TP agreement off
 
 
 def _ab_active():
-    return _ab is not None and getattr(_ab, "ACTIVE", False) and "DSV41_PREFILL_GEMM_ROW_SPLIT" in getattr(_ab, "KNOWN", ())
+    """The in-boot A/B is armed and one of its variants names the gate (else: base env, read once)."""
+    name = "DSV41_PREFILL_GEMM_ROW_SPLIT"
+    if _ab is None or not getattr(_ab, "ACTIVE", False) or name not in getattr(_ab, "KNOWN", ()):
+        return False
+    return any(name in spec for spec in getattr(_ab, "_specs", ()) or ())
 
 
 def _raw_env(name, default):
@@ -55,7 +66,10 @@ def _raw_env(name, default):
     return os.environ.get(name, default)
 
 
-def parse(rows_raw, min_k_raw="5120", min_m_raw="", n_raw=""):
+DEFAULT_N = "1792,1152"
+
+
+def parse(rows_raw, min_k_raw="5120", min_m_raw="", n_raw=DEFAULT_N):
     """(rows, min_k, min_m, n_set or None) from the env strings; rows 0 = off. rows must be a positive multiple of 128."""
     raw = str(rows_raw or "0").strip().lower()
     if raw in _OFF:
@@ -69,15 +83,28 @@ def parse(rows_raw, min_k_raw="5120", min_m_raw="", n_raw=""):
     min_m = int(str(min_m_raw).strip()) if str(min_m_raw or "").strip() else 2 * rows
     if min_m <= rows:
         raise ValueError(f"DSV41_PREFILL_GEMM_ROW_SPLIT_MIN_M={min_m} must exceed the block ({rows})")
-    ns = {int(x) for x in str(n_raw or "").split(",") if x.strip()} or None
+    n_txt = str(DEFAULT_N if n_raw is None else n_raw).strip().lower()
+    ns = None if n_txt in ("all", "*", "") else {int(x) for x in n_txt.split(",") if x.strip()}
     return rows, min_k, min_m, ns
 
 
-def config():
+_CONFIG = [None]
+
+
+def _read_config():
     return parse(_raw_env("DSV41_PREFILL_GEMM_ROW_SPLIT", "0"),
                  _raw_env("DSV41_PREFILL_GEMM_ROW_SPLIT_MIN_K", "5120"),
                  _raw_env("DSV41_PREFILL_GEMM_ROW_SPLIT_MIN_M", ""),
-                 _raw_env("DSV41_PREFILL_GEMM_ROW_SPLIT_N", ""))
+                 _raw_env("DSV41_PREFILL_GEMM_ROW_SPLIT_N", DEFAULT_N))
+
+
+def config():
+    """Per call under an armed in-boot A/B that names the gate, else parsed once (make_linear_split resets it)."""
+    if _ab_active():
+        return _read_config()
+    if _CONFIG[0] is None:
+        _CONFIG[0] = _read_config()
+    return _CONFIG[0]
 
 
 def plan_blocks(m, rows):
@@ -89,7 +116,7 @@ def plan_blocks(m, rows):
 
 def eligible(m, n, k, cfg):
     rows, min_k, min_m, ns = cfg
-    return bool(rows) and m >= min_m and k >= min_k and (ns is None or n in ns)
+    return bool(rows) and m >= min_m and m % rows == 0 and k >= min_k and (ns is None or n in ns)
 
 
 def ceil_to(x, a):
@@ -165,6 +192,7 @@ def make_linear_split(fp8_utils):
 
     None = not split (the caller runs the stock call). Mirrors fp8_utils.flashinfer_mxfp8_blockscaled_linear for the
     b12x backend: quantize once (swizzled, alignment 32), weight.t(), weight_scale.t(), autotune(False) when pinned."""
+    _CONFIG[0] = None
     raw_mm = getattr(fp8_utils, "_raw_flashinfer_mm_mxfp8", None)
     quantize = getattr(fp8_utils, "flashinfer_mxfp8_quantize", None)
     if raw_mm is None or quantize is None:

@@ -39,8 +39,9 @@ def unswizzle(flat, rows, g):
 def test_parse_and_plan():
     assert pgs.parse("0") == (0, 0, 0, None)
     assert pgs.parse("off") == (0, 0, 0, None)
-    assert pgs.parse("4096") == (4096, 5120, 8192, None)
-    assert pgs.parse("4096", "4096", "12288", "1792,1152") == (4096, 4096, 12288, {1792, 1152})
+    assert pgs.parse("4096") == (4096, 5120, 8192, {1792, 1152})      # default: the two measured shapes only
+    assert pgs.parse("4096", "5120", "", "all") == (4096, 5120, 8192, None)
+    assert pgs.parse("4096", "4096", "12288", "1792") == (4096, 4096, 12288, {1792})
     for bad in ("100", "4096:x"):
         try:
             pgs.parse(bad)
@@ -55,6 +56,10 @@ def test_parse_and_plan():
     assert not pgs.eligible(8192, 5120, 2048, cfg)          # wo_b K=2048: stays one launch
     assert not pgs.eligible(96, 1792, 5120, cfg)            # decode / verify rows
     assert not pgs.eligible(8191, 1792, 5120, cfg)
+    assert not pgs.eligible(8192 + 256, 1792, 5120, cfg)    # bypass-admitted 8192 + x: stock, no re-check
+    assert pgs.eligible(12288, 1792, 5120, cfg)
+    assert not pgs.eligible(8192, 64, 5120, cfg)            # not a measured shape under the default filter
+    assert pgs.eligible(8192, 64, 5120, pgs.parse("4096", "5120", "", "all"))
     assert not pgs.eligible(8192, 1792, 5120, pgs.parse("4096", "5120", "", "1152"))
 
 
@@ -130,6 +135,7 @@ def _inputs(m=8192, k=5120, n=64):
 
 def test_split_equals_unsplit_and_is_used_after_the_check():
     os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT"] = "4096"
+    os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT_N"] = "all"      # the fake GEMMs use N=64
     try:
         pgs._DECIDED.clear()
         calls = []
@@ -151,19 +157,25 @@ def test_split_equals_unsplit_and_is_used_after_the_check():
         calls.clear()
         assert torch.equal(split(original, q, w, ws, xs, None, torch.float32, "b12x", True), ref_q)
         assert calls == [4096, 4096], calls
-        # a partial last block (M = 10000: 4096 + 4096 + 1808)
-        x3, w3, ws3 = _inputs(m=10000)
+        # three blocks (M = 12288); M = 10000 (not a multiple of the block) keeps the stock call, no check
+        x3, w3, ws3 = _inputs(m=12288)
         ref3 = original(x3, w3, ws3, None, None, torch.float32)
         split(original, x3, w3, ws3, None, None, torch.float32, "b12x", True)
         calls.clear()
         assert torch.equal(split(original, x3, w3, ws3, None, None, torch.float32, "b12x", True), ref3)
-        assert calls == [4096, 4096, 1808], calls
+        assert calls == [4096, 4096, 4096], calls
+        x4, w4, ws4 = _inputs(m=10000)
+        n_keys = len(pgs._DECIDED)
+        assert split(original, x4, w4, ws4, None, None, torch.float32, "b12x", True) is None
+        assert len(pgs._DECIDED) == n_keys
     finally:
         os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT")
+        os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT_N", None)
 
 
 def test_check_refuses_a_shape_whose_numbers_change_with_m():
     os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT"] = "4096"
+    os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT_N"] = "all"      # the fake GEMMs use N=64
     try:
         pgs._DECIDED.clear()
         mod, original = make_fp8_utils(perturb_m=4096)
@@ -176,6 +188,7 @@ def test_check_refuses_a_shape_whose_numbers_change_with_m():
         assert split(original, x, w, ws, None, None, torch.float32, "b12x", True) is None   # stock from now on
     finally:
         os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT")
+        os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT_N", None)
 
 
 def test_off_and_ineligible_calls_return_none():
@@ -185,6 +198,8 @@ def test_off_and_ineligible_calls_return_none():
     x, w, ws = _inputs(m=8192, k=5120)
     assert split(original, x, w, ws, None, None, torch.float32, "b12x", True) is None       # gate off
     os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT"] = "4096"
+    os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT_N"] = "all"
+    split = pgs.make_linear_split(mod)                       # config is read once per install
     try:
         xs, ws_, wss = _inputs(m=96)
         assert split(original, xs, ws_, wss, None, None, torch.float32, "b12x", True) is None  # decode rows
@@ -195,6 +210,19 @@ def test_off_and_ineligible_calls_return_none():
         assert not pgs._DECIDED
     finally:
         os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT")
+        os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT_N", None)
+
+
+def test_config_read_once_without_ab():
+    os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT"] = "4096"
+    try:
+        pgs._CONFIG[0] = None
+        first = pgs.config()
+        os.environ["DSV41_PREFILL_GEMM_ROW_SPLIT"] = "0"
+        assert pgs.config() is first and first[0] == 4096
+    finally:
+        os.environ.pop("DSV41_PREFILL_GEMM_ROW_SPLIT")
+        pgs._CONFIG[0] = None
 
 
 def test_wanted_at_install():
