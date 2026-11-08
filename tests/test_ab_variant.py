@@ -348,7 +348,8 @@ def test_config_hash_inputs():
         assert a.CONFIG_HASH == b.CONFIG_HASH != c.CONFIG_HASH and c._MAX_BS == 4
         assert set(a.SOURCES) == {"ab_variant", "l2_prefetch", "fuse_quant", "sitecustomize", "cert_head",
                                   "roce_twoshot", "indexer_chunked_v3", "moe_launch_prepared",
-                                  "block_verify", "block_verify_fold", "extend_nosync"}
+                                  "block_verify", "block_verify_fold", "extend_nosync",
+                                  "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache"}
         assert a.SOURCES["ab_variant"] != "missing" and a.SOURCES["l2_prefetch"] != "missing"
         # a different adapter file on one node changes that node's hash
         saved = sys.modules.get("fuse_quant")
