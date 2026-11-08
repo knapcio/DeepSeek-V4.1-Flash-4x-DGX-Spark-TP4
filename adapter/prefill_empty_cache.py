@@ -17,6 +17,11 @@ cached blocks go back to the driver, the next chunk allocates fresh, and the pea
 one chunk's live set instead of the sum over chunks. Decode CUDA graphs live in
 private pools and are untouched. Cost: one device sync and a few cudaMalloc/cudaFree
 per long-prefill chunk (milliseconds against a 300-800 ms chunk). 0 disables it.
+
+DSV41_PREFILL_KEEP_CACHE=1 (default 0, adapter/prefill_keep_cache.py): between the chunks of one prefill the cache is
+kept (the indexer's growing tensors are padded to the prompt's final width so the next chunk reuses the same blocks)
+and empty_cache() runs only after the prefill's last chunk, on an unknown final length, or when the memory guard
+trips. Allocation only. Off = the hook below, byte for byte the same behaviour.
 """
 import logging
 import os
@@ -32,19 +37,87 @@ def install(module):
         return
     cls = module.ModelRunner
     original = cls.forward
+    keep = None
+    try:
+        import prefill_keep_cache as _keep
+        if _keep.wanted_at_install():
+            keep = _keep
+    except ImportError:
+        keep = None
+
+    def _long_extend(forward_batch):
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            return False
+        lens = forward_batch.seq_lens_cpu
+        longest = int(lens.max()) if lens is not None and lens.numel() else 0
+        return longest >= threshold
 
     def forward(self, forward_batch, *args, **kwargs):
+        if keep is not None:
+            return _forward_keep(self, forward_batch, args, kwargs)
         output = original(self, forward_batch, *args, **kwargs)
         try:
-            if forward_batch.forward_mode.is_extend_without_speculative():
-                lens = forward_batch.seq_lens_cpu
-                longest = int(lens.max()) if lens is not None and lens.numel() else 0
-                if longest >= threshold:
-                    torch.cuda.empty_cache()
+            if _long_extend(forward_batch):
+                torch.cuda.empty_cache()
         except Exception as exc:  # bookkeeping must never break a forward
             logger.warning('DSV41 prefill empty_cache hook: %s', exc)
         return output
 
+    state = {'policy': None, 'warned': False}
+
+    def _forward_keep(self, forward_batch, args, kwargs):
+        try:
+            on = keep.enabled() and _long_extend(forward_batch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('DSV41 prefill keep-cache hook: %s', exc)
+            on = False
+        if not on:
+            if state['policy'] is not None and not keep.enabled():
+                state['policy'].reset()      # gate switched off (in-boot A/B): start clean next time
+            output = original(self, forward_batch, *args, **kwargs)
+            try:
+                if _long_extend(forward_batch):
+                    torch.cuda.empty_cache()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('DSV41 prefill empty_cache hook: %s', exc)
+            return output
+        policy = state['policy']
+        if policy is None:
+            policy = state['policy'] = keep.Policy(slack=keep.slack_bytes())
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            policy.before(keep.read_stats(torch))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('DSV41 prefill keep-cache stats: %s', exc)
+        output = original(self, forward_batch, *args, **kwargs)
+        try:
+            lens = forward_batch.seq_lens_cpu
+            finals = getattr(forward_batch, 'dsv41_final_lens', None)
+            more = keep.prompt_continues(lens.tolist() if lens is not None else None, finals)
+            if finals is None and not state['warned']:
+                state['warned'] = True
+                logger.warning('DSV41_PREFILL_KEEP_CACHE: no final prompt lengths on the batch; emptying every chunk')
+            empty, reason = policy.after(more, keep.read_stats(torch))
+            if empty:
+                torch.cuda.empty_cache()
+                policy.emptied(keep.read_stats(torch))
+                if policy.sessions:
+                    s = policy.sessions.pop()
+                    if s['chunks'] > 1 or reason not in ('end', 'unknown-final'):
+                        print(keep.receipt(s), flush=True)
+                if reason.startswith('trip'):
+                    logger.warning('DSV41_PREFILL_KEEP_CACHE guard %s: cache emptied (slack above frag_ref + %d MiB)',
+                                   reason, keep.slack_bytes() >> 20)
+        except Exception as exc:  # bookkeeping must never break a forward; fall back to emptying
+            logger.warning('DSV41 prefill keep-cache hook: %s', exc)
+            try:
+                torch.cuda.empty_cache()
+                policy.reset()
+            except Exception:  # noqa: BLE001
+                pass
+        return output
+
     cls.forward = forward
     logger.warning('DSV41 prefill empty_cache hook installed (extend forwards with a '
-                   'sequence >= %d tokens)', threshold)
+                   'sequence >= %d tokens)%s', threshold,
+                   '; DSV41_PREFILL_KEEP_CACHE: kept between the chunks of one prefill' if keep is not None else '')

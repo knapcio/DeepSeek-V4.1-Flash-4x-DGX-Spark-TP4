@@ -67,11 +67,29 @@ def install(module):
     if mxfp8_backend_disabled(want):
         return
     original = module.flashinfer_mxfp8_blockscaled_linear
+    # DSV41_PREFILL_GEMM_ROW_SPLIT (adapter/prefill_gemm_split.py, off by default): K >= 5120 GEMMs of >= 8192 rows as
+    # row blocks of the same kernel, bit-identity checked per shape. None = not installed, the path below is unchanged.
+    row_split = None
+    try:
+        import prefill_gemm_split
+        if prefill_gemm_split.wanted_at_install():
+            row_split = prefill_gemm_split.make_linear_split(module)
+            if row_split is not None:
+                logger.warning('DSV41_PREFILL_GEMM_ROW_SPLIT armed: %s (rows, min K, min M, N filter)',
+                               prefill_gemm_split.config())
+    except Exception as exc:  # an opt-in knob must not stop the stock route
+        logger.warning('DSV41_PREFILL_GEMM_ROW_SPLIT not installed: %r', exc)
+        row_split = None
 
     def linear(input, weight, weight_scale, input_scale=None, bias=None,
                output_dtype=None, backend='cutlass', pin_tactic=False):
         key = (int(weight.shape[0]), int(weight.shape[1]))
         if backend == 'cutlass' and key not in _REJECTED:
+            if row_split is not None:
+                out = row_split(original, input, weight, weight_scale, input_scale, bias,
+                                output_dtype, want, pin_tactic)
+                if out is not None:
+                    return out
             try:
                 return original(input, weight, weight_scale, input_scale, bias,
                                 output_dtype, backend=want, pin_tactic=pin_tactic)

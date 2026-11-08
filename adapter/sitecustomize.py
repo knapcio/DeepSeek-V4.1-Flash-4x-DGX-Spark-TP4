@@ -81,6 +81,13 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_forward_batch as install_swa_cone_forward_batch
                 install_swa_cone_forward_batch(module)
+            # Gated on DSV41_PREFILL_KEEP_CACHE=1 (or an armed in-boot A/B naming it): extend batches carry the
+            # requests' final prompt lengths for the keep-cache policy and the indexer padding
+            # (adapter/prefill_keep_cache.py). Gate checked inside before anything is wrapped.
+            from prefill_keep_cache import wanted_at_install as _keep_wanted
+            if _keep_wanted():
+                from prefill_keep_cache import install_forward_batch as install_keep_cache_forward_batch
+                install_keep_cache_forward_batch(module)
         elif module.__name__ == 'sglang.srt.mem_cache.deepseek_v4_memory_pool':
             # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records (v41c),
             # or the whole V4.1 layout pair on SM12x (v41, v2.7). v41c_pool.enabled() raises on any value but v4 /

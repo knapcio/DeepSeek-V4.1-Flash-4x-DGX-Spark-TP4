@@ -21,6 +21,16 @@ one gather over device indices (``repeat_interleave`` with a host ``output_size`
 as pinned non-blocking copies. Integer ops only, same elements in the same order: k_slots, ks, the selected slots,
 page/raw indices and the candidate masks are bit-identical (tests/test_indexer_nosync.py). Read per call through
 adapter/ab_variant.py when the in-boot A/B is armed (a RUNTIME key), else once.
+
+``DSV41_PREFILL_KEEP_CACHE=1`` + ``DSV41_PREFILL_KEEP_CACHE_PAD`` (default 1 with it; adapter/prefill_keep_cache.py):
+the logits row width, the causal bool mask and the candidate-block maxima are sized by the request's FINAL compressed
+width (ForwardBatch.dsv41_final_lens) instead of the current one, so these allocations keep one size over the chunks
+of a prefill and the allocator can reuse its blocks without an empty_cache() per chunk. Values: DeepGEMM's
+fp8_fp4_mqa_logits writes column j only for j < ke - ks and loops only over that KV range (sm120_fp4_mqa_logits.cuh:
+kv range from cu_seq_len_k_start/end, store guarded in compressed-logits mode), the ragged top-k reads
+scores[i, :seq_lens[i]] with the row stride as a parameter (topk_v2.cuh), the -inf fill of columns >= the row's length
+is the same on every column < width, and the block maxima of the padded view equal F.pad(-inf) + amax: bit-identical
+selections and masks (tests/test_indexer_chunked_v3.py, padded runs against the stock function).
 """
 import inspect
 import logging
@@ -66,6 +76,41 @@ def nosync_value(raw):
     return str(raw or "0").strip().lower() not in _OFF
 
 
+def _pad_reader():
+    """() -> bool for DSV41_PREFILL_KEEP_CACHE_PAD (adapter/prefill_keep_cache.py), read per call."""
+    try:
+        import prefill_keep_cache as keep
+    except ImportError:
+        return lambda: False
+    if not keep.wanted_at_install():
+        return lambda: False
+    return keep.pad_enabled
+
+
+def final_lcs(forward_batch, ratio, n):
+    """Per request: the compressed width this prefill ends at, or None (no padding)."""
+    finals = getattr(forward_batch, "dsv41_final_lens", None)
+    if finals is None or len(finals) != n:
+        return None
+    return [int(f) // ratio for f in finals]
+
+
+def split_pad_width(width_max, final_max, block_size):
+    """Row width of the SG18-split logits: the final width, aligned to 4 (top-k vector loads) and to the candidate
+    block (the padded block view)."""
+    import prefill_keep_cache as keep
+    return keep.padded_width(width_max, final_max, keep.lcm(4, int(block_size)))
+
+
+def unsplit_pad_width(lc, final_lc, tp, seq, step, ratio):
+    """Row width of the unsplit (#39187) logits: the final width, or, when the SG18 split takes over above its context
+    threshold, the width of the last chunk of this prompt that stays unsplit (chunks of `step` rows from `seq` on)."""
+    import prefill_keep_cache as keep
+    if tp is None or not getattr(tp, "enabled", False):
+        return keep.padded_width(lc, final_lc, 4)
+    return keep.padded_width(lc, keep.last_unsplit_lc(seq, step, final_lc * ratio, ratio, int(tp.minimum_context)), 4)
+
+
 def h2d(values, dtype, device):
     """torch.tensor(values, dtype=dtype, device=device) without the stream sync of a pageable host copy: a pinned
     staging tensor and a non-blocking copy (the caching host allocator keeps the block until the copy has run)."""
@@ -100,12 +145,12 @@ def slot_ids_nosync(req_to_token, req_pool_indices, lc_per_req, ratio, device):
 
 
 def _split_local(indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, lengths, q_lengths,
-                 world, rank, *, budget, scorer, topk_fn, mask_topk, consume, ceil_align):
+                 world, rank, *, budget, scorer, topk_fn, mask_topk, consume, ceil_align, pad_width=None):
     """This rank's slice of the query rows, scored in row chunks of <= budget bytes of fp32
     logits (the #39187 bound applied inside the SG18 partition). Returns the packed int32
     [extent, topk + blocks] tensor the all-gather concatenates: top-k ids, then candidate
     block ids for a source layer."""
-    from spark_prefill_dense import partition, candidate_block_ids
+    from spark_prefill_dense import partition, candidate_block_ids, candidate_block_ids_padded
 
     rows = q_fp4.shape[0]
     start, end, extent = partition(rows, world, rank)
@@ -118,6 +163,8 @@ def _split_local(indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, lengths, 
     if start >= end:
         return packed
     lc_aligned = ceil_align(width_max, 4)
+    if pad_width is not None:  # DSV41_PREFILL_KEEP_CACHE_PAD: the prompt's final width, a multiple of 4 and the block
+        lc_aligned = max(lc_aligned, pad_width)
     rows_per_chunk = max(1, budget // (lc_aligned * 4))
     # request boundaries in global row space
     bounds = []
@@ -142,11 +189,21 @@ def _split_local(indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, lengths, 
             scores = logits[take, :width]
             if source:
                 row_lens = local_lens[take, None]
-                scores.masked_fill_(torch.arange(width, device=logits.device)[None, :] >= row_lens, -torch.inf)
                 nblocks = min(indexer.candidate_topk_blocks,
                               (width + indexer.candidate_block_size - 1) // indexer.candidate_block_size)
-                ids = candidate_block_ids(scores, row_lens, indexer.candidate_topk_blocks,
-                                          indexer.candidate_block_size)
+                if pad_width is not None:
+                    # columns >= the row's length (incl. [width, padded)) to -inf on the whole padded row: the same
+                    # values below width, and the block maxima need no F.pad copy of the growing width
+                    padded_rows = logits[take]
+                    padded_rows.masked_fill_(torch.arange(lc_aligned, device=logits.device)[None, :] >= row_lens,
+                                             -torch.inf)
+                    bs = indexer.candidate_block_size
+                    ids = candidate_block_ids_padded(padded_rows[:, :(width + bs - 1) // bs * bs], row_lens,
+                                                     indexer.candidate_topk_blocks, bs)
+                else:
+                    scores.masked_fill_(torch.arange(width, device=logits.device)[None, :] >= row_lens, -torch.inf)
+                    ids = candidate_block_ids(scores, row_lens, indexer.candidate_topk_blocks,
+                                              indexer.candidate_block_size)
                 packed[lo - start:hi - start, indexer.index_topk:indexer.index_topk + nblocks] = ids
             elif consume is not None:
                 scores.masked_fill_(~consume[request][lo - lo_r:hi - lo_r], -torch.inf)
@@ -161,7 +218,7 @@ def _split_local(indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, lengths, 
 
 def _split_select(tp, indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, lengths, q_lengths,
                   *, budget, scorer, topk_fn, mask_topk, consume, publish_rows, layer_id, ratio,
-                  ceil_align):
+                  ceil_align, pad_width=None):
     """Score this rank's partition, all-gather the packed ids, rebuild the (tail-only)
     candidate masks. Mirrors NativePrefillTPSplit.select with the chunk bound and the
     #39187 tail-only publishing."""
@@ -169,7 +226,7 @@ def _split_select(tp, indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, leng
 
     local = _split_local(indexer, q_fp4, q_sf, k_fp4, k_sf, weights, ks, lens, lengths, q_lengths,
                          tp.world, tp.rank, budget=budget, scorer=scorer, topk_fn=topk_fn,
-                         mask_topk=mask_topk, consume=consume, ceil_align=ceil_align)
+                         mask_topk=mask_topk, consume=consume, ceil_align=ceil_align, pad_width=pad_width)
     gathered = tp.group.all_gather(local, dim=0)[: q_fp4.shape[0]]
     masks = None
     if indexer.is_candidate_source:
@@ -208,6 +265,7 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
     published_masks = module.published_masks
     _DENSE_INDEXER_LOGITS_BUDGET_BYTES = budget
     _nosync = _nosync_reader()
+    _pad_on = _pad_reader()
 
     # ---- begin verbatim from sglang#39187 (deepseek_v4_backend.py @ cb8dd033) ----
 
@@ -282,6 +340,8 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
         topk = indexer.index_topk
         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
         _tp = getattr(self, "_dsv41_native_prefill_tp", None)
+        # ds41 DSV41_PREFILL_KEEP_CACHE_PAD (off = None everywhere = the verbatim path)
+        _finals = final_lcs(forward_batch, ratio, len(lc_per_req)) if _pad_on() else None
         if _tp is not None and _tp.eligible(
             num_tokens, max(lc_per_req),
             prefill=forward_batch.forward_mode.is_extend_without_speculative(),
@@ -303,6 +363,8 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
                 scorer=_dense_fp4_mqa_logits, topk_fn=topk_transform_ragged_v2,
                 mask_topk=mask_topk_scores, consume=_consume, publish_rows=_pub_rows,
                 layer_id=layer.layer_id, ratio=ratio, ceil_align=ceil_align,
+                pad_width=(None if _finals is None else split_pad_width(
+                    max(lc_per_req), max(_finals), indexer.candidate_block_size)),
             )
             if indexer.is_candidate_source:
                 self.forward_metadata.candidate_metadata = CandidateMasks(request_masks=_masks)
@@ -346,6 +408,8 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
                     selected[rows_b].fill_(-1)
                 continue
             lc_aligned = ceil_align(lc, 4)
+            if _finals is not None:  # ds41 PAD: as wide as this path gets for the prompt
+                lc_aligned = unsplit_pad_width(lc, _finals[b], _tp, seq_lens_cpu[b], t_len, ratio)
             rows_per_chunk = max(
                 1, _DENSE_INDEXER_LOGITS_BUDGET_BYTES // (lc_aligned * 4)
             )
@@ -360,6 +424,7 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
                 first_pub = t_len - pub_rows
                 mask_b = torch.empty((pub_rows, lc), dtype=torch.bool, device=device)
             j = torch.arange(lc, device=device)
+            jp = torch.arange(lc_aligned, device=device) if _finals is not None else None
             for c0 in range(0, t_len, rows_per_chunk):
                 c1 = min(c0 + rows_per_chunk, t_len)
                 rows = slice(rows_b.start + c0, rows_b.start + c1)
@@ -374,7 +439,10 @@ def make_index_topk_dense(module, quantize_fp4_indexer_tensor, budget):
                 )
                 scores = logits[:, :lc]
                 if publish is not None:
-                    scores.masked_fill_(j[None, :] >= lens[:, None], -torch.inf)
+                    if jp is not None:  # ds41 PAD: same fill below lc, a fixed-size mask
+                        logits.masked_fill_(jp[None, :] >= lens[:, None], -torch.inf)
+                    else:
+                        scores.masked_fill_(j[None, :] >= lens[:, None], -torch.inf)
                     p0 = max(c0, first_pub)
                     if p0 < c1:
                         mask_b[p0 - first_pub : c1 - first_pub] = (
