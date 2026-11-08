@@ -14,6 +14,11 @@ class EngramLoader(importlib.abc.Loader):
     def exec_module(self, module):
         self.original.exec_module(module)
         if module.__name__ == 'sglang.srt.layers.engram':
+            # Gated on DSV41_EXTEND_NOSYNC=1 (off by default), FIRST: the hasher's extend map gets a host-known
+            # output size before engram_prefetch wraps the hasher (adapter/extend_nosync.py, bit-identical).
+            if os.environ.get('DSV41_EXTEND_NOSYNC', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from extend_nosync import install_engram as install_extend_nosync_engram
+                install_extend_nosync_engram(module)
             from engram_backend import install
             install(module)
             # After engram_backend: Engram rows fetched on a side stream right after the
@@ -69,6 +74,12 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_backend as install_swa_cone_backend
                 install_swa_cone_backend(module)
+            # Gated on DSV41_EXTEND_NOSYNC=1 (off by default): the extend's late-layer tail metadata is built
+            # without host syncs, so an admission's launch can run under the in-flight decode step
+            # (adapter/extend_nosync.py, bit-identical). Gate checked BEFORE the import.
+            if os.environ.get('DSV41_EXTEND_NOSYNC', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from extend_nosync import install_backend as install_extend_nosync_backend
+                install_extend_nosync_backend(module)
             # DSV41_KV_LAYOUT=v41c (adapter/v41c_pool.py) / v41 (adapter/v41_pool.py, v2.7): the writer / reader call
             # sites must be the pinned ones.
             if os.environ.get('DSV41_KV_LAYOUT', '').strip() not in _V41C_OFF:
@@ -331,6 +342,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DECODE_YIELD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from decode_yield import install as install_decode_yield
                 install_decode_yield(module)
+            # TEST ONLY, gated on DSV41_EXTEND_SYNC_AUDIT=1: host syncs inside extend batches are logged per site
+            # (adapter/extend_sync_audit.py). Logging only; outermost run_batch wrapper. Gate checked BEFORE the import.
+            if os.environ.get('DSV41_EXTEND_SYNC_AUDIT', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from extend_sync_audit import install as install_extend_sync_audit
+                install_extend_sync_audit(module)
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)
