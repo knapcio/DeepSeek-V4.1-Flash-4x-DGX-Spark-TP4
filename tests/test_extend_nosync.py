@@ -70,9 +70,11 @@ if ROOT is None:
     sys.exit(0)
 BACKEND = os.path.join(ROOT, "sglang/srt/layers/attention/deepseek_v4_backend.py")
 KERNELS = os.path.join(ROOT, "sglang/kernels/ops/attention/dsv4_attn_metadata_kernels.py")
+ENGRAM = os.path.join(ROOT, "sglang/srt/layers/engram.py")
 SRC = {
     "DeepseekV4AttnBackend._build_late_layer_tail_metadata": lift(BACKEND, "DeepseekV4AttnBackend._build_late_layer_tail_metadata"),
     "late_layer_tail_layout": lift(KERNELS, "late_layer_tail_layout"),
+    "EngramHasher.forward": lift(ENGRAM, "EngramHasher.forward"),
 }
 
 # ---- 1. pins and anchors -------------------------------------------------------------------------------------
@@ -240,6 +242,39 @@ check("_h2d stages CUDA copies in pinned memory, non_blocking",
       "pin_memory=True" in h2d_src and "non_blocking=True" in h2d_src)
 check("_h2d off-CUDA == torch.tensor", same(N._h2d([3, 1, 2], torch.int32, "cpu"),
                                              torch.tensor([3, 1, 2], dtype=torch.int32)))
+
+# ---- 4b. the engram hasher's extend map ------------------------------------------------------------------------
+eng_text = N.apply_edits(SRC["EngramHasher.forward"], N.TARGETS["EngramHasher.forward"][1])
+check("engram: the edited hasher passes the host-known size to its only repeat_interleave",
+      eng_text.count("repeat_interleave(") == 1 and "**_dsv41_ri_size(forward_batch, bs)" in eng_text)
+bad = 0
+for _ in range(500):
+    lens_cpu = [rng.choice((0, 1, rng.randint(1, 64), rng.randint(1, 900))) for _ in range(rng.randint(1, 16))]
+    bs = len(lens_cpu)
+    fb = types.SimpleNamespace(extend_seq_lens_cpu=lens_cpu, extend_num_tokens=sum(lens_cpu))
+    lens = torch.tensor(lens_cpu, dtype=torch.int32).to(torch.int64)
+    a = torch.repeat_interleave(torch.arange(bs), lens)
+    b = torch.repeat_interleave(torch.arange(bs), lens, **N._ri_size(fb, bs))
+    bad += not same(a, b)
+check("engram: map with output_size == stock on 500 random batches (zero-length requests included)", bad == 0)
+N._STATE.pop("ri_fallback", None)
+r1 = N._ri_size(types.SimpleNamespace(extend_seq_lens_cpu=None, extend_num_tokens=5), 1)
+r2 = N._ri_size(types.SimpleNamespace(extend_seq_lens_cpu=[2, 3], extend_num_tokens=6), 2)
+r3 = N._ri_size(types.SimpleNamespace(extend_seq_lens_cpu=[2, 3], extend_num_tokens=5), 3)
+check("engram: missing / inconsistent host mirror falls back to the stock call",
+      r1 == {} and r2 == {} and r3 == {} and N._STATE.get("ri_fallback") == 3)
+try:
+    torch.repeat_interleave(torch.arange(2, device=meta), torch.tensor([2, 3], device=meta),
+                            **N._ri_size(types.SimpleNamespace(extend_seq_lens_cpu=[2, 3], extend_num_tokens=5), 2))
+    meta_ok = True
+except Exception:  # noqa: BLE001
+    meta_ok = False
+try:
+    torch.repeat_interleave(torch.arange(2, device=meta), torch.tensor([2, 3], device=meta))
+    meta_stock = False
+except Exception:  # noqa: BLE001
+    meta_stock = True
+check("engram: meta device, sized map needs no host read; the stock map does", meta_ok and meta_stock)
 
 # ---- 5. drift and anchors refuse -------------------------------------------------------------------------------
 try:

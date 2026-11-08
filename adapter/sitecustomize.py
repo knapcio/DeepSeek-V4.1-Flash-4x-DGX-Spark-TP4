@@ -14,6 +14,11 @@ class EngramLoader(importlib.abc.Loader):
     def exec_module(self, module):
         self.original.exec_module(module)
         if module.__name__ == 'sglang.srt.layers.engram':
+            # Gated on DSV41_EXTEND_NOSYNC=1 (off by default), FIRST: the hasher's extend map gets a host-known
+            # output size before engram_prefetch wraps the hasher (adapter/extend_nosync.py, bit-identical).
+            if os.environ.get('DSV41_EXTEND_NOSYNC', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from extend_nosync import install_engram as install_extend_nosync_engram
+                install_extend_nosync_engram(module)
             from engram_backend import install
             install(module)
             # After engram_backend: Engram rows fetched on a side stream right after the

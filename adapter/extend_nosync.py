@@ -19,6 +19,13 @@ The syncs removed here are integer bookkeeping only: the same values reach the s
     output size is ``sum(tail_lens_cpu)``, already on the host.
 * ``late_layer_tail_layout`` (called from the method above; only multi-request extends reach the copy):
   ``torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)`` is pageable. Same pinned copy.
+* ``EngramHasher.forward`` (sglang.srt.layers.engram), once per extend before layer 0: the token -> request map
+  ``torch.repeat_interleave(torch.arange(bs), lens)`` has no ``output_size``. The size is ``sum(extend_seq_lens_cpu)``,
+  the host mirror of ``lens``; when that mirror is missing or disagrees with ``extend_num_tokens`` the stock call runs.
+
+Left alone (see diagnostics/i1-admission-20261108/DESIGN.md): cold-only Engram staging copies, prefill_sp's per-new-M
+self-checks (M >= 2048), hc_fused's one-time self-check, and prefill_empty_cache's ``torch.cuda.empty_cache()`` after
+extends of sequences >= 8192 tokens (after the launch: it does not delay the extend, it blocks the next iteration).
 
 Stream ordering. A blocking copy is complete on the device before the host goes on; a non-blocking one is ordered on
 the current (forward) stream only. Every consumer of these tensors is either on that stream or derived from tensors
@@ -79,7 +86,32 @@ TARGETS = {
              "lens = _dsv41_h2d([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], torch.int64, device)"),
         ],
     ),
+    # sglang.srt.layers.engram: the hasher runs once per forward before layer 0 (deepseek_v4.py, or
+    # adapter/prefill_sp.py under SP); its extend branch sizes the token -> request map from device lengths.
+    "EngramHasher.forward": (
+        "5d17c65051cd1703ec2979cc57c5e23dbbc502a2c0d62ba04385fef0d7ca1334",
+        [
+            ("row = torch.repeat_interleave(torch.arange(bs, device=device), lens)",
+             "row = torch.repeat_interleave(torch.arange(bs, device=device), lens, **_dsv41_ri_size(forward_batch, bs))"),
+        ],
+    ),
 }
+
+
+def _ri_size(forward_batch, bs):
+    """{'output_size': total} when the host mirror of this extend's lengths is complete and agrees with the
+    batch's host token count, else {} (the stock call, with its sync). Both come from the scheduler's lists, the
+    same lists ForwardBatch.init_new copied to the device lengths the call repeats over."""
+    lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if not isinstance(lens_cpu, (list, tuple)) or len(lens_cpu) != bs:
+        _STATE["ri_fallback"] = _STATE.get("ri_fallback", 0) + 1
+        return {}
+    total = int(sum(lens_cpu))
+    expect = getattr(forward_batch, "extend_num_tokens", None)
+    if expect is not None and int(expect) != total:
+        _STATE["ri_fallback"] = _STATE.get("ri_fallback", 0) + 1
+        return {}
+    return {"output_size": total}
 
 _STATE = {"installed": False, "static": False, "calls": {}}
 
@@ -120,6 +152,7 @@ def build(fn, name, pin, edits, globals_):
     code = compile(apply_edits(src, edits), f"<{GATE}:{name}>", "exec")
     scope = {}
     globals_.setdefault("_dsv41_h2d", _h2d)
+    globals_.setdefault("_dsv41_ri_size", _ri_size)
     exec(code, globals_, scope)
     new = scope[fn.__name__]
     new.__qualname__ = fn.__qualname__
@@ -164,4 +197,20 @@ def install_backend(module, environ=None):
     _STATE["installed"] = True
     print(f"[{GATE}] armed: extend tail metadata without host syncs (pinned H2D, host-known repeat_interleave "
           "output size); bit-identical", flush=True)
+    return True
+
+
+def install_engram(module, environ=None):
+    """sglang.srt.layers.engram: EngramHasher.forward's extend branch with a host-known output size. Must run
+    before engram_backend / engram_prefetch wrap the hasher (sitecustomize.py calls it first)."""
+    if not enabled(environ) or _STATE.get("engram"):
+        return bool(_STATE.get("engram"))
+    cls = module.EngramHasher
+    stock = cls.__dict__["forward"]
+    pin, edits = TARGETS["EngramHasher.forward"]
+    edited = build(stock, "EngramHasher.forward", pin, edits, module.__dict__)
+    cls.forward = _dispatch("EngramHasher.forward", stock, edited)
+    _STATE["static"] = enabled(environ)
+    _STATE["engram"] = True
+    print(f"[{GATE}] armed: engram hasher extend map with a host-known output size; bit-identical", flush=True)
     return True
