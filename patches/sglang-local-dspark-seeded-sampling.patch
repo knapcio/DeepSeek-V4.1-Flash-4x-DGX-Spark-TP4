@@ -1,0 +1,429 @@
+diff --git a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+index 976ccad..0c7f447 100644
+--- a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
++++ b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+@@ -40,6 +40,7 @@ class AcceptSampling:
+         gamma: int,
+         verify_num_draft_tokens: int,
+         cutoff_verify_lens: Optional[torch.Tensor] = None,
++        seq_lens: Optional[torch.Tensor] = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         return accept_sampling(
+             candidates=candidates,
+@@ -50,6 +51,7 @@ class AcceptSampling:
+             gamma=gamma,
+             verify_num_draft_tokens=verify_num_draft_tokens,
+             cutoff_verify_lens=cutoff_verify_lens,
++            seq_lens=seq_lens,
+         )
+ 
+     @classmethod
+@@ -64,6 +66,7 @@ class AcceptSampling:
+         gamma: int,
+         verify_num_draft_tokens: int,
+         cutoff_verify_lens: Optional[torch.Tensor] = None,
++        seq_lens: Optional[torch.Tensor] = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         return accept_sampling_triton(
+             candidates=candidates,
+@@ -74,6 +77,7 @@ class AcceptSampling:
+             gamma=gamma,
+             verify_num_draft_tokens=verify_num_draft_tokens,
+             cutoff_verify_lens=cutoff_verify_lens,
++            seq_lens=seq_lens,
+         )
+ 
+ 
+@@ -87,6 +91,7 @@ def _accept_sampling_core(
+     gamma: int,
+     verify_num_draft_tokens: int,
+     cutoff_verify_lens: Optional[torch.Tensor],
++    seq_lens: Optional[torch.Tensor] = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     bs = candidates.shape[0]
+     device = candidates.device
+@@ -117,8 +122,27 @@ def _accept_sampling_core(
+         draft_token_num=verify_num_draft_tokens,
+         device=device,
+     )
+-    uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
+-    uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
++    if sampling_info.sampling_seed is not None and seq_lens is not None:
++        from sglang.srt.speculative.eagle_utils import _seeded_verify_coins
++
++        assert seq_lens.shape[0] >= bs, f"{seq_lens.shape=} {bs=}"
++        # seed-source: SamplingBatchInfo.sampling_seed (per request, set when
++        # --enable-deterministic-inference is on) hashed with the request's
++        # prefix length seq_lens and the coin column, as EAGLE's
++        # eagle_utils._seeded_verify_coins does.
++        uniform_samples, uniform_samples_final = _seeded_verify_coins(
++            sampling_seed=sampling_info.sampling_seed[:bs],
++            seq_lens=seq_lens[:bs],
++            draft_token_num=gamma,
++            device=device,
++        )
++        assert uniform_samples.shape == (bs, gamma), f"{uniform_samples.shape=}"
++        assert uniform_samples_final.shape == (bs,), f"{uniform_samples_final.shape=}"
++    else:
++        # seed-source: none; the global torch generator of this device (an
++        # unseeded request, or a caller that passes no seq_lens).
++        uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
++        uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+     chain_speculative_sampling_triton(
+         predicts=predicts,
+         accept_index=accept_index,
+@@ -155,6 +179,7 @@ def accept_sampling(
+     gamma: int,
+     verify_num_draft_tokens: int,
+     cutoff_verify_lens: Optional[torch.Tensor] = None,
++    seq_lens: Optional[torch.Tensor] = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     bs = candidates.shape[0]
+     device = candidates.device
+@@ -167,6 +192,7 @@ def accept_sampling(
+         gamma=gamma,
+         verify_num_draft_tokens=verify_num_draft_tokens,
+         cutoff_verify_lens=cutoff_verify_lens,
++        seq_lens=seq_lens,
+     )
+     row_ids = torch.arange(bs, dtype=torch.long, device=device)
+     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
+@@ -223,6 +249,7 @@ def accept_sampling_triton(
+     gamma: int,
+     verify_num_draft_tokens: int,
+     cutoff_verify_lens: Optional[torch.Tensor] = None,
++    seq_lens: Optional[torch.Tensor] = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
+         candidates=candidates,
+@@ -233,6 +260,7 @@ def accept_sampling_triton(
+         gamma=gamma,
+         verify_num_draft_tokens=verify_num_draft_tokens,
+         cutoff_verify_lens=cutoff_verify_lens,
++        seq_lens=seq_lens,
+     )
+     bonus = gather_two_level_bonus_triton(
+         accept_index=accept_index, predicts=predicts, correct_len=correct_len
+diff --git a/python/sglang/kernels/ops/speculative/dspark/seeded_draws.py b/python/sglang/kernels/ops/speculative/dspark/seeded_draws.py
+new file mode 100644
+index 0000000..dc39c0b
+--- /dev/null
++++ b/python/sglang/kernels/ops/speculative/dspark/seeded_draws.py
+@@ -0,0 +1,72 @@
++"""Seeded random draws for DSpark speculative decoding.
++
++When the server runs with --enable-deterministic-inference, every request
++carries a sampling seed (SamplingBatchInfo.sampling_seed, default 42). The
++EAGLE verify path then derives its coins from murmur_hash32(seed, seq_len,
++column) (eagle_utils._seeded_verify_coins). This module gives the DSpark
++draft sampler the same kind of draw: exponential noise for the
++Gumbel-max / exponential-race sampler SampleStepTokens (key = prob / noise),
++derived from the request seed, the request prefix length and the draft step.
++
++The draft seed is XOR-salted so the draft noise never reuses the hash stream
++of the verify coins or of the main sampler for the same (seed, position).
++"""
++
++from __future__ import annotations
++
++import torch
++
++# XOR salt applied to the request seed for draft noise (an odd 64-bit
++# constant below 2**63, so the salted seed stays a valid int64).
++DRAFT_NOISE_SEED_SALT = 0x2545F4914F6CDD1D
++
++# The hashed position of draft step s in a round whose prefix length is L is
++# L * DRAFT_NOISE_STEPS_PER_POSITION + s, unique per (round, step) while the
++# draft block length gamma stays below this value.
++DRAFT_NOISE_STEPS_PER_POSITION = 64
++
++# Largest float32 below 1.0: a uniform of exactly 1.0 would give noise 0 and
++# an infinite SampleStepTokens key, so uniforms are clamped to this value.
++_MAX_UNIFORM = 1.0 - 2**-24
++
++
++def draft_noise_seeds(sampling_seed: torch.Tensor) -> torch.Tensor:
++    """Salted per-request seeds (int64, shape (bs,)) for the draft noise."""
++    assert sampling_seed.dim() == 1, f"{sampling_seed.shape=}"
++    return sampling_seed.to(torch.int64) ^ DRAFT_NOISE_SEED_SALT
++
++
++def draft_noise_positions(prefix_lens: torch.Tensor, step: int) -> torch.Tensor:
++    """Hashed positions (int64, shape (bs,)) for draft step `step` of a round
++    whose per-request prefix lengths are `prefix_lens`."""
++    assert prefix_lens.dim() == 1, f"{prefix_lens.shape=}"
++    assert 0 <= step < DRAFT_NOISE_STEPS_PER_POSITION, f"{step=}"
++    return prefix_lens.to(torch.int64) * DRAFT_NOISE_STEPS_PER_POSITION + step
++
++
++def fill_seeded_exp_noise(
++    *,
++    out: torch.Tensor,
++    seeds: torch.Tensor,
++    positions: torch.Tensor,
++    cols: torch.Tensor,
++) -> torch.Tensor:
++    """Fill `out` (float32, shape (bs, V)) with Exp(1) noise derived from
++    murmur_hash32(seeds, positions, cols), in place, and return it.
++
++    The uniform is hashed / uint32_max, as in eagle_utils._seeded_verify_coins,
++    clamped to the largest float32 below 1.0; the noise is -log(uniform),
++    which lies in (0, +inf]. A uniform of 0 gives noise +inf and key 0, which
++    only removes that one token from the race.
++    """
++    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
++
++    assert out.dim() == 2 and out.dtype == torch.float32, f"{out.shape=} {out.dtype=}"
++    bs, vocab = out.shape
++    assert seeds.shape == (bs,), f"{seeds.shape=} {bs=}"
++    assert positions.shape == (bs,), f"{positions.shape=} {bs=}"
++    assert cols.shape == (vocab,), f"{cols.shape=} {vocab=}"
++    hashed = murmur_hash32(seeds.to(torch.uint64), positions.to(torch.uint64), cols)
++    out.copy_(hashed.to(torch.float64) / torch.iinfo(torch.uint32).max)
++    out.clamp_(max=_MAX_UNIFORM).log_().neg_()
++    return out
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+index fedabfd..651f9f2 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+@@ -10,6 +10,11 @@ import torch
+ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+     SampleStepTokens,
+ )
++from sglang.kernels.ops.speculative.dspark.seeded_draws import (
++    draft_noise_positions,
++    draft_noise_seeds,
++    fill_seeded_exp_noise,
++)
+ from sglang.srt.environ import envs
+ from sglang.srt.lora.layers import unwrap_lora_layer
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+@@ -136,11 +141,21 @@ def sample_draft_block(
+     markov_head,
+     device: torch.device,
+     tp_sync: SpecTpSync,
++    prefix_lens: Optional[torch.Tensor] = None,
+ ) -> DraftBlockResult:
+     bs = base_logits.shape[0]
+     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
+     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
+     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
++    seeded = (
++        any_sampling
++        and sampling_info.sampling_seed is not None
++        and prefix_lens is not None
++    )
++    if seeded:
++        assert prefix_lens.shape[0] >= bs, f"{prefix_lens.shape=} {bs=}"
++        noise_seeds = draft_noise_seeds(sampling_info.sampling_seed.view(-1)[:bs])
++        noise_prefix_lens = prefix_lens[:bs]
+ 
+     if sampling_info is None:
+         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+@@ -161,7 +176,37 @@ def sample_draft_block(
+ 
+         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
++            if seeded:
++                # seed-source: SamplingBatchInfo.sampling_seed (per request, set
++                # when --enable-deterministic-inference is on), XOR-salted by
++                # seeded_draws.draft_noise_seeds and hashed with the request's
++                # prefix length, the draft step and the vocab column.
++                exp_noise = fill_seeded_exp_noise(
++                    out=torch.empty(
++                        step_logits.shape,
++                        dtype=torch.float32,
++                        device=step_logits.device,
++                    ),
++                    seeds=noise_seeds,
++                    positions=draft_noise_positions(noise_prefix_lens, step_idx),
++                    cols=torch.arange(
++                        step_logits.shape[-1],
++                        dtype=torch.int64,
++                        device=step_logits.device,
++                    ),
++                )
++                return tp_sync.sync(
++                    SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
++                    SampleStepTokens.execute(
++                        step_logits=step_logits,
++                        temperatures=temperatures,
++                        greedy_mask=greedy_mask,
++                        exp_noise=exp_noise,
++                    ),
++                )
+             if fast_sampling:
++                # seed-source: none; the global torch generator of this device
++                # (an unseeded request).
+                 exp_noise = torch.empty(
+                     step_logits.shape, dtype=torch.float32, device=step_logits.device
+                 ).exponential_(1)
+@@ -180,6 +225,8 @@ def sample_draft_block(
+                 )
+                 probs = expect(_DRAFT_PROBS, probs)
+                 argmax_tokens = torch.argmax(step_logits, dim=-1)
++                # seed-source: none; the global torch generator of this device
++                # (an unseeded request).
+                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                 return tp_sync.sync(
+                     SpecTpSyncSite.DSPARK_DRAFT_MULTINOMIAL,
+@@ -365,6 +412,7 @@ class DraftBlockProposer:
+                 markov_head=self.draft_model.markov_head,
+                 device=device,
+                 tp_sync=self._tp_sync,
++                prefix_lens=batch.seq_lens,
+             )
+         proposal_block_ids = (
+             draft_block_ids
+@@ -483,6 +531,11 @@ class DraftBlockProposer:
+             self._stage_sampling_params(
+                 draft_sampler, bs=bs, sampling_info=sampling_info
+             )
++            # Positions change every round, so the seeded-noise staging runs on
++            # every replay, outside the restage skip of _stage_sampling_params.
++            draft_sampler.stage_seeded_noise(
++                bs=bs, sampling_info=sampling_info, prefix_lens=prefix_lens
++            )
+         with torch.inference_mode():
+             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+         logits_output = draft_out.logits_output
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
+index 073feb5..45186ba 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
+@@ -11,7 +11,13 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+ from sglang.kernels.ops.speculative.dspark.draft_params import (
+     fill_draft_params,
+ )
++from sglang.kernels.ops.speculative.dspark.seeded_draws import (
++    DRAFT_NOISE_STEPS_PER_POSITION,
++    draft_noise_seeds,
++    fill_seeded_exp_noise,
++)
+ from sglang.srt.environ import DsparkFoldedSampling, envs
++from sglang.srt.runtime_context import get_exec
+ from sglang.srt.speculative.dspark_components.dspark_draft import (
+     select_draft_hidden_without_anchor,
+ )
+@@ -81,6 +87,13 @@ class DsparkDraftSampler:
+         self._step_temperatures = None
+         self.exp_noise = None
+         self.corrected_out = None
++        # Seeded draft noise (--enable-deterministic-inference): static
++        # per-request seeds, per-step hashed positions and vocab columns that
++        # stage_seeded_noise refreshes before every draft graph replay.
++        self._noise_seed = None
++        self._noise_pos = None
++        self._noise_cols = None
++        self._exp_noise_buf = None
+         if folded_sampling:
+             vocab = int(model.lm_head.org_vocab_size)
+             self.temperatures = torch.ones(
+@@ -98,6 +111,19 @@ class DsparkDraftSampler:
+                 dtype=_base_logits_dtype(model),
+                 device=device,
+             )
++            if get_exec().deterministic.enable_deterministic_inference:
++                assert self.gamma <= DRAFT_NOISE_STEPS_PER_POSITION, f"{self.gamma=}"
++                self._noise_seed = torch.zeros(
++                    (max_bs,), dtype=torch.int64, device=device
++                )
++                self._noise_pos = torch.zeros(
++                    (self.gamma, max_bs), dtype=torch.int64, device=device
++                )
++                self._noise_cols = torch.arange(
++                    vocab, dtype=torch.int64, device=device
++                )
++                # The plain noise tensor; an adapter may later wrap exp_noise.
++                self._exp_noise_buf = self.exp_noise
+ 
+     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+         """Host-side refresh of the static sampling params; must run before
+@@ -146,10 +172,22 @@ class DsparkDraftSampler:
+             if self.folded_sampling:
+ 
+                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+-                    del step_idx
+-                    # In-graph philox noise: each replay advances the generator
+-                    # and redraws.
+-                    noise = self.exp_noise[:bs].exponential_()
++                    if self._noise_seed is not None:
++                        # seed-source: SamplingBatchInfo.sampling_seed (per
++                        # request, set when --enable-deterministic-inference is
++                        # on), staged with the request's prefix length by
++                        # stage_seeded_noise and hashed with the draft step and
++                        # the vocab column.
++                        noise = fill_seeded_exp_noise(
++                            out=self._exp_noise_buf[:bs],
++                            seeds=self._noise_seed[:bs],
++                            positions=self._noise_pos[step_idx, :bs],
++                            cols=self._noise_cols,
++                        )
++                    else:
++                        # seed-source: none; in-graph philox noise of this
++                        # device: each replay advances the generator and redraws.
++                        noise = self.exp_noise[:bs].exponential_()
+                     return self._tp_sync.sync(
+                         SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
+                         SampleStepTokens.execute(
+@@ -190,6 +228,24 @@ class DsparkDraftSampler:
+             )
+             self.confidence_out[:bs].copy_(confidence)
+ 
++    def stage_seeded_noise(self, *, bs: int, sampling_info, prefix_lens) -> None:
++        """Host-side refresh of the seeded-noise inputs (salted per-request
++        seeds and per-step hashed positions); must run before every draft
++        graph replay, because the positions change every round. A no-op unless
++        the sampler was built with --enable-deterministic-inference."""
++        if self._noise_seed is None:
++            return
++        assert prefix_lens.shape[0] >= bs, f"{prefix_lens.shape=} {bs=}"
++        if sampling_info is None or sampling_info.sampling_seed is None:
++            self._noise_seed[:bs].zero_()
++        else:
++            self._noise_seed[:bs].copy_(
++                draft_noise_seeds(sampling_info.sampling_seed.view(-1)[:bs])
++            )
++        base = prefix_lens[:bs].to(torch.int64) * DRAFT_NOISE_STEPS_PER_POSITION
++        steps = torch.arange(self.gamma, dtype=torch.int64, device=base.device)
++        self._noise_pos[:, :bs].copy_(steps[:, None] + base[None, :])
++
+ 
+ def _resolve_folded_sampling(
+     *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+index faa898f..25d8563 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+@@ -163,6 +163,7 @@ class TargetVerifyExecutor:
+             gamma=self.gamma,
+             verify_num_draft_tokens=self.verify_num_draft_tokens,
+             cutoff_layout=layout,
++            seq_lens=prefix_lens,
+         )
+         if self._simulate_acc_len > 0:
+             correct_len = self._simulated_correct_len(
+@@ -818,6 +819,7 @@ def accept_draft_tokens(
+     gamma: int,
+     verify_num_draft_tokens: int,
+     cutoff_layout: Optional[RaggedVerifyLayout] = None,
++    seq_lens: Optional[torch.Tensor] = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     greedy_mask = draft_block.greedy_mask
+     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
+@@ -846,6 +848,7 @@ def accept_draft_tokens(
+             gamma=gamma,
+             verify_num_draft_tokens=verify_num_draft_tokens,
+             cutoff_verify_lens=cutoff_verify_lens,
++            seq_lens=seq_lens,
+         )
+     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
+         candidates=candidates,
+@@ -862,6 +865,7 @@ def accept_draft_tokens(
+         gamma=gamma,
+         verify_num_draft_tokens=verify_num_draft_tokens,
+         cutoff_verify_lens=cutoff_verify_lens,
++        seq_lens=seq_lens,
+     )
+     selected = SelectMixedAccept.execute(
+         greedy_mask=greedy_mask,

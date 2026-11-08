@@ -138,13 +138,17 @@ def install(accept_module):
     import sglang.srt.speculative.dflash_utils as du
 
     def execute(*, candidates, target_logits, draft_probs, sampling_info, draft_input, gamma,
-                verify_num_draft_tokens, cutoff_verify_lens=None):
+                verify_num_draft_tokens, cutoff_verify_lens=None, seq_lens=None):
+        # seq_lens: the request prefix lengths that the patch
+        # sglang-dspark-seeded-sampling.patch adds to AcceptSampling.execute. The stock fallback
+        # below uses them for seeded verify coins; the block verification path below still
+        # draws its eta coins from the unseeded torch generator.
         if cutoff_verify_lens is not None and os.environ.get("DSV41_VERIFY_CAP", "").strip() in ("", "0", "off"):
             return cls._dsv41_orig_execute(candidates=candidates, target_logits=target_logits,
                                            draft_probs=draft_probs, sampling_info=sampling_info,
                                            draft_input=draft_input, gamma=gamma,
                                            verify_num_draft_tokens=verify_num_draft_tokens,
-                                           cutoff_verify_lens=cutoff_verify_lens)
+                                           cutoff_verify_lens=cutoff_verify_lens, seq_lens=seq_lens)
         bs = candidates.shape[0]
         if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
             target_probs = softmax_temp.execute(logits=target_logits, temperatures=sampling_info.temperatures,
