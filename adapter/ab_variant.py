@@ -79,13 +79,19 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # adapter/indexer_chunked_v3.py: eager prefill indexer slot ids without host syncs
            "DSV41_INDEXER_NOSYNC",
            # adapter/block_verify.py: sampled block verification through the fold kernels (eager, per call)
-           "DSV41_BLOCK_VERIFY_FOLD")
+           "DSV41_BLOCK_VERIFY_FOLD",
+           # adapter/prefill_gemm_split.py: K >= 5120 prefill GEMMs as row blocks (eager prefill only, per call)
+           "DSV41_PREFILL_GEMM_ROW_SPLIT",
+           # adapter/prefill_keep_cache.py: allocator cache kept between the chunks of one prefill (per forward);
+           # the indexer width padding it enables is read per call in adapter/indexer_chunked_v3.py
+           "DSV41_PREFILL_KEEP_CACHE", "DSV41_PREFILL_KEEP_CACHE_PAD")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
                 "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0}
 HASHED_SOURCES = ("ab_variant", "l2_prefetch", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
-                  "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync")
+                  "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
+                  "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")

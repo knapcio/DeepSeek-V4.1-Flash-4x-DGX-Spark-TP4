@@ -26,6 +26,17 @@ def candidate_block_ids(logits,lens,topk_blocks,block_size):
     top=scores.topk(min(topk_blocks,scores.shape[-1]),dim=-1)
     return top.indices.masked_fill(~(top.values>-torch.inf),-1).to(torch.int32)
 
+def candidate_block_ids_padded(blocks_view,lens,topk_blocks,block_size):
+    """candidate_block_ids(logits[:, :width], ...) without the F.pad copy (DSV41_PREFILL_KEEP_CACHE_PAD): blocks_view is
+    [rows, ceil(width / block_size) * block_size] of a padded logits row whose columns >= width are already -inf,
+    exactly what F.pad(..., value=-inf) would append, so the block maxima and everything after are identical."""
+    if blocks_view.shape[-1]%block_size:
+        raise ValueError((tuple(blocks_view.shape),block_size))
+    scores=blocks_view.unflatten(-1,(-1,block_size)).amax(-1)
+    scores=scores.masked_fill(torch.arange(scores.shape[-1],device=blocks_view.device)==(lens-1)//block_size,torch.inf)
+    top=scores.topk(min(topk_blocks,scores.shape[-1]),dim=-1)
+    return top.indices.masked_fill(~(top.values>-torch.inf),-1).to(torch.int32)
+
 def candidate_mask(ids,width,block_size):
     blocks=(width+block_size-1)//block_size
     cols=ids.long().masked_fill(ids<0,blocks)

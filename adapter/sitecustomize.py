@@ -92,6 +92,13 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_forward_batch as install_swa_cone_forward_batch
                 install_swa_cone_forward_batch(module)
+            # Gated on DSV41_PREFILL_KEEP_CACHE=1 (or an armed in-boot A/B naming it): extend batches carry the
+            # requests' final prompt lengths for the keep-cache policy and the indexer padding
+            # (adapter/prefill_keep_cache.py). Gate checked inside before anything is wrapped.
+            from prefill_keep_cache import wanted_at_install as _keep_wanted
+            if _keep_wanted():
+                from prefill_keep_cache import install_forward_batch as install_keep_cache_forward_batch
+                install_keep_cache_forward_batch(module)
         elif module.__name__ == 'sglang.srt.mem_cache.deepseek_v4_memory_pool':
             # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records (v41c),
             # or the whole V4.1 layout pair on SM12x (v41, v2.7). v41c_pool.enabled() raises on any value but v4 /
@@ -342,6 +349,13 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DECODE_YIELD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from decode_yield import install as install_decode_yield
                 install_decode_yield(module)
+            # DSV41_PREFILL_KEEP_CACHE=1 (or named by an armed in-boot A/B): a cache held for a prompt that can no
+            # longer continue (abort, retraction, pause, idle) is emptied; AFTER decode_yield, which pins the source
+            # of get_next_batch_to_run (adapter/prefill_keep_cache.py).
+            from prefill_keep_cache import wanted_at_install as _keep_wanted_s
+            if _keep_wanted_s():
+                from prefill_keep_cache import install_scheduler as install_keep_cache_scheduler
+                install_keep_cache_scheduler(module)
             # TEST ONLY, gated on DSV41_EXTEND_SYNC_AUDIT=1: host syncs inside extend batches are logged per site
             # (adapter/extend_sync_audit.py). Logging only; outermost run_batch wrapper. Gate checked BEFORE the import.
             if os.environ.get('DSV41_EXTEND_SYNC_AUDIT', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
