@@ -13,6 +13,7 @@ separate region at the end of each page.
 
 import logging
 import math
+import os
 from functools import lru_cache
 from typing import FrozenSet, Optional, Tuple
 
@@ -349,6 +350,23 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
+    if k_cache.shape[-1] == _V41_MAIN_BYTES:
+        # v2.7 (FlashInfer 0.7.x): a KVLayout.V41 main cache (with a V41_FP4 or V41 extra cache) is read in place by
+        # FlashInfer's SM120 DSv4.1 kernels at the pool's own page sizes -- no 256 -> 64 page split, no transcode.
+        # A V4 (584-byte) cache never takes this branch. Port of sgl-project/sglang#45851 (05yuki, closed unmerged).
+        return _flash_mla_flashinfer_v41(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+
     if _sm120_default_backend == "flashinfer":
         if q.shape[0] > SM120_DECODE_MAX_TOKENS:
             return _flash_mla_sm120_prefill(
@@ -615,6 +633,88 @@ def _split_kv_pages_to_64(
         (num_dst_pages, _PBS_DST, 1, bpt),
         (_BYTES_PER_DST_PAGE_PADDED, bpt, bpt, 1),
     )
+
+
+_V41_MAIN_BYTES = 528  # KVLayout.V41: 512 fp8 (RoPE included) + 16 ue8m0 scales (one per 32 values)
+_V41_FP4_BYTES = 288  # KVLayout.V41_FP4: 256 e2m1 bytes + 32 e4m3 scales (one per 16)
+_V41_WRAPPERS = {}
+# SGLANG_SM120_V41_PRECISION: "bf16" (default, as #45851) = FlashInfer's full-BF16 route (bf16 Q and P, the cache
+# dequantized exactly on chip, fp32 softmax and merge, as DeepSeek's reference computes); "default" = FlashInfer's
+# MXFP8 route (Q and P rounded to FP8, the FP4 extra cache up-converted to FP8 tiles). v2.7 TODO: the A/B picks one.
+_V41_PRECISIONS = ("bf16", "default", "fp8")
+
+
+def _v41_precision() -> str:
+    value = os.environ.get("SGLANG_SM120_V41_PRECISION", "bf16").strip().lower()
+    if value not in _V41_PRECISIONS:
+        raise ValueError(f"SGLANG_SM120_V41_PRECISION={value!r}: expected one of {_V41_PRECISIONS}")
+    return value
+
+
+def _v41_wrapper(extra_fp4: bool, device):
+    """One FlashInfer SM120 sparse-MLA wrapper per (extra cache format, precision, device)."""
+    precision = _v41_precision()
+    key = (extra_fp4, precision, str(device))
+    wrapper = _V41_WRAPPERS.get(key)
+    if wrapper is None:
+        from flashinfer.mla import SparseMLASm120Wrapper
+
+        wrapper = SparseMLASm120Wrapper(
+            kv_scale_format="ue8m0_g32",
+            extra_kv_fp4=extra_fp4,
+            compute_precision=precision,
+            device=device,
+        )
+        _V41_WRAPPERS[key] = wrapper
+        logger.warning(
+            "DSV41 V4.1 KV reader: FlashInfer SparseMLASm120Wrapper(ue8m0_g32, extra_kv_fp4=%s, "
+            "compute_precision=%s) on %s", extra_fp4, precision, device,
+        )
+    return wrapper
+
+
+def _flash_mla_flashinfer_v41(
+    q,
+    k_cache,
+    indices,
+    topk_length,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+    extra_k_cache,
+    extra_indices,
+    extra_topk_length,
+):
+    """Sparse MLA over a KVLayout.V41 main cache, decode and prefill alike (FlashInfer >= 0.7.2)."""
+    q2 = q.squeeze(1) if q.ndim == 4 else q
+    num_tokens, num_heads, _ = q2.shape
+    kv_u8 = k_cache if k_cache.dtype == torch.uint8 else k_cache.view(torch.uint8)
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    extra_u8 = None
+    extra_idx = None
+    if extra_k_cache is not None:
+        extra_u8 = extra_k_cache if extra_k_cache.dtype == torch.uint8 else extra_k_cache.view(torch.uint8)
+        extra_idx = extra_indices.squeeze(1) if extra_indices.dim() == 3 else extra_indices
+        if extra_u8.shape[-1] not in (_V41_FP4_BYTES, _V41_MAIN_BYTES):
+            raise RuntimeError(f"V41 main cache with a {extra_u8.shape[-1]}-byte extra cache: only V41_FP4 (288) or "
+                               f"V41 (528) pair with it")
+    extra_fp4 = extra_u8 is not None and extra_u8.shape[-1] == _V41_FP4_BYTES
+    output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
+    # v2.7 TODO (graph capture): the wrapper's own scratch must be allocated before capture and stay stable; the
+    # first GPU smoke checks eager == graph replay at every captured batch size (decode 1..16, verify rows).
+    _v41_wrapper(extra_fp4, q2.device).run(
+        q2,
+        kv_u8,
+        idx,
+        output,
+        softmax_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_u8,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_topk_length,
+    )
+    return (output.unsqueeze(1), None)
 
 
 def _flash_mla_flashinfer(

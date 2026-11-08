@@ -30,6 +30,13 @@ _REJECTED = set()
 # process will compile. sha256 of flashinfer 0.6.18's file without / with the fence.
 _FI7676_ABSENT = 'eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960'
 _FI7676_PRESENT = 'd583991c917f8cbd609f412a82651445b3f9fa1e4cac9adf24e7176e3c741d05'
+# v2.7: flashinfer 0.7.2 (d84335d8) and 0.7.3 (775207de) ship the same file as main at the PR's base (blob 4451824a);
+# with the fence it is the PR head's blob e8b94b00 exactly. Every pristine -> patched pair the receipt knows:
+_FI7676_PAIRS = {
+    _FI7676_ABSENT: _FI7676_PRESENT,
+    '6739702e27afad21767b71024678b35c6892e3f9c74aaff375fb3f6734399f86':
+        '4924ff095448f59b204b9f5ba8627ec9769eddd23777b34a1212bfc754b0e8b6',
+}
 _FI7676_LINE = 'cute.arch.fence_proxy("async.shared", space="cta")'
 _FI7676_REL = os.path.join('gemm', 'kernels', 'dense_blockscaled_gemm_sm120_b12x.py')
 
@@ -45,9 +52,9 @@ def fi7676_receipt(path=None):
     except Exception as exc:  # a receipt never breaks loading
         return f'DSV41 b12x dense GEMM fence (FlashInfer #7676): unknown ({exc})'
     digest = hashlib.sha256(data).hexdigest()
-    if digest == _FI7676_PRESENT:
+    if digest in _FI7676_PAIRS.values():
         state = 'present'
-    elif digest == _FI7676_ABSENT:
+    elif digest in _FI7676_PAIRS:
         state = 'ABSENT'
     else:
         state = 'unpinned (fence line %s)' % ('found' if _FI7676_LINE.encode() in data.split(

@@ -488,11 +488,17 @@ V41C_SITE_BLOCKS = (
 # only, its own tests in tests/test_tokenizer_heap_trim2.py): stripped too, so the rest is still the base's text
 TRIM2_SITE_BLOCK = re.compile(r"# DSV41_TOKENIZER_HEAP=trim2 \(off by default\).*?"
                               r"print\(f'DSV41_TOKENIZER_HEAP=trim2: not installed \(\{exc!r\}\)', flush=True\)\n\n", re.S)
+# the SWA prompt-tail keep's block (perf/v266-jjang-20261107: off by default, its own tests in
+# tests/test_swa_prompt_tail.py): stripped too
+PROMPT_TAIL_SITE_BLOCK = re.compile(r"            # Gated on DSV41_SWA_PROMPT_TAIL_KEEP=<tokens>:.*?"
+                                    r"install_swa_prompt_tail\(module\)\n", re.S)
 
 
 class DefaultOff(unittest.TestCase):
     SITE = ADAPTER / "sitecustomize.py"
 
+    @unittest.skip("v2.7: sitecustomize routes DSV41_KV_LAYOUT through _kv_layout_adapter (v41 / v41c); "
+                   "tests/test_v41_pool.py DefaultOff pins the text")
     def test_text_minus_v41c_is_f744d83(self):
         s = self.SITE.read_text()
         for rx in V41C_SITE_BLOCKS:
@@ -500,6 +506,8 @@ class DefaultOff(unittest.TestCase):
             self.assertEqual(n, 1, rx.pattern[:60])
         s, n = TRIM2_SITE_BLOCK.subn("", s)
         self.assertEqual(n, 1, "trim2 block")
+        s, n = PROMPT_TAIL_SITE_BLOCK.subn("", s)
+        self.assertEqual(n, 1, "prompt-tail block")
         self.assertEqual(hashlib.sha256(s.encode()).hexdigest(), SITE_F744D83_SHA)
 
     def _finder_names(self, value):
@@ -538,8 +546,8 @@ class DefaultOff(unittest.TestCase):
     def test_hook_branches(self):
         s = self.SITE.read_text()
         tree = ast.parse(s)
-        self.assertIn("_v41c_install_pool(module)", s)
-        self.assertIn("_v41c_install_configurator(module)", s)
+        self.assertIn("_kv.install_pool(module)", s)          # v2.7: v41c_pool or v41_pool via _kv_layout_adapter
+        self.assertIn("_kv.install_configurator(module)", s)
         # every hooked name has its own branch before the final else (whose body assumes dsv4.metadata)
         for name in P.MODULES:
             self.assertIn(f"elif module.__name__ == '{name}':", s)
@@ -555,6 +563,7 @@ V41N_KEYS = ["DSV41_KV_LAYOUT=v41c", "DSV41_V41C_ARM=1", "DSV41_V41C_READER=nati
 
 
 @unittest.skipUnless((ROOT / ".env.tp4.example").exists(), "not a repo checkout (in an image)")
+@unittest.skip("v2.7: the v41n keys left the production line (DSV41_KV_LAYOUT=v41); tests/test_v41_pool.py Profile")
 class Profile(unittest.TestCase):
     """v2.6.5: the production line of .env.tp4.example ends with the three v41n keys (after v2.6.4's cone keys) and
     v2.6.5's tokenizer heap trim, no other profile line sets the layout or a reader, no diagnostic v41c / v41n knob is
@@ -572,8 +581,8 @@ class Profile(unittest.TestCase):
 
     def test_production_line_ends_with_v41n_once(self):
         items = self._production_line().split('"')[1].split()
-        self.assertEqual(items[-7:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"] + V41N_KEYS
-                         + ["DSV41_TOKENIZER_HEAP=trim2"])
+        self.assertEqual(items[-8:], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"] + V41N_KEYS
+                         + ["DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
         for k in V41N_KEYS:
             self.assertEqual(sum(x.split("=")[0] == k.split("=")[0] for x in items), 1, k)
 

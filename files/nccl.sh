@@ -132,6 +132,14 @@ nccl_validate_config() {
     echo 'NCCL_WORKER_DIR must be absolute' >&2
     return 1
   fi
+  # The overlay is a docker -v source:target pair on every rank, with or without the ring (start.sh always sets
+  # NCCL_PIP_SO; unset here only when this file is sourced on its own).
+  if [[ "${NCCL_OVERLAY_PIP:-0}" == 1 ]] &&
+     [[ ( -n "${NCCL_PIP_SO:-}" && ( "$NCCL_PIP_SO" != /* || "$NCCL_PIP_SO" == *:* ) ) ||
+        "${NCCL_HOST_DIR:-}" == *:* ]]; then
+    echo 'NCCL overlay requires an absolute container path and paths without colons' >&2
+    return 1
+  fi
   switchless_ring_enabled || return 0
   if [[ "$NNODES" != 4 || "$TP_SIZE" != 4 ||
         ! "$EP_SIZE" =~ ^[1-9][0-9]*$ || "$EP_SIZE" -gt "$TP_SIZE" ||

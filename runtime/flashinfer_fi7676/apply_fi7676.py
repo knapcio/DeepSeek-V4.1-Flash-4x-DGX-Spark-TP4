@@ -36,7 +36,8 @@ PINS = {
     # flashinfer 0.6.18 (git 69ff11fc; PyPI wheel sha256 d5d26edb...), the DS v2.6 / v2.6.2 / v2.6.3 image's copy
     "eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960":
         "d583991c917f8cbd609f412a82651445b3f9fa1e4cac9adf24e7176e3c741d05",
-    # flashinfer main as of 2026-11-02 (git blob 4451824a, the PR's base) -> the PR head's blob e8b94b00 exactly
+    # flashinfer main as of 2026-11-02 (git blob 4451824a, the PR's base) -> the PR head's blob e8b94b00 exactly;
+    # the same file ships in flashinfer 0.7.2 (d84335d8) and 0.7.3 (775207de), the v2.7 candidates (checked 2026-11-07)
     "6739702e27afad21767b71024678b35c6892e3f9c74aaff375fb3f6734399f86":
         "4924ff095448f59b204b9f5ba8627ec9769eddd23777b34a1212bfc754b0e8b6",
 }

@@ -1,5 +1,134 @@
 # Changelog
 
+## 2026-11-08 v2.7
+
+v2.6.5 plus FlashInfer 0.7.2 with DeepSeek-V4.1's own KV layouts on GB10, and the three changes of the v2.6.6
+candidate (the SWA prompt-tail keep, NCCL 2.30.7 with the NVIDIA/nccl #2393 fence, the `NCCL_OVERLAY_PIP` launcher
+fix). v2.6.6 was not released on its own; its changes ship here. In production on the four Sparks since 2026-11-08
+06:52.
+
+The production profile in `.env.tp4.example` replaces v2.6.5's v41n keys (`DSV41_KV_LAYOUT=v41c DSV41_V41C_ARM=1
+DSV41_V41C_READER=native`), `DSV41_SWA_NATIVE_DECODE=1` and `DSV41_PREFILL_NATIVE_EXTRA=1` with `DSV41_KV_LAYOUT=v41
+SGLANG_SM120_V41_PRECISION=bf16`, and adds `DSV41_SWA_PROMPT_TAIL_KEEP=1024`. The KV pool pin (8,541,952 tokens at
+`MEM_FRACTION_STATIC=HEAD_MEM_FRACTION_STATIC=0.85`) and `--swa-prefix-tails 384` are unchanged.
+
+- **FlashInfer 0.7.2 and the V4.1 KV layouts (`DSV41_KV_LAYOUT=v41 SGLANG_SM120_V41_PRECISION=bf16`).** The SWA cache
+  (and the draft's paged SWA) holds `KVLayout.V41` (528 B per token, all 512 values e4m3 in groups of 32 with ue8m0
+  scales, RoPE included, as DeepSeek's V4.1 reference stores the window K), the ratio-1/2 caches `V41_FP4` (288 B, as
+  v41n), read in place by FlashInfer 0.7.2's SM120 DSv4.1 sparse-MLA kernels on the full-BF16 route (bf16 Q and P,
+  exact on-chip dequantization). FlashInfer 0.7.2 is hash-pinned (`files/flashinfer-0.7.2.requirements`, git
+  `d84335d8`) and the #7676 fence now applies to its copy of the b12x dense GEMM. This is a numerics change against
+  v2.6.5 (the window keys' RoPE part is stored in FP8, as in the reference): T = 0 outputs differ from v2.6.5's on
+  some prompts, inside the KLD bound (release gate below). The three FlashInfer-0.6.18-only modules (v41c / v41n /
+  swan and the K8 / PCE extra-cache module) are no longer built; their knobs refuse at boot on FlashInfer >= 0.7. Pool
+  sizing prices the 528-byte rows (912.25 B per full token as v2.6.5; the SWA term x 528 / 584, ~0.4 GiB less per
+  rank). Cost: cold prefill from 64K to ~400K context is ~1.7 % slower (FlashInfer 0.7.2's BF16 sparse-MLA prefill
+  kernel; measured below); decode speed is unchanged. Credits: sglang#45851 (05yuki), FlashInfer #5197 / #6616
+  (lucifer1004), #7676 (Thireus), luz-deepseek-flash-all-in-one (luxingcom). Rollback: the v2.6.5 image and profile.
+- **Fixed in testing: a cold-boot fault (no in-process sparse-MLA calibration).** FlashInfer 0.7 calibrates its SM120
+  sparse-MLA kernels whenever an autotune pass meets a request with no profile on disk, also in SGLang's draft
+  autotune pass, after the target-verify CUDA graphs are captured. In testing, every cold boot on the four Sparks then
+  faulted at the first decode: a captured graph wrote to unmapped memory on every rank (Xid 31 / 13; the faulting
+  kernel a cuBLAS bf16 batched GEMM; debug runs `run-20261107-105507-2650424` and `run-20261107-134634-3060892`),
+  while every boot that found the calibration on disk served. `boot.py` now adds `sparse_mla_sm120` to
+  `--flashinfer-autotune-skip-ops` and points `FLASHINFER_AUTOTUNE_DIR` at the calibration shipped in the image
+  (`files/fi-autotune/sparse_mla_sm120_cpb.json`: FlashInfer 0.7.2's own calibration of the four V4.1 TP4 request
+  shapes on a GB10, read-only, the same plans on every rank). A missing calibration refuses the boot;
+  `DSV41_V41_CALIBRATION=inprocess` restores FlashInfer's behaviour for diagnostics. A deliberately cold boot of the
+  release (tuning caches off) before its gate: ready in 242 s, no Xid, core dump or fault line on any node, the frozen
+  calibration and the BF16 reader logged on every node.
+- **SWA prompt tail in the production profile: `DSV41_SWA_PROMPT_TAIL_KEEP=1024`** (`adapter/swa_prompt_tail.py`; the
+  hold `DSV41_SWA_PROMPT_TAIL_HOLD` stays at its default 8192). A prompt-end insert used to keep one page (256 tokens)
+  of live SWA below the prompt's last full page, so a revisit whose shared prefix ends earlier (a document or a chat
+  turn with a new question) found no live window to end its match on: it re-prefilled from 0 on its 2nd visit and hit
+  only from the 3rd. Now the prompt end keeps 1024 tokens of live SWA. Port of Eric Jinho Jang's (dealign.ai)
+  prompt-tail floor
+  ([jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark](https://github.com/jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark)
+  `c175335` / `a9f87fe`, AGPL-3.0-or-later), redesigned: their floor also stopped every decode-time SWA free once the
+  tree owned the prompt end (a request held N + its whole output in SWA); here decode frees stay stock then, and a
+  still request-owned prompt end is held for at most 8192 tokens; chunked inserts (and so the cone replay's first
+  insert) are stock. Screen on the four Sparks (`run-20261107-140633-3102469`, A / TK / A' on v2.6.5): token-exact
+  revisits with a new 192-token question cached 2048 of 2112 shared tokens (97.0 %, first token 0.24 s instead of 0.53
+  s) at 2k and 6144 of 6208 (98.97 %, 0.25 s instead of 1.16 s) at 6k where v2.6.5 cached 0; a 6k chat turn 2 97.3 %
+  cached; c1 x1.005 and c4 x1.011 of the slower control; qeval 71 / 71 / 71 with no task outside the controls'
+  bracket; head low-water 6.35 GiB. The release gate (below) repeated the revisits: 2k / 6k first token 0.24 / 0.25 s
+  against 0.53 / 1.14-1.16 s on the two v2.6.5 controls, which cached 0. Cost: each cached prompt end holds up to 1280
+  SWA slots instead of 256 (the 384 prefix tails' headroom is shared with them). Outputs and the pool are unchanged;
+  the key is volatile for `DSV41_AUTOTUNE_KEEP` (no re-tune). Rollback, config only: unset it.
+- **NCCL 2.30.7 with NVIDIA/nccl #2393 in the canary-roce image** (no version bump). An `nccl-builder` stage rebuilds
+  the base image's NCCL version (v2.30.7-1, `73cf112`) for sm_121 with Stanislav Bardyuk's backport of [NVIDIA/nccl
+  #2393](https://github.com/NVIDIA/nccl/pull/2393) (`patches/nccl-2393-aarch64-cts-fence.patch`, until now only in the
+  switchless-ring build): one acquire fence in `ncclIbIsend`, so a weakly ordered CPU cannot read a peer's CTS `nreqs`
+  before the index check that guards it. The image replaces the wheel's `libnccl.so.2` (the path torch resolves) and
+  checks the version, the fence and the library against the builder's receipt (`scripts/nccl_receipt.py`,
+  `/opt/dsv41/files/nccl-2393.json`). Stage the source with `scripts/fetch-nccl.sh`. A/B on the four Sparks
+  (`run-20261107-080134-2137538`, A / X / R / A', R = the same rebuild without the patch): all-reduce bus bandwidth
+  x0.9998 of stock at the worst size from 8 to 256 MiB, reduction results bit-equal at every size, cold 64K x1.021 and
+  1M x1.0017, no stable qeval item changed and the one item that had differed in the first run returned the production
+  output on 5 of 5 replays. A newer NCCL release was reported to transfer ~15 % slower on this hardware, so the
+  version stays 2.30.7 and only the fence is added.
+- **Launcher fix: `NCCL_OVERLAY_PIP=1` on a switched fabric.** The head honoured the overlay only with
+  `NCCL_SWITCHLESS_RING_ONLY=1` and otherwise put `NCCL_HOST_DIR` on `LD_LIBRARY_PATH`, which torch ignores (it
+  resolves `libnccl.so.2` through its RPATH), while every worker mounted the library over the pip NCCL: the head and
+  the workers ran different NCCL builds. The head now mounts NCCL exactly as the workers do, and `serve` checks the
+  NCCL switches with the ring off too. With the overlay off the launch arguments are unchanged.
+- **Dropped:** the working-set-preserving prefill trim (`DSV41_PREFILL_TRIM`, from the same jjang-ai commits) was
+  screened in the same window and not adopted: the head's lowest free memory fell to 9.02 GiB at 64K and 4.82 GiB at
+  388K against 11.63-12.01 and 10.30-10.70 GiB on the controls, for +3 % prefill measured at 64K only. The code is not
+  in this release.
+
+Release gate (run `run-20261108-010847-479202`, 2026-11-08, 334 min including the restore of production): v2.6.5 /
+v2.7 / v2.6.5, three fresh boots in that order on the same four Sparks, abliterated 1017 `517efab`, GPU clock capped
+at 2200 MHz. The controls are production v2.6.5 as it serves; the v2.7 boot ran the release's production profile on a
+gate image of `1303d2f` (built on the v2.6.5 image with FlashInfer 0.7.2, this release's files and the #2393 NCCL
+library added). KV pool 8,541,952 tokens on all three boots. Verdict: every speed, prefill, memory, qeval, idle and
+latency rule PASS, 0 safety, 0 invalid; the verdict text is **FAIL on one rule, reasoning length** (below), accepted
+on review as release-equivalent.
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.6.5 / v2.7 / v2.6.5): greedy c1 all-prompt geomean 89.56 /
+  89.92 / 89.45 tok/s (runs 88.91 / 90.20, 89.40 / 90.43, 88.97 / 89.93) and prose 65.89 / 65.97 / 65.96; c4 132.51 /
+  132.08 / 132.16 and c16 208.39 / 208.12 / 209.13 aggregate tok/s. Sampled (T 0.7, top-p 0.95, one run per cell): c1
+  86.77 / 87.18 / 87.29 and prose 63.99 / 63.36 / 62.58 tok/s, c4 128.69 / 128.74 / 130.46. Speedbench load c16 210.93
+  / 216.55 / 214.90 aggregate tok/s (median TTFT 545 / 542 / 537 ms). v2.7 against the two controls: greedy c1 x1.004
+  / x1.005, c4 x0.997 / x0.999, c16 x0.999 / x0.995, load c16 x1.027 / x1.008. Per category (greedy c1) the text
+  changes with the numerics, and so does the acceptance on it: code 108.8 against 112.6 / 112.7 tok/s, structured
+  110.2 against 107.3 / 107.4, agentic 106.7 against 103.1 / 104.2, multilingual 72.1 against 70.6 / 70.6.
+- **Draft acceptance** (accepted tokens per verify step, v2.7 against the lower control): qeval x1.006, speedbench c1
+  x1.046 (3.33 against 3.25 / 3.19), c4 x1.020, c16 x1.029.
+- **Prefill, cold** (median of three flushed prompts): 64K 6,145 / 6,026 / 6,165 tok/s (x0.981 / x0.977), 1M (968K
+  tokens) 5,180 / 5,151 / 5,312 tok/s (x0.994 / x0.970); a cold 388K-token prompt's first token 64.4 / 65.6 / 64.0 s.
+  The steady-state screen before the gate (`run-20261107-234605-295462`, v2.6.5 / v2.7 / v2.6.5, chunks measured
+  between bursts) puts the cost at x0.983 of the slower control at 64K and at 388K (control spread 0.2 % / 0.05 %),
+  every 40K-token stretch of the 388K prompt between x0.982 and x0.987; its profile puts it in the attention kernel
+  (FlashInfer 0.7.2's BF16 sparse-MLA prefill kernel; net +1.5-1.7 % busy time per chunk after v2.6.5's separate
+  reader copies are gone). In the kernel screens the V4.1 prefill attention is faster than v2.6.5's from ~380K context
+  on (x0.92 / x0.99 of its time per call on the ratio-1 / ratio-2 layers at 376K, x0.85 / x0.93 at 768K), so a cold 1M
+  prompt is close to parity. The gate's cold-prefill bound for this release was x0.97 (0.98 before), set after that
+  screen; decode and load stayed at x0.995.
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; at T = 0 the v2.7 text differs
+  from the controls' on 26 of the 74 prompts on which the controls agree (expected from the numerics change). KLD
+  against v2.6.5: short 0.0111, long 0.0064 (control vs control 0.0061 / 0.0026; limit 0.035). T = 1 distribution
+  check PASS (12,000 samples). Needles 256K (248,129 tokens, 41.4 s) and 1M (969,022 tokens, 187.9 s) found. Evicted
+  resume point (302,048-token prompt, 800 pressure prompts, then the document plus 2,048 tokens): every boot replayed
+  one 8,192-row chunk with 0 reverts, first token 2.19 / 2.22 / 2.21 s, and the v2.7 output (16 greedy tokens) equals
+  both controls'.
+- **Revisit with a new question** (the prompt tail): 2k revisit cached 0 / 2,048 / 0 tokens, first token 0.537 / 0.244
+  / 0.534 s; 6k 0 / 6,144 / 0, 1.135 / 0.247 / 1.157 s; a 6k chat turn 2 cached 97.5 / 97.3 / 97.7 % on all three.
+- **Memory and load.** The head's lowest MemAvailable over the boot 6.47 / 8.73 / 6.95 GiB; NVRM out-of-memory log
+  lines 12 / 0 / 13 (the controls' in the Engram warm-up, the cold prefills and the soak). Soak (issue #16
+  reproduction plus a c2 companion load): 321 / 317 / 320 requests with 0 failures, companion 48.69 / 48.55 / 48.70
+  tok/s. A short request beside a 131,072-token prefill answered in 0.457 / 0.469 / 0.431 s; median first token after
+  60 s idle 194.4 / 194.1 / 192.9 ms; idle RDMA proxy CPU summed over the four nodes 1.70 / 1.78 / 1.50 % of a core.
+  Every scheduler of the v2.7 boot loaded the #2393 NCCL 2.30.7 library, and every rank logged the #7676 fence as
+  present.
+- **The rule that failed: reasoning length.** The gate holds the mean and median completion tokens and the mean
+  reasoning characters of 16 thinking-on T = 0 reasoning prompts within +-3 % of the controls (a guard against less
+  thinking). v2.7 reasoned longer: mean 139.4 against 133.4 tokens (+4.5 %), median 124.5 against 103.5, reasoning
+  characters 514 against 454. The two controls are byte-identical, so the band had no control spread to measure noise
+  against; per prompt v2.7 was longer on 6, shorter on 9 and equal on 1, and one prompt (+337 tokens) carries the mean
+  (without it v2.7 is 12 % shorter). All 16 answers are correct and identical on the three boots, none truncated. The
+  review accepted the result as release-equivalent: the direction is more reasoning, not less, and every other rule
+  passed.
+
 ## 2026-11-07 v2.6.5
 
 v2.6.4 plus three changes. The production profile in `.env.tp4.example` adds `DSV41_KV_LAYOUT=v41c

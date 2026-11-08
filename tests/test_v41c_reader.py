@@ -255,6 +255,12 @@ class AdapterText(unittest.TestCase):
         s = SWAN_BLOCK_RE.sub("", s)
         self.assertEqual(len(BLOCK_RE.findall(s)), 2)
         base = PCE_BLOCK_RE.sub("", BLOCK_RE.sub("", s), count=1)
+        # v2.7: the native V4.1 reader route (sglang#45851 port, tests/test_v27_fi07_guard.py) and its `import os`
+        base = base.replace("import logging\nimport math\nimport os\n", "import logging\nimport math\n", 1)
+        base = re.sub(r"    if k_cache\.shape\[-1\] == _V41_MAIN_BYTES:.*?extra_topk_length,\n        \)\n\n", "", base,
+                      count=1, flags=re.S)
+        base = re.sub(r"_V41_MAIN_BYTES = 528 .*?return \(output\.unsqueeze\(1\), None\)\n\n\n", "", base, count=1,
+                      flags=re.S)
         self.assertEqual(hashlib.sha256(base.encode()).hexdigest(), CANARY_F744D83_SHA)
 
     def test_blocks_gate_on_288_byte_records(self):
@@ -262,6 +268,8 @@ class AdapterText(unittest.TestCase):
             self.assertIn(".shape[-1] == 288", b.splitlines()[2])
             self.assertIn("_v41c_is_fp4(", b)
 
+    @unittest.skip("v2.7 (FlashInfer 0.7.x): the v41c / v41n module is retired from both recipes; "
+                   "tests/test_v27_fi07_guard.py checks the retirement. TODO(v2.7): delete with the module.")
     def test_dockerfiles(self):
         for name in ("Dockerfile.canary", "Dockerfile.canary-roce"):
             t = (ROOT / name).read_text()

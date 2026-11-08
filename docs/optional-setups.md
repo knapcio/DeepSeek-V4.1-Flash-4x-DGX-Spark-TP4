@@ -60,8 +60,11 @@ in both canary image builds. This is also a correctness fix, not a TPS claim.
 
 `Dockerfile.canary-roce` adds the SG17 SGLang overlay from rhys101's eight-Spark work on top of the canary image: every tensor-parallel SUM all-reduce of at most 512 KiB (bf16/fp32) goes through b12x's one-shot RDMA all-reduce over both RoCE rails instead of NCCL, inside the CUDA graphs, with a transport health check at every result boundary (a stalled transfer fails the step instead of hanging the rank). The overlay was written for TP8; `runtime/roce_tp4_adapt.py` relaxes it to TP4/TP8 and to one or two rails. The RDMA proxy is plain C over libibverbs, compiled on first use inside the container (`B12X_ROCE_CACHE_DIR`).
 
+Since v2.7 the canary-roce image also replaces the wheel's NCCL 2.30.7 with the same version rebuilt for sm_121 with NVIDIA/nccl #2393's AArch64 CTS fence (an `nccl-builder` stage; stage its source with `scripts/fetch-nccl.sh`, ~2 min of nvcc). The build checks the version (23007), the fence (one `dmb ishld` in `ncclIbIsend`) and that the library torch loads is the builder's (`/opt/dsv41/files/nccl-2393.json`).
+
 ```bash
 scripts/fetch-sglang-canary.sh
+scripts/fetch-nccl.sh                                     # stages runtime/nccl-src (NVIDIA/nccl v2.30.7-1, tree pinned)
 docker build -f Dockerfile.canary-roce -t dsv41-4x-spark:canary-roce .    # on every node
 # .env.tp4:
 #   IMAGE=dsv41-4x-spark:canary-roce
