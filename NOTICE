@@ -24,7 +24,7 @@ Third-party components and their licences:
   image installs it through runtime/patch_v41_tool_constraint.py.
 - patches/nccl-2393-aarch64-cts-fence.patch is Stanislav Bardyuk's change from
   NVIDIA/nccl PR #2393 (commit b85c5d9c4aa5), backported to NCCL v2.30.7-1;
-  Apache License 2.0 (LICENSE.sglang contains the same Apache-2.0 text). Since v2.6.6 the
+  Apache License 2.0 (LICENSE.sglang contains the same Apache-2.0 text). Since v2.7 the
   canary-roce image builds NCCL v2.30.7-1 (NVIDIA, Apache License 2.0 with parts under their
   original BSD licence, see its LICENSE.txt; source fetched by scripts/fetch-nccl.sh, not
   redistributed here) with this patch and installs it in place of the wheel's library; the build
@@ -47,14 +47,14 @@ Third-party components and their licences:
   shared-memory reuse race on ctrl[7]); b12x development continues in
   flashinfer-ai/flashinfer (flashinfer/experimental/b12x, Apache License 2.0).
   The changes are distributed under the same licence.
-  Local changes for the mixed KV layout (DSV41_KV_LAYOUT=v41c, production profile since v2.6.5) are listed in
+  Local changes for the mixed KV layout (DSV41_KV_LAYOUT=v41c, v2.6.5's production profile) are listed in
   runtime/b12x_next/v41c-provenance.json.
 - runtime/flashinfer_v41c contains NVIDIA FlashInfer sparse_mla_sm120 sources (flashinfer 0.6.18,
   BSD-3-Clause, headers retained) with local changes listed in runtime/flashinfer_v41c/PROVENANCE.json:
-  the V4.1 FP4 record readers (DSV41_KV_LAYOUT=v41c, production profile since v2.6.5) and, for DSV41_SWA_NATIVE_DECODE (production
-  profile since v2.6.4), csrc/swan_decode_dsv4.cu: FlashInfer's decode-dsv4 launcher and its stock kernel
+  the V4.1 FP4 record readers (DSV41_KV_LAYOUT=v41c, v2.6.5's production profile) and, for DSV41_SWA_NATIVE_DECODE (production
+  profile in v2.6.4 and v2.6.5), csrc/swan_decode_dsv4.cu: FlashInfer's decode-dsv4 launcher and its stock kernel
   body instantiated for 256-token pages.
-- adapter/v41c_pool.py (DSV41_KV_LAYOUT=v41c, production profile since v2.6.5) allocates SGLang's DeepSeek-V4 ratio-1/2 KV
+- adapter/v41c_pool.py (DSV41_KV_LAYOUT=v41c, v2.6.5's production profile) allocates SGLang's DeepSeek-V4 ratio-1/2 KV
   pools in SGLang's own V4.1 FP4 record layout (KVLayout.V41_FP4 and its writers, SGLang dsv4.1
   branch; Apache License 2.0, LICENSE.sglang) next to the V4 SWA cache and re-prices their pool
   sizing; it wraps SGLang functions at import and copies no SGLang source.
@@ -74,7 +74,7 @@ Third-party components and their licences:
   FlashInfer sources at build time
   (dual-cache prefill dispatch opened to 128/256-token extra pages, symbols renamed); origin and
   changes: runtime/flashinfer_pce/PROVENANCE.json.
-- runtime/flashinfer_v41c (DSV41_V41C_READER=native, "v41n", production profile since v2.6.5): the in-kernel V4.1 FP4
+- runtime/flashinfer_v41c (DSV41_V41C_READER=native, "v41n", v2.6.5's production profile; not built since v2.7): the in-kernel V4.1 FP4
   record readers extend FlashInfer's sparse_mla_sm120 decode and dual-cache prefill kernels
   (NVIDIA, BSD-3-Clause, headers retained). v41n_prefill_kernel.cuh is generated from the vendored
   prefill_kernel.cuh by gen_v41n_prefill.py; v41n_convert.cuh is new. Design idea credit:
@@ -93,7 +93,7 @@ Third-party components and their licences:
   PR 55 by Alexander Busse (GanyX19), upstream commit bdf657c (issue 54), contributed there under
   the AGPL-3.0 and ported here unchanged under the same licence. The stall it fixes on this
   repository was reported by slidonnici (issue 66).
-- adapter/swa_prompt_tail.py (DSV41_SWA_PROMPT_TAIL_KEEP, in the production profile since v2.6.6) is
+- adapter/swa_prompt_tail.py (DSV41_SWA_PROMPT_TAIL_KEEP, in the production profile since v2.7) is
   ported from Eric Jinho Jang (dealign.ai), jjang-ai/dealignai-deepseek-v4.1-flash-1017-4x-dgx-spark,
   commits c175335 / a9f87fe (adapter/swa_evict_internal_first.py `install_prompt_tail_floor`: the SWA
   prompt-tail floor), AGPL-3.0-or-later, itself a modification of this repository's AGPL files; the port's
@@ -104,7 +104,9 @@ Third-party components and their licences:
   records are FlashInfer's (flashinfer-ai/flashinfer PRs 5197 and 6616 by lucifer1004; Apache License 2.0). The
   pool-pricing gap (A7) and the selector / reader patches (A1 / A2) were identified from luxingcom's
   luz-deepseek-flash-all-in-one notes; no luz code is included. The FlashInfer PR 7676 fence (Thireus) now applies
-  to FlashInfer 0.7.2's copy of the b12x dense GEMM (the PR's base blob).
+  to FlashInfer 0.7.2's copy of the b12x dense GEMM (the PR's base blob). files/fi-autotune/sparse_mla_sm120_cpb.json
+  is FlashInfer 0.7.2's own autotune output for its SM120 sparse-MLA kernels on a GB10 (the four V4.1 TP4 request
+  shapes), shipped as data so the image never calibrates in-process.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.
