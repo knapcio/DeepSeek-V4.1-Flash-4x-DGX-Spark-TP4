@@ -84,6 +84,24 @@ FP8 = os.environ.get("DSV41_PREFILL_SP_FP8", "0").strip().lower() in ("1", "on",
 # gathered bf16 rows, and the MoE output bit for bit (needs DSV41_MOE_B12X_NEXT_DETERMINISTIC=1);
 # the ranks agree (MIN) and any difference keeps the bf16 gather for that size.
 FP8_MOE = os.environ.get("DSV41_PREFILL_SP_FP8_MOE", "0").strip().lower() in ("1", "on", "true")
+# In-boot A/B (adapter/ab_variant.py, TEST ONLY): DSV41_PREFILL_SP_FP8_MOE is a union gate there, so FP8_MOE above
+# (install: engine pins, modules, b12x_next's pre-quantized warm-up) is on when any variant enables it, and
+# fp8_moe_on() reads the replayed variant's value per MoE call. Without the harness fp8_moe_on() == FP8_MOE.
+try:
+    import ab_variant as _ab
+except ImportError:  # CPU tests without the adapter dir
+    _ab = None
+
+
+def fp8_moe_on():
+    """Per call (eager prefill): stage 2b for this MoE call."""
+    if not FP8_MOE:
+        return False
+    if _ab is not None and getattr(_ab, "ACTIVE", False) and "DSV41_PREFILL_SP_FP8_MOE" in getattr(_ab, "KNOWN", ()):
+        return str(_ab.env("DSV41_PREFILL_SP_FP8_MOE", "0") or "0").strip().lower() in ("1", "on", "true")
+    return True
+
+
 # Debug (never in production): DSV41_PREFILL_SP_DEBUG=compare,fp (either or both).
 #   fp       per traced prefill chunk, rank 0 logs the chunk layout and a checksum of every
 #            layer's input / attention in+out / MoE in+out / output residual and pre, over the full
@@ -1357,7 +1375,7 @@ def _make_moe_forward(orig):
             _rec("mout", o, True)
             return o
         v4 = _M["v4"]
-        if p.sharded and FP8_MOE:
+        if p.sharded and fp8_moe_on():
             o8 = _moe8_forward(self, p, hidden_states, orig, args, kwargs)
             if o8 is not None:
                 if o8.shape[0] != p.rows:
