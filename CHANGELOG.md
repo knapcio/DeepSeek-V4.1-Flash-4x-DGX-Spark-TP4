@@ -1,12 +1,13 @@
 # Changelog
 
-## v2.7.1 (candidate; release gate pending)
+## 2026-11-09 v2.7.1
 
 v2.7 plus five lossless changes in the production profile (eight keys of `EXTRA_CONTAINER_ENV`), a wider prefill
 bypass, and two default-off levers. The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin (8,541,952 tokens at
 fraction 0.85), the launch line and `--swa-prefix-tails 384` are v2.7's. Every change was measured on the four Sparks
 against production v2.7 in the same boot (in-boot A/B with two control arms, randomized round order, the official 1017
-checkpoint, 2026-11-08/09); the release gate is still to run.
+checkpoint, 2026-11-08/09), then together in the release gate below (official 1017 checkpoint). In production on
+the four Sparks since 2026-11-09 14:48 (abliterated checkpoint).
 
 - **Prefill: row split of the K = 5120 dense GEMMs (`DSV41_PREFILL_GEMM_ROW_SPLIT=4096
   DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152`, `adapter/prefill_gemm_split.py`, hooked from `adapter/mxfp8_b12x.py`).**
@@ -72,6 +73,42 @@ checkpoint, 2026-11-08/09); the release gate is still to run.
   `DSV41_PREFILL_BYPASS=256`: the v2.7 profile on the same image (the new adapters do nothing unset).
 - Ideas and implementation ours. The cold `wo_b` was found by comparing our per-kernel times with those of
   Christopher Owen's spark-ds41f on the same fleet (its dense MXFP8 GEMMs run with L2-warm weights).
+
+Release gate (run `run-20261109-085149-628062`, 2026-11-09, 341 min including the restore of production): v2.7 /
+v2.7.1 / v2.7, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU
+clock capped at 2200 MHz. The controls are production v2.7's image and profile; every boot ran
+`DSV41_PREFILL_BYPASS=8192`, so the bypass is not part of the comparison. The v2.7.1 boot ran a gate image of `9cee7cf`
+(production v2.7's image with this release's changed files added). KV pool 8,541,952 tokens on all three boots.
+Verdict: every speed, prefill, memory, qeval, idle and latency rule PASS, 0 safety, 0 invalid; the verdict text is
+**FAIL on one rule, draft acceptance at c4** (below), accepted on review as release-equivalent.
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.7 / v2.7.1 / v2.7): greedy c1 all-prompt geomean 89.03 /
+  89.79 / 88.83 tok/s (runs 88.35 / 89.70, 89.52 / 90.07, 88.64 / 89.02) and prose 65.83 / 66.68 / 65.91; c4 131.31 /
+  135.20 / 132.19, c8 166.19 / 171.81 / 166.84 and c16 209.61 / 216.17 / 207.59 aggregate tok/s. Sampled (T 0.7,
+  top-p 0.95, one run per cell): c1 84.35 / 87.10 / 85.30 and prose 62.56 / 64.77 / 62.73 tok/s, c4 128.70 / 133.61 /
+  129.82. Speedbench load c16 216.04 / 229.51 / 215.97 aggregate tok/s (median TTFT 539 / 466 / 533 ms, p99
+  inter-token gap 355 / 283 / 354 ms). v2.7.1 against the mean of the controls: greedy c1 x1.010, c4 x1.026, c8 x1.032,
+  c16 x1.036; sampled c1 x1.027, c4 x1.034; load c16 x1.063. Median first token at c1 166 ms against 207 ms, c4 253
+  against 316-321 ms, c16 512 against 564-567 ms.
+- **Prefill, cold** (median of three flushed prompts): 64K 6,028 / 6,308 / 6,045 tok/s (x1.045 of the controls'
+  mean), 131K 6,096 / 6,400 / 6,134 (x1.047), 1M (968K tokens) 5,022 / 5,253 / 5,067 (x1.041).
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; all 75 T = 0 prompts inside the
+  controls' bracket (75 stable). KLD against the controls: short 0.0069, long 0.0061 (limit 0.035). T = 1 distribution
+  check PASS (p 0.994, 12,000 samples). The 16 thinking-on reasoning prompts gave the same lengths on all three boots
+  (mean 122.7 tokens). Needles 256K (248,158 tokens, 39.3 s) and 1M (968,449 tokens, 185.9 s) found.
+- **Draft acceptance.** qeval at T = 0: 3.979 accepted tokens per verify step on all three boots. The speedbench rule
+  (the median over the 73 prompts of tokens per stream step, median of two runs, must stay above x0.98 of the lower
+  control) failed at c4: 3.091 against 3.168 / 3.250. With 255 decoded tokens per prompt that median moves in steps of
+  255/n, about 1.2 % per stream step, and the same rule fails a control at c16 (x0.976 with a control in the
+  release's seat). Pooled over all prompts and both runs (all tokens over all steps) the acceptance is equal: c4 2.899
+  against 2.898 / 2.931, c1 x1.001, c8 x0.999, c16 x1.003 of the lower control; on the 45 prompts whose output was
+  byte-identical in all six runs, tokens per step are identical (3.033). At c4 the greedy text of the remaining prompts
+  depends on which requests share a batch, which the faster admission shifts (first token 253 against 316 ms). The
+  rule is to be replaced by the pooled ratio in the next gate.
+- **Memory and the rest.** Head memory low-water 8.32 GiB (controls 8.34 / 8.36); the issue-16 soak 315 / 315 requests
+  ok and its companion load 225 requests, 0 failed; idle first token 189.6 ms (187.0 / 187.2); every node logged the
+  eight new keys armed and the row split's first-call check passed for both widths on every rank; no Xid on any boot.
+  A deliberately cold boot of v2.7.1 (tuning caches off) before the arms: ready in 171 s, 391, no Xid, core dump or
+  fault line on any node.
 
 ## 2026-11-08 v2.7
 
