@@ -764,12 +764,12 @@ class Profile(unittest.TestCase):
         i = items.index("DSV41_SWA_THIN=1")
         self.assertEqual(items[i:i + 3], ["DSV41_SWA_THIN=1", "DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
         # v2.7: only the native V4.1 layout keys, the tokenizer heap trim and (v2.6.6) the SWA prompt tail follow the
-        # cone; v2.7.1's seven new keys come after them
+        # cone; v2.7.1's seven new keys come after them, then v2.7.2's CED skip
         self.assertEqual(items[i + 3:i + 7], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
                                               "DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
         self.assertEqual(items[i + 7:], ["DSV41_PREFILL_GEMM_ROW_SPLIT=4096", "DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152", "DSV41_L2_PREFETCH_WOA_MB=0",
                                          "DSV41_L2_PREFETCH_WOB_MB=6", "DSV41_EXTEND_NOSYNC=1", "DSV41_SAMPLED_COMMIT_REUSE=1",
-                                         "DSV41_SAMPLED_DRAFT_PROBS_EARLY=1"])
+                                         "DSV41_SAMPLED_DRAFT_PROBS_EARLY=1", "DSV41_PREFILL_CED_SKIP=1"])
 
     def test_code_default_is_the_production_chunk(self):
         self.assertEqual(C.DEFAULT_TOKENS, 8192)
