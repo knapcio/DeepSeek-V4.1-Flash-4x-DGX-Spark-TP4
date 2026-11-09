@@ -159,7 +159,10 @@ jobs:
             tests/test_extend_nosync.py \
             tests/test_extend_sync_audit_stream.py \
             tests/test_sampled_commit_reuse.py \
-            tests/test_sampled_draft_probs_early.py
+            tests/test_sampled_draft_probs_early.py \
+            adapter/prefill_ced_skip.py \
+            tests/test_prefill_ced_skip.py \
+            tests/test_prefill_ced_skip_engine.py
           bash -n start.sh stop.sh scripts/fetch-sglang-canary.sh scripts/fetch-nccl.sh
       - name: Vendored detector identity
         run: |

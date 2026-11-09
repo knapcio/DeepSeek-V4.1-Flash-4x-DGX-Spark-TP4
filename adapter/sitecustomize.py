@@ -108,6 +108,10 @@ class EngramLoader(importlib.abc.Loader):
             if _keep_wanted() or _ced_wanted_fb():
                 from prefill_keep_cache import install_forward_batch as install_keep_cache_forward_batch
                 install_keep_cache_forward_batch(module)
+            # DSV41_PREFILL_CED_SKIP: final prompt lengths by rid (the eager runner's batch copy drops extra attributes)
+            if _ced_wanted_fb():
+                from prefill_ced_skip import install_forward_batch as install_ced_forward_batch
+                install_ced_forward_batch(module)
         elif module.__name__ == 'sglang.srt.mem_cache.deepseek_v4_memory_pool':
             # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records (v41c),
             # or the whole V4.1 layout pair on SM12x (v41, v2.7). v41c_pool.enabled() raises on any value but v4 /

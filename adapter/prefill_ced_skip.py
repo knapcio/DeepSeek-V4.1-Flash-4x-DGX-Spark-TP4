@@ -40,8 +40,13 @@ Why the outputs the prompt uses are unchanged.
   under the in-boot A/B the gate is the replayed variant's (switched on the same iteration on every rank).
 * Not touched: context parallelism (refused: stock), the draft model's own backend, speculative extends.
 
-Plumbing: ForwardBatch.dsv41_final_lens (adapter/prefill_keep_cache.py install_forward_batch, installed when this gate
-or the keep-cache gate is wanted). Missing -> stock tail.
+Plumbing: the requests' final prompt lengths, recorded by rid when ForwardBatch.init_new builds a target extend
+(install_forward_batch below) and looked up through ForwardBatch.rids when the tail metadata is built. Why not an
+attribute on the batch: the eager runner's load_batch hands the model a dataclasses.replace() copy of that batch
+(cuda_graph_buffer_registry.extract_buffer), which keeps dataclass fields such as rids and drops extra attributes
+such as dsv41_final_lens. Window C (2026-11-09 run-20261109-163256-1665083) armed this gate and it never skipped:
+the attribute was gone on the batch the backend saw. ForwardBatch.dsv41_final_lens is still read first when present.
+A rid whose final length is unknown -> that request keeps the stock tail; the first such extend logs a WARNING.
 
 Install: sitecustomize.py, the deepseek_v4_backend branch, AFTER extend_nosync (this wraps whatever is bound:
 the stock method or extend_nosync's dispatcher, and the module-level late_layer_tail_layout name both resolve).
@@ -50,6 +55,7 @@ Receipts: "[prefill_ced_skip] armed: ..." once; "[prefill_ced_skip] forward <k>:
 saved <r>; totals skipped <S> rows_saved <R>)" for the first 4 skipping forwards, then every 64th, per rank;
 "[prefill_ced_skip] NOT armed: <reason>" when the engine does not match (the stock path runs).
 """
+import collections
 import inspect
 import logging
 import os
@@ -66,7 +72,9 @@ except ImportError:  # CPU tests without the adapter dir
     _ab = None
 
 _STATE = {"installed": False, "static": False, "forwards": 0, "skipped": 0, "rows_saved": 0, "unused": 0,
-          "why_not": None}
+          "why_not": None, "no_finals": 0, "recorded": 0, "fb_installed": False}
+_FINALS = collections.OrderedDict()     # rid -> final prompt length (target extends; bounded)
+_FINALS_MAX = 4096
 _CTX = {"skip": None, "used": False}
 
 
@@ -147,6 +155,78 @@ def ced_layout(extend_lens_cpu, seq_lens_cpu, tail_len, device, skip):
     return _h2d(idx, torch.int64, device), tails, _h2d(floors, torch.int32, device)
 
 
+# ------------------------------------------------------------------ final prompt lengths by rid
+def record_finals(rids, finals):
+    """Remember each request's final prompt length (constant per request: max(extend end, len(origin_input_ids)))."""
+    if not rids or finals is None or len(rids) != len(finals):
+        return
+    for rid, f in zip(rids, finals):
+        if rid is None or f is None:
+            continue
+        _FINALS[rid] = int(f)
+        _FINALS.move_to_end(rid)
+        _STATE["recorded"] += 1
+    while len(_FINALS) > _FINALS_MAX:
+        _FINALS.popitem(last=False)
+
+
+def finals_for(forward_batch):
+    """Per request of this forward batch: the final prompt length, or None when any one is unknown."""
+    f = getattr(forward_batch, "dsv41_final_lens", None)
+    if f is not None:
+        return f
+    rids = getattr(forward_batch, "rids", None)
+    if not rids:
+        return None
+    out = [_FINALS.get(r) for r in rids]
+    return None if any(x is None for x in out) else out
+
+
+def _reqs_finals(reqs):
+    out, rids = [], []
+    for r in reqs:
+        rng = getattr(r, "extend_range", None)
+        origin = getattr(r, "origin_input_ids", None)
+        rid = getattr(r, "rid", None)
+        if rng is None or origin is None or rid is None:
+            return None, None
+        out.append(max(int(rng.end), len(origin)))
+        rids.append(rid)
+    return rids, out
+
+
+def install_forward_batch(module, environ=None):
+    """sglang.srt.model_executor.forward_batch_info: ForwardBatch.init_new records the final prompt lengths of a target
+    extend's requests by rid (not on the draft worker, not on speculative extends)."""
+    if _STATE["fb_installed"]:
+        return True
+    if not wanted_at_install(environ):
+        return False
+    cls = getattr(module, "ForwardBatch", None)
+    if cls is None or not hasattr(cls, "init_new"):
+        print(f"{_TAG} NOT armed: ForwardBatch.init_new not found (no final prompt lengths)", flush=True)
+        return False
+    orig = cls.init_new.__func__
+
+    def init_new(klass, batch, model_runner, *args, **kwargs):
+        fb = orig(klass, batch, model_runner, *args, **kwargs)
+        try:
+            mode = getattr(fb, "forward_mode", None)
+            if (mode is not None and mode.is_extend_without_speculative()
+                    and not getattr(model_runner, "is_draft_worker", False)):
+                rids, finals = _reqs_finals(getattr(batch, "reqs", None) or [])
+                record_finals(rids, finals)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping never breaks a batch
+            logger.warning("%s final lengths: %r", _TAG, exc)
+        return fb
+
+    init_new._dsv41_ced = True
+    cls.init_new = classmethod(init_new)
+    _STATE["fb_installed"] = True
+    print(f"{_TAG} ForwardBatch.init_new records the target extends' final prompt lengths by rid", flush=True)
+    return True
+
+
 # ------------------------------------------------------------------ engine hook
 def _note(skip, extend_lens, window):
     n = sum(1 for k in skip if k)
@@ -205,8 +285,13 @@ def install_backend(module, environ=None):
             if not cp:
                 seq = getattr(forward_batch, "seq_lens_cpu", None)
                 seq = seq.tolist() if hasattr(seq, "tolist") else seq
-                skip = plan(getattr(forward_batch, "extend_seq_lens_cpu", None), seq,
-                            getattr(forward_batch, "dsv41_final_lens", None), window)
+                finals = finals_for(forward_batch)
+                if finals is None:
+                    _STATE["no_finals"] += 1
+                    if _STATE["no_finals"] == 1:
+                        print(f"{_TAG} WARNING: an extend without known final prompt lengths (rids "
+                              f"{str(getattr(forward_batch, 'rids', None))[:80]}): stock tail", flush=True)
+                skip = plan(getattr(forward_batch, "extend_seq_lens_cpu", None), seq, finals, window)
         if skip is None:
             return build(self, forward_batch)
         _CTX["skip"], _CTX["used"] = skip, False
