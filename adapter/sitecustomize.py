@@ -231,6 +231,10 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
                 from sampled_commit_reuse import install_verify as install_sampled_commit_reuse_verify
                 install_sampled_commit_reuse_verify(module)
+            # Gated on DSV41_SAMPLED_DRAFT_PROBS_EARLY: accept_draft_tokens' draft probabilities from the side stream.
+            if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_draft_probs_early import install_verify as install_sampled_draft_probs_early_verify
+                install_sampled_draft_probs_early_verify(module)
         elif module.__name__ == 'sglang.kernels.ops.moe.moe_fused_gate':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_gate as install_verify_cap_gate
@@ -242,6 +246,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_EAGER_GLUE', '').strip() not in ('', '0', 'off', 'false'):
                 from eager_glue import install_draft as install_eager_glue_draft
                 install_eager_glue_draft(module)
+            # Gated on DSV41_SAMPLED_DRAFT_PROBS_EARLY: sampled draft probabilities launched on a side stream
+            # right after the proposal, overlapping the verify graph (adapter/sampled_draft_probs_early.py).
+            if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_draft_probs_early import install_draft as install_sampled_draft_probs_early_draft
+                install_sampled_draft_probs_early_draft(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_planner':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_planner as install_verify_cap_planner
@@ -339,6 +348,10 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
                 from sampled_commit_reuse import install_scheduler as install_sampled_commit_reuse_scheduler
                 install_sampled_commit_reuse_scheduler(module)
+            # Gated on DSV41_SAMPLED_DRAFT_PROBS_EARLY: terminal receipts at each busy -> idle transition.
+            if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_draft_probs_early import install_scheduler as install_sampled_draft_probs_early_scheduler
+                install_sampled_draft_probs_early_scheduler(module)
             # Gated on DSV41_DECODE_YIELD=<pct>: running streams keep a decode share while a long
             # prompt prefills (adapter/decode_yield.py). Gate checked BEFORE the import.
             if os.environ.get('DSV41_DECODE_YIELD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
