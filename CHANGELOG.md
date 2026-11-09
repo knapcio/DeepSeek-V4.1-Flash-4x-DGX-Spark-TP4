@@ -2,10 +2,11 @@
 
 ## v2.7.1 (candidate; release gate pending)
 
-v2.7 plus two lossless changes in the production profile and five default-off levers. The image stack (SGLang tree,
-FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line and
-`--swa-prefix-tails 384` are v2.7's. Both profile changes were measured on the four Sparks against production v2.7 in
-the same boot (in-boot A/B, randomized round order, the official 1017 checkpoint); the release gate is still to run.
+v2.7 plus five lossless changes in the production profile (eight keys of `EXTRA_CONTAINER_ENV`) and two default-off
+levers. The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin (8,541,952 tokens at
+fraction 0.85), the launch line and `--swa-prefix-tails 384` are v2.7's. Every change was measured on the four Sparks
+against production v2.7 in the same boot (in-boot A/B with two control arms, randomized round order, the official 1017
+checkpoint, 2026-11-08/09); the release gate is still to run.
 
 - **Prefill: row split of the K = 5120 dense GEMMs (`DSV41_PREFILL_GEMM_ROW_SPLIT=4096
   DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152`, `adapter/prefill_gemm_split.py`, hooked from `adapter/mxfp8_b12x.py`).**
@@ -17,40 +18,51 @@ the same boot (in-boot A/B, randomized round order, the official 1017 checkpoint
   (N, K, M, pre-quantized, dtype) shape runs the stock GEMM and the split on the same input, compares the outputs bit for
   bit and the TP ranks agree, so a shape is split on every rank or on none (`DSV41_PREFILL_GEMM_ROW_SPLIT N=1792 ...
   -> SPLIT` in the head log); a difference, an exception or a CUDA-graph capture keeps the stock call. Decode, DSpark
-  verify and short extends never split (M below 8192). Measured (window P, four rounds): cold prefill +3.77 %
-  [3.60, 3.94] at 131K, +3.1 % at 32K, +3.5 % at 1M; the head's memory low-water and the decode stall of streams during
-  a long prefill unchanged; the boot check bit-identical for both widths on every rank. 2048-row blocks measured the
-  same as 4096 (+0.05 points). Rollback: unset both keys.
+  verify and short extends never split (M below 8192). Measured (four rounds): cold prefill **+3.77 % [3.60, 3.94]** at
+  131K, +3.1 % at 32K, +3.5 % at 1M; the head's memory low-water and the decode stall of streams during a long prefill
+  unchanged; the boot check bit-identical for both widths on every rank. 2048-row blocks measured the same as 4096
+  (+0.05 points).
 - **Decode: the attention-core L2 window warms `wo_b` instead of `wo_a` (`DSV41_L2_PREFETCH_WOA_MB=0
   DSV41_L2_PREFETCH_WOB_MB=6`, `adapter/l2_prefetch.py`, no code change).** `wo_b` was the one main-stream dense weight
   still ~60 % cold in serving (51 us per call against 15.5 us warm). With a `wo_a` budget of 0 the window opened before
   the attention core takes 6 MB of `wo_b` instead; `wo_a` goes cold and gives part of the gain back. The plan moves
-  budget without adding any (835.1 MB of prefetch per forward, as before). Measured (window B1, six rounds, c1): decode
-  step -0.40 ms, **+1.10 % [0.86, 1.36]** (prose +1.09 %), faster than both control arms in every round; tokens per
-  step identical; qeval 75 / 75 T = 0 outputs equal to the controls'; c4 -0.34 % [-0.84, 0.16] (inside the noise). The
-  dense b12x GEMM group falls from 7.03 to 5.94 ms per step in the trace. Rollback: unset both keys (`WOA_MB` 6 is the
-  code default).
-- **Default off, one line each in `.env.tp4.example` (lossless, measured in-boot only):**
-  - `DSV41_MOE_LAUNCH_PREPARED=plan,direct` (`adapter/moe_launch_prepared.py`, already in v2.7's image): eager MoE
-    launches call the op's Python body directly instead of through the PyTorch dispatcher; first token at c1 -41 ms in
-    every round of window E (together with the next item).
-  - `DSV41_EXTEND_NOSYNC=1` (`adapter/extend_nosync.py`): every extend builds its late-layer tail metadata and the
-    Engram hasher's extend map without the two host syncs of the stock path (a pinned host-to-device copy and a
-    `repeat_interleave` with a host-known output size); bit-identical. `DSV41_EXTEND_SYNC_AUDIT=1`
-    (`adapter/extend_sync_audit.py`, test only) logs every host-sync site of an extend.
-  - `DSV41_SAMPLED_COMMIT_REUSE=1` (`adapter/sampled_commit_reuse.py`) and `DSV41_SAMPLED_DRAFT_PROBS_EARLY=1`
-    (`adapter/sampled_draft_probs_early.py`): on sampled steps (T > 0) the draft-KV commit reuses the projection the
-    verify graph already computed instead of recomputing it eagerly (~0.3 ms of the sampled step's eager tail), and the
-    draft probabilities are computed on a side stream while the verify graph runs (~0.1 ms). Same kernels on the same
-    inputs, bitwise; `check` recomputes and counts differing bits. Greedy steps are untouched.
-  - `DSV41_PREFILL_KEEP_CACHE=1` (`adapter/prefill_keep_cache.py`; not recommended yet): the caching allocator keeps its
-    blocks between the chunks of one long prefill instead of `empty_cache()` after every chunk, with padded indexer
-    widths and a memory-neutrality guard. In window P it never engaged on a solo prefill (released at every idle
-    check) and cost 0.45 GiB where decode interleaved; fixed since (held across idle checks within one prompt, no keep
-    once decode interleaves), not re-measured.
-  - `DSV41_CERT_HEAD_MASK_MAX_M=<rows>` (`adapter/cert_head.py`; not measured on its own): the certified head's masked
-    mode is disarmed above that many verify rows, so greedy steps there run its full (exact) mode.
+  budget without adding any (835.1 MB of prefetch per forward, as before). Measured (six rounds, c1): decode step
+  -0.40 ms, **+1.10 % [0.86, 1.36]** (prose +1.09 %), faster than both control arms in every round; tokens per step
+  identical; qeval 75 / 75 T = 0 outputs equal to the controls'; c4 -0.34 % [-0.84, 0.16] (inside the noise). The dense
+  b12x GEMM group falls from 7.03 to 5.94 ms per step in the trace.
+- **Admission: extends without host syncs (`DSV41_EXTEND_NOSYNC=1`, `adapter/extend_nosync.py`) and MoE launches
+  without the dispatcher (`DSV41_MOE_LAUNCH_PREPARED=plan,direct`, was `plan`; `adapter/moe_launch_prepared.py`).**
+  Every extend (a new prompt, a chunk, a DSpark admission) built its late-layer tail metadata (decoder SWA bounded
+  replay) and the Engram hasher's extend map with a pageable host-to-device copy and a `repeat_interleave` without
+  `output_size`: two host syncs per extend that, under the overlap schedule, stall the CPU behind queued GPU work. Now
+  the lengths go through a pinned buffer and the output size comes from the host-known lengths (the stock call runs
+  when they are missing or disagree); bit-identical. In a sync audit of c16 traffic all 19
+  audited extends on the head synced (11 behind queued GPU work); with the change no sync site was left on any of the
+  four nodes (`DSV41_EXTEND_SYNC_AUDIT=1`, `adapter/extend_sync_audit.py`, test only).
+  `plan,direct` also calls the MoE op's Python body directly in eager mode instead of through the PyTorch dispatcher
+  (same body, same arguments). Measured together (six rounds): c16 per-stream decode **+3.38 % [1.38, 5.39]**, c4
+  +2.98 %, c1 first token **-40.6 ms**; `plan,direct` alone: first token -38.7 ms, c16 +0.9 % (not significant). Greedy
+  outputs within the controls' own T = 0 spread on every prompt, qeval bracket held.
+- **Sampled verify: commit reuse and early draft probabilities (`DSV41_SAMPLED_COMMIT_REUSE=1`,
+  `DSV41_SAMPLED_DRAFT_PROBS_EARLY=1`; `adapter/sampled_commit_reuse.py`, `adapter/sampled_draft_probs_early.py`).**
+  On a sampled step (T > 0, a grammar, a logit bias) the target-verify graph already computes the draft-KV commit
+  projection but stores nothing, and the worker then recomputed it eagerly (main_proj, its all-gather, norm, quant, the
+  wkv GEMM). The graph now copies the projection into a persistent buffer (~2 us) and the eager commit stores from it
+  when the replayed graph's batch equals the real one. And the accept's softmax of the draft logits is launched on a side
+  stream right after the proposal, overlapping the verify graph, and used when its inputs are exactly the accept's.
+  Same kernels on the same inputs, no random draw on either path: bitwise (`check` recomputes and counts differing bits;
+  0 in testing). Greedy steps are untouched. Measured (T 1.0 / top-p 0.95, prose, c1): step **-0.251 ms [-0.356,
+  -0.13]**.
+- **Default off, not recommended yet:** `DSV41_PREFILL_KEEP_CACHE=1` (`adapter/prefill_keep_cache.py`): the caching
+  allocator keeps its blocks between the chunks of one long prefill instead of `empty_cache()` after every chunk, with
+  padded indexer widths and a memory-neutrality guard. In its first measurement it never engaged on a solo prefill
+  (released at every idle check) and cost 0.45 GiB where decode interleaved; fixed since (held across idle checks within
+  one prompt, no keep once decode interleaves), not re-measured. `DSV41_CERT_HEAD_MASK_MAX_M=<rows>`
+  (`adapter/cert_head.py`, not measured on its own): the certified head's masked mode is disarmed above that many
+  verify rows, so greedy steps there run its full (exact) mode.
 - **Image tests:** the canary-roce image runs the CPU suites of all of the above at build; CI compiles them.
+- Rollback, config only: unset the seven new keys and set `DSV41_MOE_LAUNCH_PREPARED=plan`: the v2.7 profile on the
+  same image (the new adapters do nothing unset).
 - Ideas and implementation ours. The cold `wo_b` was found by comparing our per-kernel times with those of
   Christopher Owen's spark-ds41f on the same fleet (its dense MXFP8 GEMMs run with L2-warm weights).
 
