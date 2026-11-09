@@ -1,5 +1,47 @@
 # Changelog
 
+## v2.7.2 (candidate; release gate pending)
+
+v2.7.1 plus one lossless prefill change in the production profile (`DSV41_PREFILL_CED_SKIP=1`, one key appended to
+`EXTRA_CONTAINER_ENV`). The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin
+(8,541,952 tokens at fraction 0.85), the launch line, `--swa-prefix-tails 384` and every v2.7.1 key are unchanged.
+Measured on the four Sparks against v2.7.1 in the same boot (in-boot A/B with two control arms, the official 1017
+checkpoint, 2026-11-09); the release gate is still to run.
+
+- **Prefill: non-final chunks run the late layers on one row (`DSV41_PREFILL_CED_SKIP=1`,
+  `adapter/prefill_ced_skip.py`).** The launch runs SGLang's decoder SWA bounded replay: every prefill chunk runs
+  layers 0-19 over all its rows, layer 20 writes its compressed KV for all rows, and layers 20-39 then run over the
+  chunk's last 128 rows (one sliding window), also for a chunk whose prompt goes on for thousands of rows. For a request
+  with at least 128 prompt rows still to come after the chunk, that late-layer tail is now the chunk's last row only,
+  its window floored at its own position. Nothing reads the rows it no longer writes: the next chunk's tail is floored at
+  its own start minus one window, which lies at or past the skipped chunk's end; the final chunk's tail and every decode
+  step read only the last window of the prompt, which the skip never touches; a later prefix hit re-prefills one full
+  window (#41303), and the SWA cone replay floors its window at its start. The chunk that ends a prompt, the chunk
+  before a final chunk of fewer than 128 rows, bypass prompts and any request whose final length is unknown keep the
+  stock tail byte for byte. Final prompt lengths are recorded by request id when `ForwardBatch.init_new` builds a target
+  extend (the eager runner hands the model a `dataclasses.replace()` copy of the batch, which keeps `rids` and drops
+  extra attributes). The late-layer tail costs 86-93 ms per 8192-row chunk in the v2.7 trace, the one-row pass ~25 ms.
+  Measured (four rounds, cold prefill): 131K **+6.18 % [5.89, 6.48]** (rounds 5.93 / 6.16 / 6.35 / 6.30; A / A'
+  -0.21 %), 32K +3.65 %, 1M +7.39 / +5.82 %; qeval wall time unchanged (its prompts fit in one chunk). Exactness: qeval
+  75 / 75 T = 0 outputs equal to both controls'; 64-token greedy continuations of a 32K and a 131K document equal on
+  every arm; the 32K first token's top-20 logprobs bit-identical (the controls are bitwise stable there); at 131K and
+  1M, where the controls themselves vary run to run, the skip lands on a control's exact state in 2 of 5 samples. Head
+  memory low-water during the 32K / 131K prefill blocks 12.68 against 12.69 GiB, during the 1M prefills 8.44 against
+  8.65 / 8.62 GiB. 0 Xid, 0 tracebacks.
+  The window's own verdict text was BLOCKED by a leak check that counted skip receipts inside the controls' request
+  windows: a judge attribution overlap (each control window was widened by 5 s and covered the start of the next
+  request, an X request), disproved by the skip counter (the cumulative skip count at every printed receipt equals the
+  X-only count of eligible chunks; one skipped control chunk would shift it).
+- **In-boot A/B registry:** `DSV41_PREFILL_CED_SKIP` is an in-boot A/B key (`adapter/ab_variant.py`, test only).
+- **Image tests:** the canary-roce image runs both CED CPU suites at build (`tests/test_prefill_ced_skip.py`, and
+  `tests/test_prefill_ced_skip_engine.py`, which drives a 131K prompt chunk by chunk through a real `ForwardBatch` and
+  the engine's tail builder); CI compiles them.
+- Rollback, config only: unset `DSV41_PREFILL_CED_SKIP` (= the v2.7.1 profile on the same image).
+- **Credits:** a port of **Christopher Owen**'s [spark-ds41f](https://github.com/christopherowen/spark-ds41f) CED skip
+  (vLLM patches 0229-0255, 0255 "keep one decoder row of unread nonfinal chunks", and 0526-0527, Apache-2.0) to
+  SGLang's decoder SWA bounded replay; the adaptation and its proof of which rows are read are described in the
+  adapter's header.
+
 ## 2026-11-09 v2.7.1
 
 v2.7 plus five lossless changes in the production profile (eight keys of `EXTRA_CONTAINER_ENV`), a wider prefill
