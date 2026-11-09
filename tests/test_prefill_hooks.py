@@ -279,6 +279,75 @@ def test_scheduler_releases_a_held_cache_when_its_prompt_cannot_continue():
         assert fake.empties == 1                     # nothing held: no second empty
 
 
+def test_on_idle_between_chunks_of_the_held_prompt_keeps_it():
+    """Fleet run-20261109-011349: on_idle ran between the chunks of one prefill and released after every chunk
+    (737 / 739 receipts released_by=idle). on_idle now releases only when the held prompt cannot continue."""
+    import prefill_keep_cache as keep
+    importlib.reload(keep)
+    fake = FakeCuda()
+    mod = _scheduler_module()
+    keep.install_scheduler(mod, torch=_Torch(fake))
+    sch = mod.Scheduler()
+    _holding_policy(keep, fake)
+    fake.empties = 0
+    sch.chunked_req = types.SimpleNamespace(rid="a")     # the prefill in progress
+    sch.on_idle()
+    sch.on_idle()
+    assert fake.empties == 0 and keep.policy().holding
+    sch.chunked_req = types.SimpleNamespace(rid="other")
+    sch.on_idle()
+    assert fake.empties == 1 and not keep.policy().holding
+
+
+def _decode_fb():
+    return types.SimpleNamespace(forward_mode=types.SimpleNamespace(is_extend_without_speculative=lambda: False),
+                                 seq_lens_cpu=torch.tensor([9000]))
+
+
+def _fb2(seq, final, prev):
+    fb = _fb(seq, final)
+    fb.dsv41_rids = ["p%d" % final]
+    fb.extend_seq_lens_cpu = [seq - prev]
+    return fb
+
+
+def test_decode_between_chunks_stops_keeping_that_prompt():
+    fake, runner, saved = _install_hook({"DSV41_PREFILL_KEEP_CACHE": "1"})
+    try:
+        import prefill_keep_cache as keep
+        seqs = [8192, 16384, 24576, 32768, 40000]
+        prev = 0
+        for i, seq in enumerate(seqs[:2]):
+            runner.forward(_fb2(seq, 40000, prev))
+            prev = seq
+        assert keep.policy().holding
+        fake.empties = 0
+        runner.forward(_decode_fb())                     # a decode step between chunks: release now
+        assert fake.empties == 1 and not keep.policy().holding
+        runner.forward(_decode_fb())                     # nothing held: no second empty
+        assert fake.empties == 1
+        pads = []
+        for seq in seqs[2:]:
+            fb = _fb2(seq, 40000, prev)
+            runner.forward(fb)
+            pads.append(fb.dsv41_pad_ok)
+            prev = seq
+            assert not keep.policy().holding             # the rest of the prompt runs as today
+        assert fake.empties == 1 + 3 and pads == [False, False, False], (fake.empties, pads)
+        # the next prompt (no decode between its chunks) keeps again
+        prev = 0
+        for seq in (8192, 16384):
+            runner.forward(_fb2(seq, 30000, prev))
+            prev = seq
+        assert keep.policy().holding
+        # a draft-model decode forward does not count
+        runner.is_draft_worker = True
+        runner.forward(_decode_fb())
+        assert keep.policy().holding
+    finally:
+        _restore(saved)
+
+
 def test_gate_off_releases_and_armed_ab_without_the_key_installs_nothing():
     import prefill_keep_cache as keep
     importlib.reload(keep)

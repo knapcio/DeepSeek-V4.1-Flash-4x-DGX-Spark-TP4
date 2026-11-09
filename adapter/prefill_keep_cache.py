@@ -262,6 +262,8 @@ class Policy:
         self.fresh = False
         self._start = None
         self.sessions = []           # finished-session receipts (the hook prints and pops them)
+        self.no_keep = None          # (identity, finals) of a prompt whose chunks interleave with decode steps
+        self._no_keep_now = False
 
     @property
     def holding(self):
@@ -295,10 +297,42 @@ class Policy:
             return False
         return ignore_rows or s["rows"] is None or batch.rows(ends) <= s["rows"]
 
+    def mid_prompt(self):
+        """A prompt's prefill is under way (a session with at least one chunk, held or not)."""
+        return self.session is not None and self.session["chunks"] > 0
+
+    def mark_no_keep(self):
+        """A decode / verify step ran between the chunks of the current prompt: stop keeping for the rest of it
+        (mixed prefill + decode must never hold the prefill's peak through the decode windows). Returns True if a
+        cache is held (the caller empties it)."""
+        s = self.session
+        if s is None or not s["chunks"]:
+            return False
+        self.no_keep = (s["identity"], s["finals"])
+        s["no_keep"] = True
+        if s["holding"]:
+            s["holding"] = False
+            s["empty"]["decode"] = s["empty"].get("decode", 0) + 1
+            return True
+        return False
+
     def begin(self, batch, stats):
         # padding needs every request of the batch to continue (a batch where some request ends is emptied after it,
         # so padding it to the largest final width would only raise its own peak: A last + B first)
         self._all_continue = batch.more() is True
+        if self.no_keep is not None:
+            if (batch.identity(), batch.finals) == self.no_keep:
+                # the rest of a prompt that interleaves with decode: today's behaviour (empty after every chunk,
+                # stock widths), no empty before (the cache was emptied after the previous chunk)
+                self._no_keep_now = True
+                if self.session is None:
+                    self._new_session()
+                    self.session["no_keep"] = True
+                return False, "no-keep"
+            self.no_keep = None
+            if self.session is not None and self.session.get("no_keep"):
+                self._close("switch")
+        self._no_keep_now = False
         out = self._begin(batch, stats)
         s = self.session
         if s is not None and batch.rows(s["ends"] if self.continues(batch, need_holding=False) else None) \
@@ -309,7 +343,7 @@ class Policy:
     def pad_ok(self):
         """The indexer may pad this forward to the final width: every request of the batch continues (begin) and the
         batch is not wider than a chunk."""
-        if not getattr(self, "_all_continue", False):
+        if not getattr(self, "_all_continue", False) or self._no_keep_now:
             return False
         return self.session is None or not self.session.get("wide", False)
 
@@ -359,6 +393,8 @@ class Policy:
         more = batch.more()
         if more is not True:
             reason = {False: "end", None: "unknown-final"}.get(more, "mixed")
+        elif self._no_keep_now:
+            reason = "decode-mixed"
         elif s.pop("wide", False):
             reason = "wide"
         elif s["disabled"]:
@@ -446,6 +482,19 @@ def release(torch, why="released"):
     return True
 
 
+def release_for_decode(torch):
+    """A decode / verify forward of the target model while a prompt is mid-prefill: stop keeping for that prompt and
+    empty a held cache now. Returns True if it emptied."""
+    p = _POLICY[0]
+    if p is None or not p.mid_prompt():
+        return False
+    if not p.mark_no_keep():
+        return False
+    torch.cuda.empty_cache()
+    p.emptied(read_stats(torch))
+    return True
+
+
 def scheduler_owns_session(scheduler, batch):
     """True while the held session may still continue: the scheduler's chunked request, or a request of the batch
     about to run, is one of the session's requests."""
@@ -495,7 +544,9 @@ def install_scheduler(module, torch=None):
             def fn(self, *args, **kwargs):
                 out = orig(self, *args, **kwargs)
                 try:
-                    if why == "idle" or getattr(self, "chunked_req", None) is None:
+                    # the fleet run (run-20261109-011349) reached on_idle between the chunks of ONE prefill:
+                    # release only when neither the chunked request nor a batch belongs to the held prompt
+                    if not scheduler_owns_session(self, None):
                         release(torch, why)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("DSV41_PREFILL_KEEP_CACHE release (%s): %r", why, exc)

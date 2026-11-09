@@ -389,6 +389,23 @@ def test_policy_row_change_gap_and_rewind_empty_before():
     assert p.begin(B(["a"], [100000], [12000], [3808]), _st(1000, 0, 9)) == (False, "continue")   # short last chunk
 
 
+def test_policy_decode_between_chunks_disables_keep_for_that_prompt():
+    p = keep.Policy(slack=100)
+    p.emptied(_st())
+    a = lambda seq, prev: B(["a"], [40000], [seq], [seq - prev])  # noqa: E731
+    _chunk(p, a(8192, 0), _st(), _st(1000, 990, 9))
+    assert p.holding and p.mark_no_keep() and not p.holding
+    assert not p.mark_no_keep()                              # nothing held any more
+    assert p.begin(a(16384, 8192), _st(0, 0, 12)) == (False, "no-keep") and not p.pad_ok()
+    p.before(_st(0, 0, 12))
+    assert p.after(a(16384, 8192), _st(1000, 990, 14)) == (True, "decode-mixed")
+    p.emptied(_st(0, 0, 14))
+    assert _chunk(p, a(40000, 16384), _st(0, 0, 14), _st(1000, 990, 16))[1:] == (True, "end")
+    # the next prompt is not affected
+    eb, ea, why = _chunk(p, B(["b"], [30000], [8192], [8192]), _st(0, 0, 16), _st(1000, 990, 20))
+    assert why == "keep" and p.holding and p.no_keep is None
+
+
 def test_policy_release():
     p = keep.Policy(slack=100)
     assert not p.release()

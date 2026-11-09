@@ -75,6 +75,15 @@ def install(module):
         if not on:
             if not gate:
                 keep.release(torch, 'gate-off')   # in-boot A/B switched it off: nothing may stay held
+            else:
+                try:
+                    mode = forward_batch.forward_mode
+                    if not getattr(self, 'is_draft_worker', False) and not mode.is_extend_without_speculative():
+                        # decode / verify between the chunks of a kept prompt: stop keeping it (stall-11 receipt:
+                        # the held peak plus the decode steps' allocations cost 0.45 GiB of head low-water)
+                        keep.release_for_decode(torch)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning('DSV41 prefill keep-cache decode release: %s', exc)
             output = original(self, forward_batch, *args, **kwargs)
             try:
                 if _long_extend(forward_batch):
