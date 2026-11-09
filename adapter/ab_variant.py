@@ -84,7 +84,10 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            "DSV41_PREFILL_GEMM_ROW_SPLIT",
            # adapter/prefill_keep_cache.py: allocator cache kept between the chunks of one prefill (per forward);
            # the indexer width padding it enables is read per call in adapter/indexer_chunked_v3.py
-           "DSV41_PREFILL_KEEP_CACHE", "DSV41_PREFILL_KEEP_CACHE_PAD")
+           "DSV41_PREFILL_KEEP_CACHE", "DSV41_PREFILL_KEEP_CACHE_PAD",
+           # adapter/cert_head.py X3b: masked-mode row cap, read per verify step on the host (same graphs);
+           # and the qualified row counts, read per capture (a subset of the process list; X3 arm, TEST ONLY)
+           "DSV41_CERT_HEAD_MASK_MAX_M", "DSV41_CERT_HEAD_M")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
@@ -164,6 +167,32 @@ def _fold_value(value):
     raise RuntimeError(f"DSV41_BLOCK_VERIFY_FOLD={value!r}: expected 0 / 1 / check")
 
 
+def _cert_rows(value):
+    """DSV41_CERT_HEAD_M as the sorted tuple of row counts adapter/cert_head.parse_m qualifies ('' = none)."""
+    out = set()
+    for part in filter(None, (p.strip() for p in (value or "").split(","))):
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        if not 1 <= lo <= hi <= 128:
+            raise RuntimeError(f"DSV41_CERT_HEAD_M: bad entry {part!r} (1..128)")
+        out.update(range(lo, hi + 1))
+    return tuple(sorted(out))
+
+
+def _mask_cap(value):
+    """DSV41_CERT_HEAD_MASK_MAX_M as adapter/cert_head.parse_mask_cap reads it; unset and >= 128 are both no cap."""
+    raw = (value or "").strip()
+    if not raw:
+        return 128
+    try:
+        v = int(raw)
+    except ValueError:
+        raise RuntimeError(f"DSV41_CERT_HEAD_MASK_MAX_M={value!r}: expected an integer row count") from None
+    if v < 0:
+        raise RuntimeError(f"DSV41_CERT_HEAD_MASK_MAX_M={value!r}: must be >= 0")
+    return min(v, 128)
+
+
 def _norm(cfg):
     """Effective behaviour of one variant's registry values (defaults applied; L2 knobs are moot
     while the L2 main gate is off)."""
@@ -189,6 +218,10 @@ def _norm(cfg):
             out[key] = "off" if v in _OFF else ("plan,direct" if "direct" in v else "plan")
         elif key == "DSV41_BLOCK_VERIFY_FOLD":     # off / on / check are three behaviours
             out[key] = _fold_value(value)
+        elif key == "DSV41_CERT_HEAD_M":           # the qualified row set (order / ranges / spaces do not matter)
+            out[key] = _cert_rows(value)
+        elif key == "DSV41_CERT_HEAD_MASK_MAX_M":  # a row cap; unset = no cap = 128
+            out[key] = _mask_cap(value)
         else:
             out[key] = truthy(value)
     return out
