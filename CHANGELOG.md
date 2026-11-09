@@ -2,8 +2,8 @@
 
 ## v2.7.1 (candidate; release gate pending)
 
-v2.7 plus five lossless changes in the production profile (eight keys of `EXTRA_CONTAINER_ENV`) and two default-off
-levers. The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin (8,541,952 tokens at
+v2.7 plus five lossless changes in the production profile (eight keys of `EXTRA_CONTAINER_ENV`), a wider prefill
+bypass, and two default-off levers. The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin (8,541,952 tokens at
 fraction 0.85), the launch line and `--swa-prefix-tails 384` are v2.7's. Every change was measured on the four Sparks
 against production v2.7 in the same boot (in-boot A/B with two control arms, randomized round order, the official 1017
 checkpoint, 2026-11-08/09); the release gate is still to run.
@@ -53,6 +53,13 @@ checkpoint, 2026-11-08/09); the release gate is still to run.
   Same kernels on the same inputs, no random draw on either path: bitwise (`check` recomputes and counts differing bits;
   0 in testing). Greedy steps are untouched. Measured (T 1.0 / top-p 0.95, prose, c1): step **-0.251 ms [-0.356,
   -0.13]**.
+- **Multi-user: a wider bypass (`DSV41_PREFILL_BYPASS=8192`, was 256; `adapter/prefill_bypass.py`, no code change).** A
+  request with up to 8192 fresh tokens that arrives during a long cold prefill is now admitted beside it (in a solo pass
+  of its own, as before; at most one solo pass between two chunks of the long prompt) instead of only requests of
+  <= 256 tokens. Measured with Christopher Owen's servebench on production v2.7: a 500-token prompt beside a cold 131K
+  prefill answers in 1.3-1.7 s instead of 26-28 s; the long prompt takes 6-10 % longer while such requests arrive.
+  In production since 2026-11-08; the release gate runs it on every arm. The one-chunk limit follows Christopher
+  Owen's spark-ds41f prefill yield (a waiting prompt that fits in one chunk takes the next step).
 - **Default off, not recommended yet:** `DSV41_PREFILL_KEEP_CACHE=1` (`adapter/prefill_keep_cache.py`): the caching
   allocator keeps its blocks between the chunks of one long prefill instead of `empty_cache()` after every chunk, with
   padded indexer widths and a memory-neutrality guard. In its first measurement it never engaged on a solo prefill
@@ -61,8 +68,8 @@ checkpoint, 2026-11-08/09); the release gate is still to run.
   (`adapter/cert_head.py`, not measured on its own): the certified head's masked mode is disarmed above that many
   verify rows, so greedy steps there run its full (exact) mode.
 - **Image tests:** the canary-roce image runs the CPU suites of all of the above at build; CI compiles them.
-- Rollback, config only: unset the seven new keys and set `DSV41_MOE_LAUNCH_PREPARED=plan`: the v2.7 profile on the
-  same image (the new adapters do nothing unset).
+- Rollback, config only: unset the seven new keys and set `DSV41_MOE_LAUNCH_PREPARED=plan` and
+  `DSV41_PREFILL_BYPASS=256`: the v2.7 profile on the same image (the new adapters do nothing unset).
 - Ideas and implementation ours. The cold `wo_b` was found by comparing our per-kernel times with those of
   Christopher Owen's spark-ds41f on the same fleet (its dense MXFP8 GEMMs run with L2-warm weights).
 
