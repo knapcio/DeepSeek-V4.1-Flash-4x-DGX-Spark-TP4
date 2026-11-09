@@ -60,7 +60,15 @@ UNION_BOOL = ("DSV41_L2_PREFETCH", "DSV41_L2_PREFETCH_WOA", "DSV41_L2_PREFETCH_D
               "DSV41_CERT_HEAD",
               # adapter/moe_launch_prepared.py: hooks installed when any variant enables it; mode
               # (off / plan / plan,direct) read per eager launch
-              "DSV41_MOE_LAUNCH_PREPARED")
+              "DSV41_MOE_LAUNCH_PREPARED",
+              # adapter/extend_nosync.py: edited tail metadata installed when any variant enables it; read per call
+              "DSV41_EXTEND_NOSYNC",
+              # adapter/sampled_commit_reuse.py: hooks installed when any variant enables it; the in-graph
+              # buffer copy read per capture, the eager reuse (off / on / check) per replayed variant
+              "DSV41_SAMPLED_COMMIT_REUSE",
+              # adapter/sampled_draft_probs_early.py: hooks installed when any variant enables it; off / on / check
+              # read per call (eager only)
+              "DSV41_SAMPLED_DRAFT_PROBS_EARLY")
 UNION_PARTS = {"DSV41_FUSE_QUANT": ("qnorm", "wo_a", "hcpad"),
                # adapter/spec_sync_free.py: per-step rank-0 broadcasts kept / dropped per variant
                "DSV41_SPEC_SYNC_FREE": ("draft", "accept", "vcap", "merge"),
@@ -77,13 +85,22 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # adapter/indexer_chunked_v3.py: eager prefill indexer slot ids without host syncs
            "DSV41_INDEXER_NOSYNC",
            # adapter/block_verify.py: sampled block verification through the fold kernels (eager, per call)
-           "DSV41_BLOCK_VERIFY_FOLD")
+           "DSV41_BLOCK_VERIFY_FOLD",
+           # adapter/prefill_gemm_split.py: K >= 5120 prefill GEMMs as row blocks (eager prefill only, per call)
+           "DSV41_PREFILL_GEMM_ROW_SPLIT",
+           # adapter/prefill_keep_cache.py: allocator cache kept between the chunks of one prefill (per forward);
+           # the indexer width padding it enables is read per call in adapter/indexer_chunked_v3.py
+           "DSV41_PREFILL_KEEP_CACHE", "DSV41_PREFILL_KEEP_CACHE_PAD",
+           # adapter/cert_head.py X3b: masked-mode row cap, read per verify step on the host (same graphs);
+           # and the qualified row counts, read per capture (a subset of the process list; X3 arm, TEST ONLY)
+           "DSV41_CERT_HEAD_MASK_MAX_M", "DSV41_CERT_HEAD_M")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
                 "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0}
 HASHED_SOURCES = ("ab_variant", "l2_prefetch", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
-                  "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold")
+                  "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
+                  "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")
@@ -144,8 +161,8 @@ def _parse_parts(value, all_parts):
     return parts
 
 
-def _fold_value(value):
-    """DSV41_BLOCK_VERIFY_FOLD as the behaviour block_verify dispatches on: off / on / check."""
+def _fold_value(value, name="DSV41_BLOCK_VERIFY_FOLD"):
+    """DSV41_BLOCK_VERIFY_FOLD (or another off / on / check gate) as the behaviour its adapter dispatches on."""
     v = (value or "0").strip().lower()
     if v in _OFF:
         return "off"
@@ -153,7 +170,33 @@ def _fold_value(value):
         return "check"
     if v in ("1", "on", "true", "yes"):
         return "on"
-    raise RuntimeError(f"DSV41_BLOCK_VERIFY_FOLD={value!r}: expected 0 / 1 / check")
+    raise RuntimeError(f"{name}={value!r}: expected 0 / 1 / check")
+
+
+def _cert_rows(value):
+    """DSV41_CERT_HEAD_M as the sorted tuple of row counts adapter/cert_head.parse_m qualifies ('' = none)."""
+    out = set()
+    for part in filter(None, (p.strip() for p in (value or "").split(","))):
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        if not 1 <= lo <= hi <= 128:
+            raise RuntimeError(f"DSV41_CERT_HEAD_M: bad entry {part!r} (1..128)")
+        out.update(range(lo, hi + 1))
+    return tuple(sorted(out))
+
+
+def _mask_cap(value):
+    """DSV41_CERT_HEAD_MASK_MAX_M as adapter/cert_head.parse_mask_cap reads it; unset and >= 128 are both no cap."""
+    raw = (value or "").strip()
+    if not raw:
+        return 128
+    try:
+        v = int(raw)
+    except ValueError:
+        raise RuntimeError(f"DSV41_CERT_HEAD_MASK_MAX_M={value!r}: expected an integer row count") from None
+    if v < 0:
+        raise RuntimeError(f"DSV41_CERT_HEAD_MASK_MAX_M={value!r}: must be >= 0")
+    return min(v, 128)
 
 
 def _norm(cfg):
@@ -181,6 +224,12 @@ def _norm(cfg):
             out[key] = "off" if v in _OFF else ("plan,direct" if "direct" in v else "plan")
         elif key == "DSV41_BLOCK_VERIFY_FOLD":     # off / on / check are three behaviours
             out[key] = _fold_value(value)
+        elif key == "DSV41_CERT_HEAD_M":           # the qualified row set (order / ranges / spaces do not matter)
+            out[key] = _cert_rows(value)
+        elif key == "DSV41_CERT_HEAD_MASK_MAX_M":  # a row cap; unset = no cap = 128
+            out[key] = _mask_cap(value)
+        elif key in ("DSV41_SAMPLED_COMMIT_REUSE", "DSV41_SAMPLED_DRAFT_PROBS_EARLY"):  # off / on / check
+            out[key] = _fold_value(value, key)
         else:
             out[key] = truthy(value)
     return out
