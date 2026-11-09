@@ -350,7 +350,7 @@ def test_config_hash_inputs():
                                   "roce_twoshot", "indexer_chunked_v3", "moe_launch_prepared",
                                   "block_verify", "block_verify_fold", "extend_nosync",
                                   "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache",
-                                  "sampled_commit_reuse"}
+                                  "sampled_commit_reuse", "sampled_draft_probs_early"}
         assert a.SOURCES["ab_variant"] != "missing" and a.SOURCES["l2_prefetch"] != "missing"
         # a different adapter file on one node changes that node's hash
         saved = sys.modules.get("fuse_quant")
