@@ -62,7 +62,10 @@ UNION_BOOL = ("DSV41_L2_PREFETCH", "DSV41_L2_PREFETCH_WOA", "DSV41_L2_PREFETCH_D
               # (off / plan / plan,direct) read per eager launch
               "DSV41_MOE_LAUNCH_PREPARED",
               # adapter/extend_nosync.py: edited tail metadata installed when any variant enables it; read per call
-              "DSV41_EXTEND_NOSYNC")
+              "DSV41_EXTEND_NOSYNC",
+              # adapter/sampled_commit_reuse.py: hooks installed when any variant enables it; the in-graph
+              # buffer copy read per capture, the eager reuse (off / on / check) per replayed variant
+              "DSV41_SAMPLED_COMMIT_REUSE")
 UNION_PARTS = {"DSV41_FUSE_QUANT": ("qnorm", "wo_a", "hcpad"),
                # adapter/spec_sync_free.py: per-step rank-0 broadcasts kept / dropped per variant
                "DSV41_SPEC_SYNC_FREE": ("draft", "accept", "vcap", "merge"),
@@ -94,7 +97,7 @@ _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "D
                 "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0}
 HASHED_SOURCES = ("ab_variant", "l2_prefetch", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
                   "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
-                  "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache")
+                  "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")
@@ -155,8 +158,8 @@ def _parse_parts(value, all_parts):
     return parts
 
 
-def _fold_value(value):
-    """DSV41_BLOCK_VERIFY_FOLD as the behaviour block_verify dispatches on: off / on / check."""
+def _fold_value(value, name="DSV41_BLOCK_VERIFY_FOLD"):
+    """DSV41_BLOCK_VERIFY_FOLD (or another off / on / check gate) as the behaviour its adapter dispatches on."""
     v = (value or "0").strip().lower()
     if v in _OFF:
         return "off"
@@ -164,7 +167,7 @@ def _fold_value(value):
         return "check"
     if v in ("1", "on", "true", "yes"):
         return "on"
-    raise RuntimeError(f"DSV41_BLOCK_VERIFY_FOLD={value!r}: expected 0 / 1 / check")
+    raise RuntimeError(f"{name}={value!r}: expected 0 / 1 / check")
 
 
 def _cert_rows(value):
@@ -222,6 +225,8 @@ def _norm(cfg):
             out[key] = _cert_rows(value)
         elif key == "DSV41_CERT_HEAD_MASK_MAX_M":  # a row cap; unset = no cap = 128
             out[key] = _mask_cap(value)
+        elif key == "DSV41_SAMPLED_COMMIT_REUSE":  # off / on / check are three behaviours
+            out[key] = _fold_value(value, key)
         else:
             out[key] = truthy(value)
     return out

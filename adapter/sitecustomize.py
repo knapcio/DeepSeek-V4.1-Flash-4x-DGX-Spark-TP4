@@ -185,6 +185,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DRAFT_MAIN_PROJ_SPLIT', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_main_proj import install as install_draft_main_proj
                 install_draft_main_proj(module)
+            # Gated on DSV41_SAMPLED_COMMIT_REUSE: sampled steps store the draft-KV commit the verify graph
+            # already projected instead of recomputing it (adapter/sampled_commit_reuse.py; source-pinned).
+            if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_commit_reuse import install_dspark as install_sampled_commit_reuse_dspark
+                install_sampled_commit_reuse_dspark(module)
             # Gated on DSV41_DRAFT_HEAD_FP8: the draft's LM head from an fp8 copy (target untouched).
             if os.environ.get('DSV41_DRAFT_HEAD_FP8', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_head_fp8 import install as install_draft_head_fp8
@@ -240,6 +245,10 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DRAFT_CAPTURE', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_capture import install as install_draft_capture
                 install_draft_capture(module)
+            # Gated on DSV41_SAMPLED_COMMIT_REUSE: the epilogue copy, the per-step verify record, the eager commit.
+            if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_commit_reuse import install_verify as install_sampled_commit_reuse_verify
+                install_sampled_commit_reuse_verify(module)
         elif module.__name__ == 'sglang.kernels.ops.moe.moe_fused_gate':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_gate as install_verify_cap_gate
@@ -344,6 +353,10 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_BLOCK_VERIFY_FOLD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from block_verify_fold import install_scheduler as install_block_verify_fold_scheduler
                 install_block_verify_fold_scheduler(module)
+            # Gated on DSV41_SAMPLED_COMMIT_REUSE: terminal reuse receipts at each busy -> idle transition.
+            if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_commit_reuse import install_scheduler as install_sampled_commit_reuse_scheduler
+                install_sampled_commit_reuse_scheduler(module)
             # Gated on DSV41_DECODE_YIELD=<pct>: running streams keep a decode share while a long
             # prompt prefills (adapter/decode_yield.py). Gate checked BEFORE the import.
             if os.environ.get('DSV41_DECODE_YIELD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
