@@ -14,6 +14,11 @@ class EngramLoader(importlib.abc.Loader):
     def exec_module(self, module):
         self.original.exec_module(module)
         if module.__name__ == 'sglang.srt.layers.engram':
+            # Gated on DSV41_EXTEND_NOSYNC=1 (off by default), FIRST: the hasher's extend map gets a host-known
+            # output size before engram_prefetch wraps the hasher (adapter/extend_nosync.py, bit-identical).
+            if os.environ.get('DSV41_EXTEND_NOSYNC', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from extend_nosync import install_engram as install_extend_nosync_engram
+                install_extend_nosync_engram(module)
             from engram_backend import install
             install(module)
             # After engram_backend: Engram rows fetched on a side stream right after the
@@ -69,6 +74,12 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_backend as install_swa_cone_backend
                 install_swa_cone_backend(module)
+            # Gated on DSV41_EXTEND_NOSYNC=1 (off by default): the extend's late-layer tail metadata is built
+            # without host syncs, so an admission's launch can run under the in-flight decode step
+            # (adapter/extend_nosync.py, bit-identical). Gate checked BEFORE the import.
+            if os.environ.get('DSV41_EXTEND_NOSYNC', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from extend_nosync import install_backend as install_extend_nosync_backend
+                install_extend_nosync_backend(module)
             # DSV41_KV_LAYOUT=v41c (adapter/v41c_pool.py) / v41 (adapter/v41_pool.py, v2.7): the writer / reader call
             # sites must be the pinned ones.
             if os.environ.get('DSV41_KV_LAYOUT', '').strip() not in _V41C_OFF:
@@ -81,6 +92,13 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SWA_CONE_REPLAY', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from swa_cone import install_forward_batch as install_swa_cone_forward_batch
                 install_swa_cone_forward_batch(module)
+            # Gated on DSV41_PREFILL_KEEP_CACHE=1 (or an armed in-boot A/B naming it): extend batches carry the
+            # requests' final prompt lengths for the keep-cache policy and the indexer padding
+            # (adapter/prefill_keep_cache.py). Gate checked inside before anything is wrapped.
+            from prefill_keep_cache import wanted_at_install as _keep_wanted
+            if _keep_wanted():
+                from prefill_keep_cache import install_forward_batch as install_keep_cache_forward_batch
+                install_keep_cache_forward_batch(module)
         elif module.__name__ == 'sglang.srt.mem_cache.deepseek_v4_memory_pool':
             # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records (v41c),
             # or the whole V4.1 layout pair on SM12x (v41, v2.7). v41c_pool.enabled() raises on any value but v4 /
@@ -167,6 +185,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DRAFT_MAIN_PROJ_SPLIT', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_main_proj import install as install_draft_main_proj
                 install_draft_main_proj(module)
+            # Gated on DSV41_SAMPLED_COMMIT_REUSE: sampled steps store the draft-KV commit the verify graph
+            # already projected instead of recomputing it (adapter/sampled_commit_reuse.py; source-pinned).
+            if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_commit_reuse import install_dspark as install_sampled_commit_reuse_dspark
+                install_sampled_commit_reuse_dspark(module)
             # Gated on DSV41_DRAFT_HEAD_FP8: the draft's LM head from an fp8 copy (target untouched).
             if os.environ.get('DSV41_DRAFT_HEAD_FP8', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_head_fp8 import install as install_draft_head_fp8
@@ -222,6 +245,14 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DRAFT_CAPTURE', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_capture import install as install_draft_capture
                 install_draft_capture(module)
+            # Gated on DSV41_SAMPLED_COMMIT_REUSE: the epilogue copy, the per-step verify record, the eager commit.
+            if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_commit_reuse import install_verify as install_sampled_commit_reuse_verify
+                install_sampled_commit_reuse_verify(module)
+            # Gated on DSV41_SAMPLED_DRAFT_PROBS_EARLY: accept_draft_tokens' draft probabilities from the side stream.
+            if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_draft_probs_early import install_verify as install_sampled_draft_probs_early_verify
+                install_sampled_draft_probs_early_verify(module)
         elif module.__name__ == 'sglang.kernels.ops.moe.moe_fused_gate':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_gate as install_verify_cap_gate
@@ -233,6 +264,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_EAGER_GLUE', '').strip() not in ('', '0', 'off', 'false'):
                 from eager_glue import install_draft as install_eager_glue_draft
                 install_eager_glue_draft(module)
+            # Gated on DSV41_SAMPLED_DRAFT_PROBS_EARLY: sampled draft probabilities launched on a side stream
+            # right after the proposal, overlapping the verify graph (adapter/sampled_draft_probs_early.py).
+            if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_draft_probs_early import install_draft as install_sampled_draft_probs_early_draft
+                install_sampled_draft_probs_early_draft(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_planner':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_planner as install_verify_cap_planner
@@ -326,11 +362,31 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_BLOCK_VERIFY_FOLD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from block_verify_fold import install_scheduler as install_block_verify_fold_scheduler
                 install_block_verify_fold_scheduler(module)
+            # Gated on DSV41_SAMPLED_COMMIT_REUSE: terminal reuse receipts at each busy -> idle transition.
+            if os.environ.get('DSV41_SAMPLED_COMMIT_REUSE', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_commit_reuse import install_scheduler as install_sampled_commit_reuse_scheduler
+                install_sampled_commit_reuse_scheduler(module)
+            # Gated on DSV41_SAMPLED_DRAFT_PROBS_EARLY: terminal receipts at each busy -> idle transition.
+            if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                from sampled_draft_probs_early import install_scheduler as install_sampled_draft_probs_early_scheduler
+                install_sampled_draft_probs_early_scheduler(module)
             # Gated on DSV41_DECODE_YIELD=<pct>: running streams keep a decode share while a long
             # prompt prefills (adapter/decode_yield.py). Gate checked BEFORE the import.
             if os.environ.get('DSV41_DECODE_YIELD', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from decode_yield import install as install_decode_yield
                 install_decode_yield(module)
+            # DSV41_PREFILL_KEEP_CACHE=1 (or named by an armed in-boot A/B): a cache held for a prompt that can no
+            # longer continue (abort, retraction, pause, idle) is emptied; AFTER decode_yield, which pins the source
+            # of get_next_batch_to_run (adapter/prefill_keep_cache.py).
+            from prefill_keep_cache import wanted_at_install as _keep_wanted_s
+            if _keep_wanted_s():
+                from prefill_keep_cache import install_scheduler as install_keep_cache_scheduler
+                install_keep_cache_scheduler(module)
+            # TEST ONLY, gated on DSV41_EXTEND_SYNC_AUDIT=1: host syncs inside extend batches are logged per site
+            # (adapter/extend_sync_audit.py). Logging only; outermost run_batch wrapper. Gate checked BEFORE the import.
+            if os.environ.get('DSV41_EXTEND_SYNC_AUDIT', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
+                from extend_sync_audit import install as install_extend_sync_audit
+                install_extend_sync_audit(module)
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)

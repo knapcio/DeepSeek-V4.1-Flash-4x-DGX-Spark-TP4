@@ -143,7 +143,10 @@ class Wiring(unittest.TestCase):
         prod = lines[i - 1]
         self.assertTrue(prod.startswith('#EXTRA_CONTAINER_ENV="'), prod[:60])
         items = prod.split('"')[1].split()
-        self.assertEqual(items[-1], "DSV41_SWA_PROMPT_TAIL_KEEP=1024")
+        # v2.7.1: the seven new keys follow it
+        self.assertEqual(items[-8], "DSV41_SWA_PROMPT_TAIL_KEEP=1024")
+        self.assertTrue(all(x.startswith(("DSV41_PREFILL_GEMM_ROW_SPLIT", "DSV41_L2_PREFETCH_WO", "DSV41_EXTEND_NOSYNC",
+                                          "DSV41_SAMPLED_")) for x in items[-7:]), items[-7:])
         self.assertEqual(sum(x.startswith("DSV41_SWA_PROMPT_TAIL") for x in items), 1)
         on = [line for line in lines if "DSV41_SWA_PROMPT_TAIL" in line and not line.startswith("# ")]
         self.assertEqual(on, [prod])

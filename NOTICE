@@ -107,6 +107,11 @@ Third-party components and their licences:
   to FlashInfer 0.7.2's copy of the b12x dense GEMM (the PR's base blob). files/fi-autotune/sparse_mla_sm120_cpb.json
   is FlashInfer 0.7.2's own autotune output for its SM120 sparse-MLA kernels on a GB10 (the four V4.1 TP4 request
   shapes), shipped as data so the image never calibrates in-process.
+- v2.7.1: adapter/sampled_commit_reuse.py (DSV41_SAMPLED_COMMIT_REUSE, default off) mirrors the body of SGLang's
+  DeepseekV4ForCausalLMDSpark.write_target_hidden_kv (dsv4.1 branch, sha256-pinned; Apache License 2.0,
+  LICENSE.sglang), split into its projection and its stores. adapter/extend_nosync.py (DSV41_EXTEND_NOSYNC, default
+  off) applies small textual edits to SGLang's late-layer tail metadata functions at import and copies no other
+  SGLang source. The prefill row split, the keep-cache and the wo_b L2 window are this repository's own code.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

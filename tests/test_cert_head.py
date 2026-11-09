@@ -1,5 +1,6 @@
 """CPU tests of adapter/cert_head.py (no GPU, no Triton): tables, the bound, the tile mask, the argmax argument over
-TP shards, full / non-finite modes, the engine routing with fake SGLang classes, and the A/B harness registry.
+TP shards, full / non-finite modes, the engine routing with fake SGLang classes, the A/B harness registry, and
+the X3b masked-mode row cap (DSV41_CERT_HEAD_MASK_MAX_M).
 
   uv run --no-project --with torch --with numpy python tests/test_cert_head.py
 """
@@ -461,6 +462,187 @@ def test_ab_registry():
     ab.configure({})
 
 
+def test_mask_cap_x3b():
+    """X3b (DSV41_CERT_HEAD_MASK_MAX_M): unset = the production decisions; set, a greedy step above the cap takes full
+    mode (the stock logits) and the greedy argmax / accept is unchanged at every M; the graphs are untouched."""
+    os.environ.pop("DSV41_CERT_HEAD_MASK_MAX_M", None)
+    importlib.reload(ch)
+    greedy = types.SimpleNamespace(is_all_greedy=True, has_custom_logit_processor=False, logit_bias=None,
+                                   grammar_mask=None, penalizer_orchestrator=None)
+    sampled = types.SimpleNamespace(**dict(vars(greedy), is_all_greedy=False))
+
+    def b(si, n=1):
+        return types.SimpleNamespace(return_logprob=False, has_grammar=False, sampling_info=si,
+                                     reqs=[object()] * n)
+
+    # flag unset: no cap; every decision equals the stock (rows-less) one, the config hash is the pre-X3b one
+    check(ch.mask_max_m() is None, "X3b off: no cap when unset")
+    same = all(ch.step_armed(None, b(si), rows) == ch.step_armed(None, b(si))
+               for si in (greedy, sampled) for rows in (None, 6, 30, 36, 48, 96, 128, 192))
+    check(same, "X3b off: step_armed identical to the stock decision at every row count")
+    import hashlib
+    e = {"DSV41_CERT_HEAD": "1", "DSV41_CERT_HEAD_M": "6,12,18,24,30,36,42,48"}
+    pre = "|".join(f"{k}={e.get(k, '')}" for k in ("DSV41_CERT_HEAD", "DSV41_CERT_HEAD_M", "DSV41_CERT_HEAD_GROUP",
+                                                    "DSV41_CERT_HEAD_TILE", "DSV41_CERT_HEAD_EXACT"))
+    pre_h = int.from_bytes(hashlib.sha256(pre.encode()).digest()[:7], "little")
+    check(ch.config_hash(e) == pre_h and ch.config_hash(dict(e, DSV41_CERT_HEAD_MASK_MAX_M="")) == pre_h,
+          "X3b off: config hash unchanged (rank handshake of production configs untouched)")
+    check(ch.config_hash(dict(e, DSV41_CERT_HEAD_MASK_MAX_M="30")) != pre_h,
+          "X3b on: the cap is in the rank handshake (ranks with different caps disable the head)")
+    check(ch.qualified_m() is ch.QUALIFIED_M, "X3b off: qualified row list is the process one")
+
+    # flag on: masked mode only up to the cap
+    os.environ["DSV41_CERT_HEAD_MASK_MAX_M"] = "30"
+    got = {M: ch.step_armed(None, b(greedy, M // 6), M) for M in (6, 12, 18, 24, 30, 36, 42, 48)}
+    check(all(got[M] == (True, ()) for M in (6, 12, 18, 24, 30)) and all(got[M] == (False, ()) for M in (36, 42, 48)),
+          "X3b on: greedy masked at M <= 30, full mode at M 36-48", str({M: g[0] for M, g in got.items()}))
+    check(all(not ch.step_armed(None, b(sampled), M)[0] for M in (6, 30, 36, 48)), "X3b on: sampled unchanged (full)")
+    check(ch.step_armed(None, b(greedy), None) == (True, ()), "X3b on: unknown row count keeps the stock decision")
+    check(ch.qualified_m() == ch.QUALIFIED_M, "X3b on: the qualified row list (the graphs) is unchanged")
+    os.environ["DSV41_CERT_HEAD_MASK_MAX_M"] = "0"
+    check(not ch.step_armed(None, b(greedy), 6)[0], "X3b cap 0: never masked")
+    os.environ["DSV41_CERT_HEAD_MASK_MAX_M"] = "thirty"
+    check(ch.mask_max_m() is None and ch.step_armed(None, b(greedy, 8), 48)[0], "X3b malformed cap: no cap (stock)")
+    for bad in ("-1", "x"):
+        try:
+            ch.parse_mask_cap(bad)
+            check(False, f"parse_mask_cap refuses {bad!r}")
+        except ValueError:
+            check(True, f"parse_mask_cap refuses {bad!r}")
+    check(ch.parse_mask_cap("500") == ch.MAX_M and ch.parse_mask_cap(" 30 ") == 30, "parse_mask_cap clamps / strips")
+
+    # the verify hook: rows from verify_ids_2d (bs x stride), else len(reqs) x verify_num_draft_tokens; the same
+    # decision on every rank (it reads only the batch and the env)
+    os.environ["DSV41_CERT_HEAD_MASK_MAX_M"] = "30"
+    flags_by_rank = []
+    for r in range(4):
+        importlib.reload(ch)
+        ch._rank = lambda r=r: r
+        mod = types.ModuleType("fake_verify")
+        seen = []
+
+        class TargetVerifyExecutor:
+            verify_epilogue = None
+            verify_num_draft_tokens = 6
+
+            def run_non_compact(self, *, batch, draft_input=None, verify_ids_2d=None, verify_window=None,
+                                sampling_info=None):
+                seen.append(ch._S["bufs"].flag_host)
+
+            def run_compact(self, **kw):
+                pass
+
+            def run_idle_participation(self, **kw):
+                pass
+
+        mod.TargetVerifyExecutor = TargetVerifyExecutor
+
+        class Flag:
+            def fill_(self, v):
+                pass
+
+        ch._S["bufs"] = types.SimpleNamespace(flag=Flag(), flag_host=0)
+        ch.install_verify(mod)
+        ex = TargetVerifyExecutor()
+        for bs in (1, 5, 6, 8, 5):
+            ex.run_non_compact(batch=b(greedy, bs), verify_ids_2d=torch.zeros(bs, 6, dtype=torch.int64))
+        ex.run_non_compact(batch=b(greedy, 6))           # no verify_ids_2d: len(reqs) x stride = 36
+        ex.run_non_compact(batch=b(greedy, 5))
+        flags_by_rank.append(tuple(seen))
+        capped = ch._S.get("capped_calls", 0)
+    check(flags_by_rank[0] == (1, 1, 0, 0, 1, 0, 1) and len(set(flags_by_rank)) == 1 and capped == 3,
+          "X3b hook: flag per step from the verify row count, identical on 4 ranks", str(flags_by_rank[0]))
+    os.environ.pop("DSV41_CERT_HEAD_MASK_MAX_M", None)
+    importlib.reload(ch)
+
+    # identical outputs: at M 36-48 the full mode is the stock logits, and its argmax (the in-graph greedy accept)
+    # equals the masked one over 4 TP shards, ties included
+    shards = [make_head(dup=((5, 700),)) for _ in range(4)]
+    shards[3][100] = shards[1][100]
+    states = [ch.build_tables(w) for w in shards]
+    Wfull = torch.cat(shards)
+    gamma = (torch.rand(K, generator=GEN) * 2.0 + 0.2)
+    n_bad = n_rows = 0
+    full_bytes = True
+    for kind in ("normlike", "peaked", "neartie"):
+        for M in (36, 42, 48):
+            x = acts(kind, M, Wfull, gamma)
+            x[0] = (Wfull[5].float() / Wfull[5].float().norm() * 40).to(torch.bfloat16)
+            stock = torch.cat([stock_logits(w, x) for w in shards], dim=1)
+            full, masked = [], []
+            for w, st in zip(shards, states):
+                hi, T, bad = ch.reference_bounds(st, x)
+                ex_l = stock_logits(w, x)
+                full.append(ch.reference_masked(ex_l, ch.reference_needed_tiles(hi, T, bad, full=True)))
+                masked.append(ch.reference_masked(ex_l, ch.reference_needed_tiles(hi, T, bad, full=False)))
+            full, masked = torch.cat(full, dim=1), torch.cat(masked, dim=1)
+            full_bytes &= torch.equal(full.view(torch.int16), stock.view(torch.int16))
+            a, f, m = stock.float().argmax(1), full.float().argmax(1), masked.float().argmax(1)
+            n_rows += M
+            n_bad += int((a != f).sum()) + int((a != m).sum())
+            n_bad += int((stock.float().gather(1, a[:, None]) != masked.float().gather(1, m[:, None])).sum())
+    check(full_bytes, "X3b outputs: full mode at M 36-48 = the stock logits byte for byte")
+    check(n_bad == 0, "X3b outputs: greedy argmax stock == full == masked at M 36-48 (4 shards)",
+          f"{n_rows} rows, violations {n_bad}")
+
+
+def test_ab_registry_x3b():
+    sys.path.insert(0, os.path.join(HERE, "..", "adapter"))
+    import ab_variant as ab
+    os.environ.pop("DSV41_CERT_HEAD_MASK_MAX_M", None)
+    importlib.reload(ch)
+    check("DSV41_CERT_HEAD_MASK_MAX_M" in ab.RUNTIME and "DSV41_CERT_HEAD_MASK_MAX_M" not in ab.UNION_BOOL,
+          "A/B X3b: the cap is a runtime (per step) key, never unioned")
+    env = {"DSV41_AB_VARIANTS": "2", "DSV41_CERT_HEAD": "1", "DSV41_AB_V1": "DSV41_CERT_HEAD_MASK_MAX_M=30"}
+    try:
+        ab.configure(env)
+        check("DSV41_CERT_HEAD_MASK_MAX_M" not in env, "A/B X3b: process env untouched by the cap")
+        check(ab.env_for(0, "DSV41_CERT_HEAD_MASK_MAX_M") is None and ab.env_for(1, "DSV41_CERT_HEAD_MASK_MAX_M") == "30",
+              "A/B X3b: per-variant value")
+        ab.set_runtime(0)
+        a0 = (ch.mask_max_m(), ch.step_armed(None, types.SimpleNamespace(return_logprob=False, has_grammar=False,
+                                                                         sampling_info=None, reqs=[]), 48)[0])
+        ab.set_runtime(1)
+        a1 = (ch.mask_max_m(), ch.step_armed(None, types.SimpleNamespace(return_logprob=False, has_grammar=False,
+                                                                         sampling_info=None, reqs=[]), 48)[0])
+        check(a0 == (None, True) and a1 == (30, False), "A/B X3b: the replayed variant's cap decides the step",
+              f"{a0} {a1}")
+        ab.set_runtime(0)
+    finally:
+        ab.configure({})
+    for v0, v1, aa in (("", "128", True), ("", "500", True), ("", "30", False), ("30", "36", False)):
+        env = {"DSV41_AB_VARIANTS": "2", "DSV41_AB_V0": f"DSV41_CERT_HEAD_MASK_MAX_M={v0}",
+               "DSV41_AB_V1": f"DSV41_CERT_HEAD_MASK_MAX_M={v1}"}
+        try:
+            ab.configure(env)
+            check(not aa, f"A/B X3b: cap {v0 or 'unset'} vs {v1} is not an A/A")
+        except RuntimeError:
+            check(aa, f"A/B X3b: cap {v0 or 'unset'} vs {v1} refused as A/A")
+        finally:
+            ab.configure({})
+    try:
+        ab.configure({"DSV41_AB_VARIANTS": "2", "DSV41_AB_V1": "DSV41_CERT_HEAD_MASK_MAX_M=-3"})
+        check(False, "A/B X3b: a negative cap refused at configure")
+    except RuntimeError:
+        check(True, "A/B X3b: a negative cap refused at configure")
+    finally:
+        ab.configure({})
+    # X3 arm of the same boot: a variant's qualified rows are a subset of the process list
+    env = {"DSV41_AB_VARIANTS": "2", "DSV41_CERT_HEAD": "1", "DSV41_CERT_HEAD_M": "6,12,18,24",
+           "DSV41_AB_V1": "DSV41_CERT_HEAD_M=6,12,30"}
+    try:
+        ab.configure(env)
+        ab.set_runtime(0)
+        q0 = ch.qualified_m()
+        with ab.capturing(1):
+            q1 = ch.qualified_m()
+        check(q0 == ch.QUALIFIED_M and q1 == frozenset({6, 12}),
+              "A/B X3: per-capture qualified rows, intersected with the process list", f"{sorted(q1)}")
+    finally:
+        ab.configure({})
+    check(ch.qualified_m() is ch.QUALIFIED_M, "A/B off again: the process list")
+
+
 def test_sitecustomize_compiles():
     import py_compile
     p = os.path.join(HERE, "..", "adapter", "sitecustomize.py")
@@ -481,6 +663,8 @@ if __name__ == "__main__":
     test_stop_rule()
     test_verify_hook()
     test_ab_registry()
+    test_mask_cap_x3b()
+    test_ab_registry_x3b()
     test_sitecustomize_compiles()
     print("ALL PASS" if not FAILS else f"FAILED: {FAILS}")
     sys.exit(1 if FAILS else 0)

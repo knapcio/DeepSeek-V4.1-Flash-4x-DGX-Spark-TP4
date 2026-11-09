@@ -145,7 +145,21 @@ jobs:
             tests/test_tokenizer_heap_trim2.py \
             tests/test_v41_tool_constraint.py \
             tests/test_nccl_2393.py \
-            scripts/nccl_receipt.py
+            scripts/nccl_receipt.py \
+            adapter/prefill_gemm_split.py \
+            adapter/prefill_keep_cache.py \
+            adapter/extend_nosync.py \
+            adapter/extend_sync_audit.py \
+            adapter/sampled_commit_reuse.py \
+            adapter/sampled_draft_probs_early.py \
+            tests/test_prefill_gemm_split.py \
+            tests/test_prefill_keep_cache.py \
+            tests/test_prefill_hooks.py \
+            tests/test_prefill_keep_cache_abort.py \
+            tests/test_extend_nosync.py \
+            tests/test_extend_sync_audit_stream.py \
+            tests/test_sampled_commit_reuse.py \
+            tests/test_sampled_draft_probs_early.py
           bash -n start.sh stop.sh scripts/fetch-sglang-canary.sh scripts/fetch-nccl.sh
       - name: Vendored detector identity
         run: |

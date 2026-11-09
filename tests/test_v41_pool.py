@@ -339,6 +339,22 @@ V41_SITE_BLOCKS = (
 )
 
 
+# v2.7.1's sitecustomize hooks (extend nosync, keep-cache, sampled commit reuse / early draft probabilities, the extend
+# sync audit; every one gated and off by default, their own tests in tests/test_*.py): stripped too
+V271_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
+    r"            # Gated on DSV41_EXTEND_NOSYNC=1 \(off by default\), FIRST:.*?install_extend_nosync_engram\(module\)\n",
+    r"            # Gated on DSV41_EXTEND_NOSYNC=1 \(off by default\): the extend's.*?install_extend_nosync_backend\(module\)\n",
+    r"            # Gated on DSV41_PREFILL_KEEP_CACHE=1 .*?install_keep_cache_forward_batch\(module\)\n",
+    r"            # Gated on DSV41_SAMPLED_COMMIT_REUSE: sampled steps.*?install_sampled_commit_reuse_dspark\(module\)\n",
+    r"            # Gated on DSV41_SAMPLED_COMMIT_REUSE: the epilogue copy.*?install_sampled_draft_probs_early_verify\(module\)\n",
+    r"            # Gated on DSV41_SAMPLED_DRAFT_PROBS_EARLY: sampled draft probabilities.*?"
+    r"install_sampled_draft_probs_early_draft\(module\)\n",
+    r"            # Gated on DSV41_SAMPLED_COMMIT_REUSE: terminal reuse receipts.*?"
+    r"install_sampled_draft_probs_early_scheduler\(module\)\n",
+    r"            # DSV41_PREFILL_KEEP_CACHE=1 \(or named by an armed in-boot A/B\).*?install_extend_sync_audit\(module\)\n",
+))
+
+
 class DefaultOff(unittest.TestCase):
     SITE = ROOT / "adapter" / "sitecustomize.py"
 
@@ -351,6 +367,9 @@ class DefaultOff(unittest.TestCase):
         self.assertEqual(n, 1, "trim2 block")
         s, n = T.PROMPT_TAIL_SITE_BLOCK.subn("", s)        # v2.6.6's prompt-tail hook
         self.assertEqual(n, 1, "prompt-tail block")
+        for rx in V271_SITE_BLOCKS:                         # v2.7.1's hooks
+            s, n = rx.subn("", s)
+            self.assertEqual(n, 1, rx.pattern[:60])
         self.assertEqual(hashlib.sha256(s.encode()).hexdigest(), T.SITE_F744D83_SHA)
 
     def test_finder(self):
@@ -392,9 +411,12 @@ class Profile(unittest.TestCase):
 
     def test_production_line(self):
         items = self._production_line().split('"')[1].split()
-        # v2.6.6's SWA prompt tail follows the v2.7 keys and trim2
-        self.assertEqual(items[-4:], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
-                                      "DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
+        # v2.6.6's SWA prompt tail follows the v2.7 keys and trim2; v2.7.1's seven new keys follow them
+        self.assertEqual(items[-11:-7], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
+                                         "DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
+        self.assertEqual(items[-7:], ["DSV41_PREFILL_GEMM_ROW_SPLIT=4096", "DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152",
+                                      "DSV41_L2_PREFETCH_WOA_MB=0", "DSV41_L2_PREFETCH_WOB_MB=6", "DSV41_EXTEND_NOSYNC=1",
+                                      "DSV41_SAMPLED_COMMIT_REUSE=1", "DSV41_SAMPLED_DRAFT_PROBS_EARLY=1"])
         for k in ("DSV41_KV_LAYOUT", "SGLANG_SM120_V41_PRECISION"):
             self.assertEqual(sum(x.split("=")[0] == k for x in items), 1, k)
         retired = ("DSV41_V41C_", "DSV41_SWA_NATIVE_DECODE", "DSV41_PREFILL_NATIVE_EXTRA", "DSV41_V41N_")

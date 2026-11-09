@@ -4,6 +4,59 @@ Every dated table, note and rejected experiment that used to live in the README,
 
 The rows from before the sparkDash 1.8.8 sections were taken with sparkDash up to 1.8.6. sparkDash 1.8.7 replaced the code prompts (c1 and the concurrent waves), so those code columns are not comparable with the 1.8.8 tables; the prose, structured and prefill prompts are unchanged. From v2.6 (2026-10-27) the README reports speedbench only.
 
+## v2.7 release, 2026-11-08, speedbench (the README's current results until v2.7.1)
+
+The README's v2.7 results and release gate, moved here (headings demoted, links adjusted, text unchanged) when v2.7.1 was released on 2026-11-09. The v2.7.1 numbers are in the [README](../README.md#current-results).
+
+**v2.7** (2026-11-08, in production on the four Sparks since 2026-11-08) is v2.6.5 plus FlashInfer 0.7.2 with DeepSeek-V4.1's own KV layouts (`DSV41_KV_LAYOUT=v41 SGLANG_SM120_V41_PRECISION=bf16`: the sliding-window cache in the 528-byte V4.1 layout as DeepSeek's reference stores it, the compressed caches in the 288-byte V4.1 FP4 layout, both read in place by FlashInfer's SM120 DSv4.1 kernels with exact on-chip dequantization), the SWA prompt-tail keep (`DSV41_SWA_PROMPT_TAIL_KEEP=1024`: a revisit of a document or chat with a new question reuses the shared prefix on its 2nd visit instead of its 3rd), NCCL 2.30.7 rebuilt with the NVIDIA/nccl #2393 AArch64 fence in the canary-roce image, and a launcher fix for `NCCL_OVERLAY_PIP=1` on a switched fabric. In its release gate against two v2.6.5 control boots: decode at parity (greedy c1 x1.004 / x1.005, c4 x0.997 / x0.999, c16 x0.999 / x0.995), draft acceptance x1.006-1.046, 2k / 6k revisits answered in 0.24 / 0.25 s instead of 0.53 / 1.14-1.16 s, a cold 1M prompt at x0.994 of the slower control; **cold prefill from 64K to ~400K context is ~1.7 % slower** (FlashInfer 0.7.2's BF16 sparse-MLA prefill kernel). It is a numerics change against v2.6.5 (the window keys' RoPE part is stored in FP8, as in the reference): T = 0 outputs differ on some prompts, KLD against v2.6.5 0.011 short / 0.006 long (limit 0.035), qeval unchanged (71 / 75). The KV pool is unchanged: 8,541,952 tokens at fraction 0.85, eight 1M-token contexts at once. The gate's verdict text was FAIL on one rule (reasoning length: v2.7 reasoned longer on the mean of 16 deterministic prompts, with identical answers), accepted on review; details in [CHANGELOG.md](../CHANGELOG.md).
+
+#### speedbench
+
+[speedbench](https://github.com/knapcio/speedbench) 0.3 (`6733653`), full mode: 73 frozen prompts in six categories (prompt set speedbench-v1), 256 output tokens, thinking off, run on the head. v2.7 release-gate boot (2026-11-08, KV pool pinned at 8,541,952 tokens as in the production profile), mean of two full runs per greedy cell and one run per sampled cell; c1 is the decode tok/s geometric mean over the prompts, c4 and c16 the aggregate tok/s:
+
+| tok/s | all 73 prompts, c1 | prose, c1 | c4 aggregate | c16 aggregate |
+|---|---:|---:|---:|---:|
+| greedy (temperature 0) | **89.9** | 66.0 | **132.1** | **208.1** |
+| sampled (temperature 0.7, top-p 0.95, seed 1) | 87.2 | 63.4 | 128.7 | – |
+
+The two v2.6.5 control boots of the same gate gave greedy c1 89.6 / 89.5, c4 132.5 / 132.2, c16 208.4 / 209.1 and sampled c1 86.8 / 87.3 tok/s. Speedbench load at c16 gave 216.6 aggregate tok/s, median TTFT 542 ms (controls 210.9 / 214.9 tok/s, 545 / 537 ms).
+
+Per category, greedy c1 (same boots, mean of two full runs):
+
+| tok/s | prose | code | structured | agentic | multilingual | long context | all 73 prompts |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| v2.7 | **66.0** | 108.8 | 110.2 | 106.7 | 72.1 | 91.8 | **89.9** |
+| v2.6.5 (two control boots) | 65.9 / 66.0 | 112.6 / 112.7 | 107.3 / 107.4 | 103.1 / 104.2 | 70.6 / 70.6 | 93.3 / 90.6 | 89.6 / 89.5 |
+
+v2.7 runs: all 89.40 / 90.43, prose 65.46 / 66.47, code 108.21 / 109.44, structured 109.53 / 110.77, agentic 106.15 / 107.17, multilingual 71.49 / 72.63, long context 91.71 / 91.98. Median time to first token 204.4 / 209.1 ms; 73 of 73 prompts valid in both runs, none failed. The numerics change alters the greedy text and with it the draft acceptance per prompt, so categories move against v2.6.5 in both directions (code -3.4 %, structured / agentic / multilingual +2 to +3 %) while the all-prompt geomean and prose stay equal. Long context varies most from run to run.
+
+**Under load** (v2.6, one fresh boot of the v2.6 image and profile, the last full load sweep; speedbench load: closed loop, 90 s per level, 256 output tokens, thinking off)
+
+| concurrency | block tok/s | per stream, median tok/s | TTFT, median |
+|---|---:|---:|---:|
+| c1 | 77.3 | 83.3 | 207 ms |
+| c4 | 131.7 | 38.7 | 310 ms |
+| c16 | **211.0** | 16.0 | 539 ms |
+
+Block tok/s is all completion tokens over the wall time of the level, including request start and prefill, so the c1 value sits below the decode geomean above. The v2.7 release gate ran load at c16 only: 216.6 aggregate tok/s, median TTFT 542 ms, per-stream median 16.6 tok/s.
+
+**Prefill, cold** (v2.7 release gate, the gate's own probes, not speedbench: 64K and 1M are the median of three flushed prompts; 388K is the first token of a cold 388,000-token prompt, median of three)
+
+| tok/s | 64K | 388K | 1M (968K tokens) |
+|---|---:|---:|---:|
+| v2.7 | 6,026 | 5,917 (65.6 s) | 5,151 |
+| v2.6.5 (two control boots) | 6,145 / 6,165 | 6,023 / 6,062 (64.4 / 64.0 s) | 5,180 / 5,312 |
+
+The steady-state screen before the gate put v2.7 at x0.983 of the slower v2.6.5 control at both 64K and 388K (every 40K-token stretch of the 388K prompt between x0.982 and x0.987) and located the difference in FlashInfer 0.7.2's BF16 sparse-MLA prefill kernel. In the kernel screens that kernel is faster than v2.6.5's attention from ~380K context on, so a cold 1M prompt is close to parity.
+
+The official checkpoint ([`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) `1bae0e1`, the default weights profile in `.env.tp4.example`) was last measured in the v2.6.2 release gate (2026-10-29, same speedbench protocol, KV pool pinned at 4,194,304 tokens): full c1 all-prompt geomean 88.4, c4 130.7 and c16 207.6 aggregate tok/s, cold prefill 64K 6,054 and 1M 5,310 tok/s. v2.6.3 to v2.7 moved greedy all-prompt decode speed by about 1 % or less in their release gates on the abliterated checkpoint; the official checkpoint has not been re-measured since. The abliterated edit touches only `attn.wo_b` and `shared_experts.w2` of the main layers (the DSpark draft layers are identical), so the two run within a few percent of each other.
+
+#### v2.7 release gate
+
+v2.6.5 / v2.7 / v2.6.5, three fresh boots in that order on the same four Sparks, abliterated 1017 `517efab`, GPU clock capped at 2200 MHz, 2026-11-08 (run `run-20261108-010847-479202`, 334 min including the restore of production). The controls are production v2.6.5 as it serves; the v2.7 boot ran this release's production profile; KV pool 8,541,952 tokens on all three. Every speed, prefill, memory, qeval, idle and latency rule passed, 0 safety, 0 invalid. Speedbench full: the numbers above; draft acceptance (accepted tokens per verify step) x1.006 on qeval and x1.020-1.046 on speedbench c1 / c4 / c16 against the lower control. Cold prefill 64K x0.981 / x0.977 and 1M x0.994 / x0.970 of the two controls (the gate's bound for this release: x0.97). qeval 71 / 71 / 71 with the same four failed tasks on every boot; at T = 0 the v2.7 text differs from the controls' on 26 of the 74 prompts on which the controls agree, as expected from the numerics change. KLD against v2.6.5: short 0.0111, long 0.0064 (control vs control 0.0061 / 0.0026; limit 0.035); T = 1 distribution check PASS (12,000 samples); needles at 256K (41.4 s) and 1M (969,022 tokens, 187.9 s) found. Revisits with a new question: 2k cached 2,048 tokens (first token 0.244 s; controls 0 cached, 0.537 / 0.534 s), 6k 6,144 tokens (0.247 s; controls 0, 1.135 / 1.157 s). An evicted 302,048-token resume point replayed one 8,192-token chunk on every boot (first token 2.19 / 2.22 / 2.21 s), and the v2.7 output (16 greedy tokens) equals both controls'. Head MemAvailable low-water over the boot 6.47 / 8.73 / 6.95 GiB, NVRM out-of-memory lines 12 / 0 / 13; soak ([issue #16](issue-16-swa-crash.md) reproduction plus a c2 companion load) 321 / 317 / 320 requests with 0 failures. A deliberately cold boot of v2.7 with no tuning caches, before the gate, was ready in 242 s with no Xid or fault line on any node (the boot fault fixed in this release, see [CHANGELOG.md](../CHANGELOG.md)).
+
+The verdict text was **FAIL on one rule, reasoning length**: the mean and median completion tokens and the mean reasoning characters of 16 thinking-on T = 0 reasoning prompts must stay within ±3 % of the controls (a guard against less thinking). v2.7 reasoned longer: mean 139.4 against 133.4 tokens (+4.5 %), median 124.5 against 103.5, reasoning characters 514 against 454; per prompt it was longer on 6, shorter on 9 and equal on 1, and one prompt (+337 tokens) carries the mean. The two controls are byte-identical, so the band had no control noise to compare against. All 16 answers are correct and identical on the three boots. Accepted on review as release-equivalent: the direction is more reasoning, not less.
+
 ## v2.6.5 release, 2026-11-07, speedbench (the README's current results until v2.7)
 
 The README's v2.6.5 results, its note on the v2.6.6 candidate and the v2.6 correctness checks, moved here (links adjusted, text unchanged) when v2.7 was released on 2026-11-08 (v2.6.6 was not released on its own; its changes shipped in v2.7). The v2.7 numbers are in the [README](../README.md#current-results) and its release gate in [CHANGELOG.md](../CHANGELOG.md).

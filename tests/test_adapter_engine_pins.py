@@ -20,7 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 # Pins that only the off-by-default stages check at install; DSV41_WO_A_INPUT_FP8 (off by default) checks
 # the wo_a dispatch it wraps and its install order against wo_a_w8's mid/drop wrapper.
-EXTRA_FLAGS = {"DSV41_PREFILL_SP_FP8_MOE": "1", "DSV41_WO_A_INPUT_FP8": "1"}
+# DSV41_EXTEND_NOSYNC (off by default) pins the backend tail-metadata source it edits.
+EXTRA_FLAGS = {"DSV41_PREFILL_SP_FP8_MOE": "1", "DSV41_WO_A_INPUT_FP8": "1", "DSV41_EXTEND_NOSYNC": "1"}
 
 PROBE = """
 import sglang.srt.models.deepseek_v4 as v4

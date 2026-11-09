@@ -44,13 +44,25 @@ Modes
                               (and every logit in full mode). Counters are logged every DSV41_CERT_HEAD_LOG_EVERY
                               verify steps (one host sync then).
   DSV41_CERT_HEAD_M=6,12      qualified verify row counts (from gpu_test_cert_ds.py); empty = stock everywhere
+  DSV41_CERT_HEAD_MASK_MAX_M=30   X3b: masked mode only for verify steps of at most this many rows; a greedy step
+                              above it runs full mode (every tile exact, the stock logits). Unset = no cap (the
+                              production behaviour). The graphs are the same; only the host-set flag differs.
   DSV41_CERT_HEAD_GROUP=128   residual-norm group width
   DSV41_CERT_HEAD_TILE=64,128,4,3        screen BN,BK,warps,stages (BM = next pow2 >= M, >= 16)
   DSV41_CERT_HEAD_EXACT=16,128,4,3       exact kernel BV,BK,warps,stages (BMX = next pow2 >= M, >= 16)
   DSV41_CERT_HEAD_LOG_EVERY=2000
 In-boot A/B (adapter/ab_variant.py): DSV41_CERT_HEAD is a union gate (tables are built when any variant enables
 it) and is read per capture through ab_variant.env(), so each variant's verify graphs contain the certified head or
-the stock matmul.
+the stock matmul. DSV41_CERT_HEAD_MASK_MAX_M is read per verify step (host side, the replayed variant).
+DSV41_CERT_HEAD_M is read per capture too (qualified_m(), TEST ONLY): a variant may qualify a subset of the process
+list (the others take the stock matmul); the process value still gates the table build and the rank handshake.
+
+X3b (DSV41_CERT_HEAD_MASK_MAX_M). The certified head's masked mode is slower than stock from M 36 (K4c, Tier-1
+2026-11-08: 1935 vs 1636 us at M 48), its full mode faster (1528 us). Above the cap, step_armed returns (False, ()):
+the step takes full mode, the exact stock logits (bit-identical where qualified), whose greedy argmax is the stock
+one; sampled / logprob / grammar steps were never armed. The row count is the verify forward's (verify_ids_2d: bs x
+stride); SGLang captures every speculative decode bs 1..8, so it equals the replayed graph's M wherever the head is
+qualified (M <= 48). Nothing the draft confidence or the verify policy reads changes (they read the draft's state).
 All DSV41_CERT_HEAD* values must be identical on every rank (a config hash is MAX-all-reduced at build; any
 difference or a failed build disables the feature on every rank).
 """
@@ -73,6 +85,8 @@ MAX_M = 128
 NSTOP = 64        # stop-id slots (min_new_tokens masks); a batch with more distinct stop ids takes full mode
 CONFIG_KEYS = ("DSV41_CERT_HEAD", "DSV41_CERT_HEAD_M", "DSV41_CERT_HEAD_GROUP", "DSV41_CERT_HEAD_TILE",
                "DSV41_CERT_HEAD_EXACT")
+# hashed only when set, so the hash (and the handshake) of a config without it is unchanged
+OPTIONAL_CONFIG_KEYS = ("DSV41_CERT_HEAD_MASK_MAX_M",)
 
 # certificate constants (identical to cert_math.py of the GLM-5.3 TP4 recipe)
 INFL_Q = 1.0 + 2.0 ** -18
@@ -119,6 +133,59 @@ def parse_m(spec: str) -> frozenset:
 
 
 QUALIFIED_M = parse_m(os.environ.get("DSV41_CERT_HEAD_M", ""))
+_QM: dict = {}
+_CAP: dict = {}
+
+
+def qualified_m() -> frozenset:
+    """The qualified verify row counts for the variant being captured / replayed: QUALIFIED_M itself unless the
+    in-boot A/B harness is armed; then that variant's DSV41_CERT_HEAD_M intersected with QUALIFIED_M (a variant can
+    only drop row counts, never qualify one the process did not). Parsed once per distinct spec."""
+    if _ab is None or not getattr(_ab, "ACTIVE", False):
+        return QUALIFIED_M
+    spec = env("DSV41_CERT_HEAD_M", "")
+    got = _QM.get(spec)
+    if got is None:
+        got = _QM[spec] = parse_m(spec) & QUALIFIED_M
+    return got
+
+
+def parse_mask_cap(spec):
+    """DSV41_CERT_HEAD_MASK_MAX_M -> the row cap of the masked mode; '' = None (no cap, the production code path).
+    Values above MAX_M are MAX_M (no larger M is ever qualified)."""
+    raw = str(spec or "").strip()
+    if not raw:
+        return None
+    try:
+        v = int(raw)
+    except ValueError:
+        raise ValueError(f"DSV41_CERT_HEAD_MASK_MAX_M={spec!r}: expected an integer row count") from None
+    if v < 0:
+        raise ValueError(f"DSV41_CERT_HEAD_MASK_MAX_M={spec!r}: must be >= 0")
+    return min(v, MAX_M)
+
+
+def mask_max_m():
+    """The masked-mode row cap of the variant being replayed, None = no cap (per verify step, host side; parsed once
+    per spec). A malformed value takes no cap (the production behaviour), logged once; ab_variant refuses it at boot."""
+    spec = env("DSV41_CERT_HEAD_MASK_MAX_M", "") or ""
+    if spec in _CAP:
+        return _CAP[spec]
+    try:
+        got = parse_mask_cap(spec)
+    except ValueError as e:
+        _log(f"{e}; no cap")
+        got = None
+    _CAP[spec] = got
+    return got
+
+
+def mask_capped(rows) -> bool:
+    """X3b: True when this verify step must take full mode because of DSV41_CERT_HEAD_MASK_MAX_M."""
+    if rows is None:
+        return False
+    cap = mask_max_m()
+    return cap is not None and rows > cap
 
 
 def c_acc(K: int) -> float:
@@ -128,7 +195,8 @@ def c_acc(K: int) -> float:
 
 def config_hash(environ=None) -> int:
     environ = os.environ if environ is None else environ
-    s = "|".join(f"{k}={environ.get(k, '')}" for k in CONFIG_KEYS)
+    keys = CONFIG_KEYS + tuple(k for k in OPTIONAL_CONFIG_KEYS if environ.get(k, "") != "")
+    s = "|".join(f"{k}={environ.get(k, '')}" for k in keys)
     return int.from_bytes(hashlib.sha256(s.encode()).digest()[:7], "little")
 
 
@@ -612,7 +680,7 @@ def install_logits(lp_module):
         st = _S["st"]
         md = mode()
         M = int(hidden_states.shape[0])
-        if (not ctx["on"] or embedding_bias is not None or md == "0" or M not in QUALIFIED_M
+        if (not ctx["on"] or embedding_bias is not None or md == "0" or M not in qualified_m()
                 or hidden_states.dim() != 2 or lm_head.weight is not st.lm_head.weight):
             return orig_head(self, hidden_states, lm_head, embedding_bias)
         key = (md, M)
@@ -661,12 +729,27 @@ def _req_stop_ids(req):
     return got
 
 
-def step_armed(executor, batch):
+def verify_rows(executor, batch, verify_ids_2d=None):
+    """Rows of the target-verify forward (bs x stride), from host metadata only (no sync); None if unknown."""
+    shape = getattr(verify_ids_2d, "shape", None)
+    if shape is not None and len(shape) == 2:
+        return int(shape[0]) * int(shape[1])
+    w, reqs = getattr(executor, "verify_num_draft_tokens", None), getattr(batch, "reqs", None)
+    if w is None or reqs is None:
+        return None
+    return len(reqs) * int(w)
+
+
+def step_armed(executor, batch, rows=None):
     """-> (armed, stop ids). Certified (masked) logits are safe when every consumer of the verify logits is the
     greedy argmax: all rows greedy, no logprobs, no grammar, no custom logit processor, no logit bias, and no
     penalizer other than min_new_tokens (its -inf stop ids are handled by the stop-id rule of the screen).
+    rows (X3b): the verify forward's row count; above DSV41_CERT_HEAD_MASK_MAX_M the step is not armed (full mode,
+    the stock logits) because the masked mode is the slower one there. None = no cap check.
     Everything read here is per-batch scheduler state, identical on every TP rank."""
     del executor
+    if mask_capped(rows):
+        return False, ()
     if getattr(batch, "return_logprob", False) or getattr(batch, "has_grammar", False):
         return False, ()
     si = getattr(batch, "sampling_info", None)
@@ -706,7 +789,8 @@ def _log_stats():
         return
     c = [int(v) for v in bufs.counters.tolist()]
     need = int(bufs.need.item())
-    msg = (f"rank {_rank()} verify steps {_S['verify_calls']} (armed {_S.get('armed_calls', 0)}), tiles computed "
+    msg = (f"rank {_rank()} verify steps {_S['verify_calls']} (armed {_S.get('armed_calls', 0)}, mask-capped "
+           f"{_S.get('capped_calls', 0)}), tiles computed "
            f"{need} (all-tile steps = {bufs.need_per_full or '?'} each)")
     if c[0]:
         msg += (f"; check: steps {c[0]} (certified {c[1]}), argmax mismatches {c[2]}, value mismatches {c[3]}, "
@@ -726,12 +810,15 @@ def install_verify(verify_module):
     orig_nc, orig_c, orig_idle = ex.run_non_compact, ex.run_compact, ex.run_idle_participation
 
     def run_non_compact(self, *, batch, **kw):
-        armed, stops = step_armed(self, batch)
+        rows = verify_rows(self, batch, kw.get("verify_ids_2d"))
+        armed, stops = step_armed(self, batch, rows)
         if armed and stops:
             set_stop(stops)       # a superset left from earlier steps is harmless (those ids are simply computed)
         set_flag(armed)
         _S["verify_calls"] += 1
         _S["armed_calls"] = _S.get("armed_calls", 0) + int(armed)
+        if mask_capped(rows):
+            _S["capped_calls"] = _S.get("capped_calls", 0) + 1
         if LOG_EVERY and _S["verify_calls"] % LOG_EVERY == 0:
             _log_stats()
         return orig_nc(self, batch=batch, **kw)
