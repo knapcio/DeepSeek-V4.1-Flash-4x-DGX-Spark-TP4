@@ -114,6 +114,13 @@ def _run_steps(env, steps):
     class ModelRunner:
         def forward(self, fb):
             high[0] = max(high[0], alloc.reserved - RESIDENT)
+            if not fb.forward_mode.is_extend_without_speculative():
+                # a decode / verify step of 11 streams: its own eager transients, freed at the end
+                live = [alloc.malloc(n) for n in (96 * MIB, 40 * MIB, 3 * MIB, 600 * 1024)]
+                high[0] = max(high[0], alloc.reserved - RESIDENT)
+                for h in live:
+                    alloc.release(h)
+                return "out"
             chunk = model.CHUNK
             model.CHUNK = int(sum(fb.extend_seq_lens_cpu))
             try:
@@ -131,9 +138,10 @@ def _run_steps(env, steps):
     try:
         for label, ids, seqs, finals, extends in steps:
             high[0] = 0
+            is_prefill = ids is not None
             runner.forward(types.SimpleNamespace(
-                forward_mode=types.SimpleNamespace(is_extend_without_speculative=lambda: True),
-                seq_lens_cpu=torch.tensor(seqs), dsv41_final_lens=list(finals), dsv41_rids=list(ids),
+                forward_mode=types.SimpleNamespace(is_extend_without_speculative=lambda p=is_prefill: p),
+                seq_lens_cpu=torch.tensor(seqs), dsv41_final_lens=list(finals), dsv41_rids=list(ids) if ids else None,
                 extend_seq_lens_cpu=list(extends)))
             out[label] = max(out.get(label, 0), high[0])
     finally:
@@ -175,6 +183,22 @@ def test_mixed_batch_in_split_regime_is_not_padded_to_the_largest_final():
     stock = _run_steps({}, steps)
     keep = _run_steps({"DSV41_PREFILL_KEEP_CACHE": "1"}, steps)
     assert keep["mixed"] <= stock["mixed"] + 16 * MIB, (stock["mixed"] / GIB, keep["mixed"] / GIB)
+
+
+def test_decode_between_chunks_never_holds_the_prefill_peak():
+    """Fleet stall-11 (run-20261109-011349): 131K prefill with decode steps between its chunks; keep held the peak
+    through the decode windows (-0.45 GiB head low-water, 6 trips). Now the first decode step releases the cache and
+    the rest of that prompt runs as today: every step's high-water within 16 MiB of stock's."""
+    final = 136072
+    steps = []
+    for st in _prompt_steps("p", "p", final):
+        steps.append(st)
+        if st[2][0] < final:
+            steps += [("decode", None, [1], [1], [1])] * 3
+    stock = _run_steps({}, steps)
+    keep = _run_steps({"DSV41_PREFILL_KEEP_CACHE": "1"}, steps)
+    for label in ("p", "decode"):
+        assert keep[label] <= stock[label] + 16 * MIB, (label, stock[label] / GIB, keep[label] / GIB)
 
 
 def test_more_rows_mid_prompt_empties_before_the_wider_chunk():
