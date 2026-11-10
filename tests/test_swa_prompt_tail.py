@@ -143,11 +143,13 @@ class Wiring(unittest.TestCase):
         prod = lines[i - 1]
         self.assertTrue(prod.startswith('#EXTRA_CONTAINER_ENV="'), prod[:60])
         items = prod.split('"')[1].split()
-        # v2.7.1: the seven new keys follow it; v2.7.2: the CED skip comes last
-        self.assertEqual(items[-9], "DSV41_SWA_PROMPT_TAIL_KEEP=1024")
+        # v2.7.1: the seven new keys follow it; v2.7.2: the CED skip; v2.7.3: stage 2b, the GEMM tactic and the W2 /
+        # evict-first decode keys come last
+        self.assertEqual(items[-13], "DSV41_SWA_PROMPT_TAIL_KEEP=1024")
         self.assertTrue(all(x.startswith(("DSV41_PREFILL_GEMM_ROW_SPLIT", "DSV41_L2_PREFETCH_WO", "DSV41_EXTEND_NOSYNC",
-                                          "DSV41_SAMPLED_")) for x in items[-8:-1]), items[-8:-1])
-        self.assertEqual(items[-1], "DSV41_PREFILL_CED_SKIP=1")
+                                          "DSV41_SAMPLED_")) for x in items[-12:-5]), items[-12:-5])
+        self.assertEqual(items[-5:], ["DSV41_PREFILL_CED_SKIP=1", "DSV41_PREFILL_SP_FP8_MOE=1", "DSV41_PREFILL_GEMM_TACTIC=1",
+                                      "DSV41_L2_PREFETCH_WOB2_MB=10", "DSV41_WO_A_W8_EVICT_FIRST=1"])
         self.assertEqual(sum(x.startswith("DSV41_SWA_PROMPT_TAIL") for x in items), 1)
         on = [line for line in lines if "DSV41_SWA_PROMPT_TAIL" in line and not line.startswith("# ")]
         self.assertEqual(on, [prod])

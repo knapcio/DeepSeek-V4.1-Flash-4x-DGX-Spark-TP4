@@ -68,7 +68,11 @@ UNION_BOOL = ("DSV41_L2_PREFETCH", "DSV41_L2_PREFETCH_WOA", "DSV41_L2_PREFETCH_D
               "DSV41_SAMPLED_COMMIT_REUSE",
               # adapter/sampled_draft_probs_early.py: hooks installed when any variant enables it; off / on / check
               # read per call (eager only)
-              "DSV41_SAMPLED_DRAFT_PROBS_EARLY")
+              "DSV41_SAMPLED_DRAFT_PROBS_EARLY",
+              # adapter/prefill_sp.py stage 2b: engine pins, modules and b12x_next's pre-quantized front-end
+              # (moe_b12x_next.PREQUANT_WARM) installed when any variant enables it; the MXFP8 MoE-input gather
+              # read per call (eager prefill only; the per-size bitwise self-check state is shared by the variants)
+              "DSV41_PREFILL_SP_FP8_MOE")
 UNION_PARTS = {"DSV41_FUSE_QUANT": ("qnorm", "wo_a", "hcpad"),
                # adapter/spec_sync_free.py: per-step rank-0 broadcasts kept / dropped per variant
                "DSV41_SPEC_SYNC_FREE": ("draft", "accept", "vcap", "merge"),
@@ -80,6 +84,10 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # l2_prefetch v4 (plan-time, per variant)
            "DSV41_L2_PREFETCH_SKIP_N", "DSV41_L2_PREFETCH_WOB_MB", "DSV41_L2_PREFETCH_MOE",
            "DSV41_L2_PREFETCH_MOE_MB",
+           # l2_prefetch v6 (plan-time, per variant): the W2 wo_b window at the wo_a call
+           "DSV41_L2_PREFETCH_WOB2_MB",
+           # adapter/wo_a_w8.py: evict-first L2 policy on the twin loads, read per call (per capture)
+           "DSV41_WO_A_W8_EVICT_FIRST",
            # adapter/roce_twoshot.py: two-shot all-reduce row threshold (0 = one-shot), per capture
            "DSV41_ROCE_TWOSHOT_ROWS",
            # adapter/indexer_chunked_v3.py: eager prefill indexer slot ids without host syncs
@@ -95,15 +103,18 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # and the qualified row counts, read per capture (a subset of the process list; X3 arm, TEST ONLY)
            "DSV41_CERT_HEAD_MASK_MAX_M", "DSV41_CERT_HEAD_M",
            # adapter/prefill_ced_skip.py: non-final prefill chunks run the late layers on one row (eager, per call)
-           "DSV41_PREFILL_CED_SKIP")
+           "DSV41_PREFILL_CED_SKIP",
+           # adapter/prefill_gemm_tactic.py: boot-checked prefill shapes on CUTLASS tactic 5 (eager prefill, per call)
+           "DSV41_PREFILL_GEMM_TACTIC")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
-                "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0}
-HASHED_SOURCES = ("ab_variant", "l2_prefetch", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
+                "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0,
+                "DSV41_L2_PREFETCH_WOB2_MB": 0.0}
+HASHED_SOURCES = ("ab_variant", "l2_prefetch", "wo_a_w8", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
                   "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
                   "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early",
-                  "prefill_ced_skip")
+                  "prefill_ced_skip", "prefill_gemm_tactic", "prefill_sp", "moe_b12x_next")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")

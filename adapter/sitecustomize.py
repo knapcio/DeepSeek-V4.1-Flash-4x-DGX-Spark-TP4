@@ -51,6 +51,13 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.model_executor.model_runner':
             from prefill_empty_cache import install
             install(module)
+            # Gated on DSV41_PREFILL_GEMM_TACTIC (off by default): the per-shape bit-identity boot check of the prefill
+            # dense GEMM tactic, after the target model is loaded (adapter/prefill_gemm_tactic.py).
+            try:
+                import prefill_gemm_tactic
+                prefill_gemm_tactic.install_model_runner(module)
+            except Exception as exc:
+                print(f'DSV41_PREFILL_GEMM_TACTIC boot check not installed: {exc!r}', flush=True)
             # TEST ONLY, gated before the import: eager forward host / GPU timing (adapter/moe_launch_prepared.py)
             if os.environ.get('DSV41_MOE_LAUNCH_TIMING', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
                 from moe_launch_prepared import install_forward_timing

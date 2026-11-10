@@ -84,6 +84,24 @@ FP8 = os.environ.get("DSV41_PREFILL_SP_FP8", "0").strip().lower() in ("1", "on",
 # gathered bf16 rows, and the MoE output bit for bit (needs DSV41_MOE_B12X_NEXT_DETERMINISTIC=1);
 # the ranks agree (MIN) and any difference keeps the bf16 gather for that size.
 FP8_MOE = os.environ.get("DSV41_PREFILL_SP_FP8_MOE", "0").strip().lower() in ("1", "on", "true")
+# In-boot A/B (adapter/ab_variant.py, TEST ONLY): DSV41_PREFILL_SP_FP8_MOE is a union gate there, so FP8_MOE above
+# (install: engine pins, modules, b12x_next's pre-quantized warm-up) is on when any variant enables it, and
+# fp8_moe_on() reads the replayed variant's value per MoE call. Without the harness fp8_moe_on() == FP8_MOE.
+try:
+    import ab_variant as _ab
+except ImportError:  # CPU tests without the adapter dir
+    _ab = None
+
+
+def fp8_moe_on():
+    """Per call (eager prefill): stage 2b for this MoE call."""
+    if not FP8_MOE:
+        return False
+    if _ab is not None and getattr(_ab, "ACTIVE", False) and "DSV41_PREFILL_SP_FP8_MOE" in getattr(_ab, "KNOWN", ()):
+        return str(_ab.env("DSV41_PREFILL_SP_FP8_MOE", "0") or "0").strip().lower() in ("1", "on", "true")
+    return True
+
+
 # Debug (never in production): DSV41_PREFILL_SP_DEBUG=compare,fp (either or both).
 #   fp       per traced prefill chunk, rank 0 logs the chunk layout and a checksum of every
 #            layer's input / attention in+out / MoE in+out / output residual and pre, over the full
@@ -888,6 +906,12 @@ _MOE8 = {}                      # M -> {"ok", "router", "sf_shape", "sf_dtype"} 
 _MOE8_CLS = []
 _MOE8_LOG = set()
 _MOE8_DANGER = [0]              # layer calls that fell back because of a tiny-block row
+# Per-call receipt (every rank): sharded MoE calls with stage 2b on for the call, on the MXFP8 input ("mxfp8") or back
+# on the bf16 gather ("bf16": a size whose self-check said OFF, a tiny-block row, no pre-quantized plan). Each rank logs
+# `DSV41_PREFILL_SP fp8 MoE calls rank <r>: mxfp8 <n> bf16 <m> danger <d>` at its first call and every
+# MOE8_RECEIPT_EVERY calls after it (a 131K prompt makes ~320 such calls per rank).
+_MOE8_CALLS = {"mxfp8": 0, "bf16": 0}
+MOE8_RECEIPT_EVERY = 256
 
 
 def _mbn():
@@ -1100,6 +1124,14 @@ def _moe8_call(moe, p, orig, args, kwargs, xf, topk_out, pre):
     return out
 
 
+def _moe8_count(p, used):
+    _MOE8_CALLS["mxfp8" if used else "bf16"] += 1
+    n = _MOE8_CALLS["mxfp8"] + _MOE8_CALLS["bf16"]
+    if n == 1 or n % MOE8_RECEIPT_EVERY == 0:
+        print(f"DSV41_PREFILL_SP fp8 MoE calls rank {p.rank}: mxfp8 {_MOE8_CALLS['mxfp8']} bf16 {_MOE8_CALLS['bf16']} "
+              f"danger {_MOE8_DANGER[0]}", flush=True)
+
+
 def _moe8_log(key, msg):
     if key not in _MOE8_LOG and len(_MOE8_LOG) < 16:
         _MOE8_LOG.add(key)
@@ -1261,6 +1293,10 @@ def _moe8_first(moe, p, x, orig, args, kwargs, a, tgt):
     if p.rank == 0:
         print(f"DSV41_PREFILL_SP fp8 MoE input (M={p.rows}): router on the {router or 'none'}, "
               f"rank 0 {detail} -> {'ON' if ok else 'OFF (bf16 gather for this size)'}", flush=True)
+    else:
+        # every rank's own self-check result (the agreed verdict above is the MIN over the TP group)
+        print(f"DSV41_PREFILL_SP fp8 MoE input (M={p.rows}) rank {p.rank}: local {bool(local)} {detail} -> agreed "
+              f"{'ON' if ok else 'OFF'}", flush=True)
     if _ctx.dbg is not None:
         _rec("min", xb, True)
     del xb
@@ -1357,8 +1393,10 @@ def _make_moe_forward(orig):
             _rec("mout", o, True)
             return o
         v4 = _M["v4"]
-        if p.sharded and FP8_MOE:
+        if p.sharded and fp8_moe_on():
             o8 = _moe8_forward(self, p, hidden_states, orig, args, kwargs)
+            # the first call of a size returns the stock output when its self-check said OFF
+            _moe8_count(p, o8 is not None and bool(_MOE8.get(p.rows, {}).get("ok")))
             if o8 is not None:
                 if o8.shape[0] != p.rows:
                     raise RuntimeError(f"DSV41_PREFILL_SP: MoE returned {tuple(o8.shape)} for {p.rows} rows")

@@ -359,6 +359,10 @@ V272_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
     r"            # Gated on DSV41_PREFILL_CED_SKIP=1 \(or an armed in-boot A/B naming it.*?install_ced_backend\(module\)\n",
     r"            # DSV41_PREFILL_CED_SKIP: final prompt lengths by rid.*?install_ced_forward_batch\(module\)\n",
 ))
+# v2.7.3: the DSV41_PREFILL_GEMM_TACTIC boot-check hook (gated, off by default; tests/test_prefill_gemm_tactic.py)
+V273_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
+    r"            # Gated on DSV41_PREFILL_GEMM_TACTIC \(off by default\).*?boot check not installed: \{exc!r\}', flush=True\)\n",
+))
 
 
 class DefaultOff(unittest.TestCase):
@@ -373,7 +377,7 @@ class DefaultOff(unittest.TestCase):
         self.assertEqual(n, 1, "trim2 block")
         s, n = T.PROMPT_TAIL_SITE_BLOCK.subn("", s)        # v2.6.6's prompt-tail hook
         self.assertEqual(n, 1, "prompt-tail block")
-        for rx in V271_SITE_BLOCKS + V272_SITE_BLOCKS:      # v2.7.1's and v2.7.2's hooks
+        for rx in V271_SITE_BLOCKS + V272_SITE_BLOCKS + V273_SITE_BLOCKS:   # v2.7.1, v2.7.2 and v2.7.3 hooks
             s, n = rx.subn("", s)
             self.assertEqual(n, 1, rx.pattern[:60])
         self.assertEqual(hashlib.sha256(s.encode()).hexdigest(), T.SITE_F744D83_SHA)
@@ -417,13 +421,14 @@ class Profile(unittest.TestCase):
 
     def test_production_line(self):
         items = self._production_line().split('"')[1].split()
-        # v2.6.6's SWA prompt tail follows the v2.7 keys and trim2; v2.7.1's seven new keys follow them, v2.7.2's CED
-        # skip comes last
-        self.assertEqual(items[-12:-8], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
+        # v2.6.6's SWA prompt tail follows the v2.7 keys and trim2; v2.7.1's seven new keys follow them, then v2.7.2's CED
+        # skip, then v2.7.3's stage 2b, GEMM tactic and W2 / evict-first decode keys (WOA_MB / WOB_MB flipped in place)
+        self.assertEqual(items[-16:-12], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
                                          "DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
-        self.assertEqual(items[-1], "DSV41_PREFILL_CED_SKIP=1")
-        self.assertEqual(items[-8:-1], ["DSV41_PREFILL_GEMM_ROW_SPLIT=4096", "DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152",
-                                        "DSV41_L2_PREFETCH_WOA_MB=0", "DSV41_L2_PREFETCH_WOB_MB=6", "DSV41_EXTEND_NOSYNC=1",
+        self.assertEqual(items[-5:], ["DSV41_PREFILL_CED_SKIP=1", "DSV41_PREFILL_SP_FP8_MOE=1", "DSV41_PREFILL_GEMM_TACTIC=1",
+                                      "DSV41_L2_PREFETCH_WOB2_MB=10", "DSV41_WO_A_W8_EVICT_FIRST=1"])
+        self.assertEqual(items[-12:-5], ["DSV41_PREFILL_GEMM_ROW_SPLIT=4096", "DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152",
+                                        "DSV41_L2_PREFETCH_WOA_MB=6", "DSV41_L2_PREFETCH_WOB_MB=0", "DSV41_EXTEND_NOSYNC=1",
                                         "DSV41_SAMPLED_COMMIT_REUSE=1", "DSV41_SAMPLED_DRAFT_PROBS_EARLY=1"])
         for k in ("DSV41_KV_LAYOUT", "SGLANG_SM120_V41_PRECISION"):
             self.assertEqual(sum(x.split("=")[0] == k for x in items), 1, k)

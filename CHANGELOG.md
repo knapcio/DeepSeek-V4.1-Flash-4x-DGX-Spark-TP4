@@ -1,5 +1,145 @@
 # Changelog
 
+## 2026-11-10 v2.7.3
+
+v2.7.2 plus two lossless prefill changes and one lossless decode change in the production profile
+(`DSV41_PREFILL_SP_FP8_MOE=1 DSV41_PREFILL_GEMM_TACTIC=1`; `DSV41_L2_PREFETCH_WOA_MB=6 DSV41_L2_PREFETCH_WOB_MB=0`
+(were 0 / 6) `DSV41_L2_PREFETCH_WOB2_MB=10 DSV41_WO_A_W8_EVICT_FIRST=1`: four keys appended to `EXTRA_CONTAINER_ENV`,
+two values changed in place). The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin
+(8,541,952 tokens at fraction 0.85), the launch line, `--swa-prefix-tails 384` and every other v2.7.2 key are
+unchanged. Measured on the four Sparks against the v2.7.2 profile in
+the same boot (in-boot A/B with two control arms, the official 1017 checkpoint, 2026-11-10), then in the release gate
+below (official 1017 checkpoint). In production on the four Sparks since 2026-11-10 18:00 (abliterated checkpoint).
+
+- **Prefill: the MoE input is gathered as MXFP8 (`DSV41_PREFILL_SP_FP8_MOE=1`, `adapter/prefill_sp.py` stage 2b).**
+  Prefill sequence parallel all-gathers each full-row layer's MoE input as bf16 rows, and b12x then quantizes them to
+  MXFP8 inside the kernel. Stage 2b quantizes on each rank's quarter of the rows, gathers the MXFP8 bytes and UE8M0
+  scales (half the bytes), runs the router and top-k on the shard and hands b12x the gathered input pre-quantized. The
+  first chunk of every row count runs both paths and keeps the MXFP8 gather only if the routing, the gathered bytes
+  (against b12x's own in-kernel quantization) and the MoE output are bit-identical on every rank (MIN over TP); a row
+  with a FlashInfer scale-byte-0 block keeps the bf16 gather for that layer. Measured (five rounds, servebench cold
+  prefill): 131K **+2.52 % [2.40, 2.64]** (A / A' 0.12 %), 32K +0.12 % (four of five rounds +0.4 to +1.4 %, one
+  transient round -3.2 % shared with another arm); cold first token of a flushed 131K document -2.4 % and of a 32K one
+  -2.2 % (all three X runs below all six control runs), about 30 ms per 8192-row chunk; trace: -1.7 ms of non-collective
+  kernel time per full-row layer. Exactness: the 32K first token's top-20 logprobs bit-identical to the controls (3 of
+  3); at 131K, where the controls themselves vary run to run, every X state is a control's or stock code's exact state
+  or inside the controls' spread; the 64-token continuations equal a control's text. Head memory unchanged (11.98
+  against 11.98 / 11.99 GiB). It existed since 2026-09 (off by default); it is in the production profile now.
+- **Prefill: eight dense GEMM shapes on FlashInfer's CUTLASS SM120 MXFP8 tactic 5 (`DSV41_PREFILL_GEMM_TACTIC=1`,
+  `adapter/prefill_gemm_tactic.py`).** The prefill dense MXFP8 GEMMs ran on FlashInfer's b12x kernel with its pinned
+  default plan. A single-GB10 bench of the serving call against every alternative at the prefill row counts found
+  FlashInfer's CUTLASS SM120 block-scaled MXFP8 GEMM, tactic 5 of `mm_mxfp8(backend="cutlass")` (CTA 128x128x128,
+  swap_ab), returning the same bytes and faster: `wo_b` 1.28x and `q_b` 1.12x at 8192 rows, `wqkv_a` 1.33x and the
+  shared FC1 1.37x at the row split's 4096-row blocks, the indexer `q_b` 1.10x. Only an exact (N, K, M) table entry
+  switches (decode, verify and short extends never match). After the target model loads, every rank runs every table
+  shape both ways on three synthetic operand sets quantized as production quantizes activations (gauss, mixed scales,
+  mirrored K halves), compares the bf16 outputs byte for byte (tactic 5 twice), and the ranks agree in one MIN
+  collective; a difference, an exception, FlashInfer sources other than the pinned 0.7.2 ones or no boot check keep
+  the serving call. Measured on top of stage 2b (servebench cold prefill): 131K **+1.90 % [1.20, 2.60]**, 32K +1.79 %
+  [0.45, 3.12] (A / A' 0.04 %); boot check 8 / 8 shapes on every rank (1.2 s); first tokens and the 131K continuations
+  inside the controls' states; head memory +0.005 GiB.
+- **Decode: a second `wo_b` L2 window at the `wo_a` call (`DSV41_L2_PREFETCH_WOA_MB=6 DSV41_L2_PREFETCH_WOB_MB=0
+  DSV41_L2_PREFETCH_WOB2_MB=10 DSV41_WO_A_W8_EVICT_FIRST=1`, `adapter/l2_prefetch.py` v6 and `adapter/wo_a_w8.py`).**
+  Since v2.7.1 the attention-core L2 window (after `wq_b`) warmed 6 MB of `wo_b` and left `wo_a` cold. The new layout
+  warms 6 MB of `wo_a` there again and forks a second window ("W2") at the `wo_a` call itself, on the second side
+  stream right before the `wo_a` kernel launches: it prefetches the `wo_b` bytes (weight, then scales) the first window
+  did not take, up to 10 MB, while `wo_a` runs from L2 and DRAM is mostly idle; `wo_a`'s single-use FP8 twin loads
+  carry an L2 evict-first policy (`createpolicy.fractional.L2::evict_first`, checked from the PTX). Cache hints only:
+  values, kernels and their order are unchanged, outputs bit-identical. Measured in one boot against the v2.7.2 profile
+  (tier-8 window M, two control arms, four rounds): c1 greedy step **-0.205 ms** (paired per prompt on the 25 prompts
+  whose work is identical in every run, CI95 -0.302 to -0.108; the controls' A' - A -0.032 ms), c1 sampled -0.30 ms
+  (CI95 -0.39 to -0.21), c4 **+1.09 %** (CI95 +0.16 to +2.01; per-step time -1.04 %); c8 / c16 per-step time -0.6 /
+  -0.5 % (inside the noise; tok/s there carries ~1.3 % of T = 0 acceptance noise between identical controls). Trace,
+  rank 0, c1: `wo_a` 44.6 -> 34.7 us per call, block span 109.4 -> 101.5 us per layer, the post-attention all-reduce
+  not slower; `wo_b` 23.9 -> 25.2 us (this layout drops the 6 MB `wo_b` window of the attention core). qeval 75 / 75
+  T = 0 outputs byte-identical to the controls'; head low-water during the speedbench 14.97 GiB (control 14.77). Evict-first alone was flat (+0.010
+  ms, CI95 -0.10 to +0.13); it is kept because the measured layout carries it. Receipts: the bracket line names
+  `W2 wo_b windows at the wo_a call (10.0 MB)`, every learned plan line ends ` wob2=<windows>/<MB> MB`, every capture
+  line ` wob2=<forks>`.
+- **`adapter/l2_prefetch.py`: every wrapper keeps `__wrapped__`** (the MXFP8 linear, the router GEMM, RoCE all-reduce /
+  all-gather, the model / LM-head / DSpark draft forwards, the Engram row join and the `wo_a` recorder), so the
+  adapters that hash-pin engine sources through `inspect.unwrap` (prefill_sp pins `DeepseekV4Model.forward`) see the
+  stock source after the bracket. Behaviour unchanged; the tier-8 window measured the stage-1 layout on this code.
+- **Receipts:** every rank logs its own stage-2b self-check per chunk row count (`... (M=<rows>) rank <r>: local ...
+  -> agreed ON`) and its stage-2b call counts (`DSV41_PREFILL_SP fp8 MoE calls rank <r>: mxfp8 <n> bf16 <m> danger
+  <d>`, first call and every 256); every rank logs its own GEMM-tactic boot-check count and its tactic call counts
+  (`DSV41_PREFILL_GEMM_TACTIC calls rank <r>: tactic <n> ...`, first call and every 4096). Host prints only.
+- **In-boot A/B registry:** `DSV41_PREFILL_SP_FP8_MOE` is a union gate read per MoE call and
+  `DSV41_PREFILL_GEMM_TACTIC` a runtime key (`adapter/ab_variant.py`, test only); `prefill_sp`, `moe_b12x_next` and
+  `prefill_gemm_tactic` are hashed sources.
+- **Image tests:** the canary-roce image runs `tests/test_prefill_gemm_tactic.py`,
+  `tests/test_prefill_sp_fp8_moe_ab.py`, `tests/test_l2_prefetch_wob2.py` (the W2 plan, the fork, and
+  `test_every_wrapper_unwraps_to_engine`) and `tests/test_wo_a_w8_evict_first.py` (interpreter bitwise and the PTX hint
+  placement) at build; `tests/test_adapter_engine_pins.py` checks that the tactic's `ModelRunner.load_model` hook, the
+  l2_prefetch bracket and the `wo_a` recorder unwrap to the engine, and re-runs prefill_sp's drift guard after every
+  adapter installed.
+- Rollback, config only: unset `DSV41_PREFILL_SP_FP8_MOE`, `DSV41_PREFILL_GEMM_TACTIC`, `DSV41_L2_PREFETCH_WOB2_MB` and
+  `DSV41_WO_A_W8_EVICT_FIRST` and set `DSV41_L2_PREFETCH_WOA_MB=0 DSV41_L2_PREFETCH_WOB_MB=6` (= the v2.7.2 profile on
+  the same image); the decode change alone reverts with the last four.
+- Open follow-up (not in this release): an attribution boot of `DSV41_L2_PREFETCH_WOA_MB=6 DSV41_L2_PREFETCH_WOB_MB=6`
+  plus W2 on the `wo_b` remainder, which would keep the attention core's `wo_b` window that this layout drops (`wo_b`
+  +1.4 us per call at c1), and of the layout without evict-first.
+- **Credits:** the GEMM tactic is FlashInfer's CUTLASS SM120 block-scaled MXFP8 GEMM (built on NVIDIA CUTLASS); we
+  only select it at measured shapes. The per-kernel comparison with Christopher Owen's spark-ds41f stack (its TileLang
+  `mxfp8_gemm`, bitwise equal to b12x and a comparison arm of the bench) led us to measure a second kernel at the
+  prefill shapes; no spark-ds41f code is included. Stage 2b is ours. The W2 window and the evict-first twin loads are
+  ours (megakernel stage 1); that `wo_b` was worth warming at all came from v2.7.1's per-kernel comparison with
+  Christopher Owen's spark-ds41f stack (credited there).
+
+Release gate (run `run-20261110-114511-236731`, 2026-11-10, 362 min including the restore of production): v2.7.2 /
+v2.7.3 / v2.7.2, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU
+clock capped at 2200 MHz. The controls are production v2.7.2's image and profile; the v2.7.3 boot ran a gate image of
+`9413b93` (production v2.7.2's image with this release's changed files added) with the six profile keys above. KV pool
+8,541,952 tokens on all three boots. Verdict: **FAIL -> NO-RELEASE on one rule (exactness at 131K), accepted on review
+as release-equivalent** (below); every other rule PASS (decode, sampled, load, decode step time, c1 step, cold prefill,
+memory, qeval, idle CPU, idle first token, inter-token gaps, long-prompt decode, 32K exactness), 0 safety, 0 invalid,
+restore PASS.
+- **Prefill, cold** (median of three flushed prompts; v2.7.2 / v2.7.3 / v2.7.2): 64K 6,469 / 6,726 / 6,481 tok/s
+  (x1.039 of the controls' mean), 131K 6,554 / 6,851 / 6,584 (x1.043), 1M (969K tokens) 5,431 / 5,697 / 5,545 (x1.038).
+  A cold 388,000-token prompt (solo, median of three): first token 60.00 / 57.28 / 59.81 s (x1.048 / x1.044 the speed
+  of the two controls). The flushed-document first tokens of the exactness probes: 32K 5.30 / 5.06 / 5.27 s, 131K
+  20.84 / 19.87 / 20.76 s, 1M 188.0 / 181.4 / 186.9 s (x1.043 / x1.047 / x1.033 of the controls' mean speed).
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.7.2 / v2.7.3 / v2.7.2): greedy c1 all-prompt geomean 89.59 /
+  90.41 / 90.00 tok/s (runs 89.35 / 89.83, 89.84 / 90.98, 89.33 / 90.66) and prose 66.68 / 67.22 / 66.71; c4 135.97 /
+  136.65 / 135.66, c8 171.39 / 172.20 / 171.99 and c16 215.12 / 213.62 / 216.31 aggregate tok/s. Sampled (T 0.7, top-p
+  0.95, one run per cell): c1 87.20 / 86.96 / 88.38 and prose 63.55 / 64.69 / 65.79 tok/s, c4 133.19 / 134.74 / 133.86.
+  Speedbench load c16 228.29 / 226.80 / 227.57 aggregate tok/s (median TTFT 473 / 466 / 464 ms, p99 inter-token gap
+  286 / 286 / 290 ms). v2.7.3 against the mean of the controls: greedy c1 x1.007, c4 x1.006, c8 x1.003, c16 x0.990;
+  sampled c1 x0.990, c4 x1.009; load c16 x0.995; all inside the gate's bands. New rules in this gate: the decode step
+  time at c8 / c16 (127.23 ms against 127.05 / 127.41, 195.14 against 194.26 / 194.72: at parity; the c16 tok/s follows
+  the T = 0 text's acceptance) and the c1 step paired per prompt on identical work (-0.27 ms, CI95 -0.29 to -0.25).
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; all 75 T = 0 prompts inside the
+  controls' bracket (75 stable, 0 outside). KLD against the controls: short 0.0054, long 0.0039 (limit 0.035). T = 1
+  distribution check PASS (p 0.949, 12,000 samples). The 16 thinking-on reasoning prompts gave the same lengths on all
+  three boots (mean 122.7 tokens). Needles 256K (248,175 tokens, 36.2 s) and 1M (968,669 tokens, 168.6 s) found.
+- **Exactness** (new rule: flushed 32K, 131K and 1M documents; the first token's top-20 logprobs and a 64-token greedy
+  continuation, three samples per boot). 32K: the first token identical in every run on all three boots, continuations
+  on control states. 1M: inside the controls' spread. 131K: **the rule fired**: the six control samples gave one
+  continuation, the three v2.7.3 samples two others, so the rule took the controls as stable and the v2.7.3 texts as
+  different. The 131K continuation is not stable on the stock code: across this gate and three earlier test windows on
+  the same code base, checkpoint and document, v2.7.2 gave five different continuations in 16 samples, because the DSA
+  indexer's top-k returns its indices in a different order from call to call (prefill and every decode step), which
+  moves near-tied logits; six equal control samples happen by chance about 6 % of the time. One v2.7.3 text (two
+  samples) is one of the stock texts and leaves the commonest one at token 62 of 64, on a 0.13-nat near tie that the
+  stock code also flips; the other is new, as about 3 in 16 stock samples are. Two of the three v2.7.3 first-token
+  top-20 vectors are bit-identical to vectors the v2.7.2 code produced, which one changed bit anywhere in the prefill
+  would rule out. Every rank logged all three changes' own checks passing (the GEMM tactic's boot check 8 / 8 shapes
+  bit-identical and agreed, 0 errors; the MoE-input gather on for every chunk size with every self-check true; the same
+  W2 windows on the four nodes). Reviewed as the engine's known T = 0 nondeterminism at 131K, not a numerical change,
+  and accepted as release-equivalent; the machine verdict stays FAIL. From the next gate the 131K continuation is
+  judged against the accumulated set of stock states (a document counts as stable only with one state in at least 12
+  control samples) and the probe stores the full tokens.
+- **Draft acceptance** (pooled over all prompts): c1 x1.001, c4 x1.004 of the lower control; c8 x1.004 and c16 x0.998
+  reported only from this gate on (at concurrency the T = 0 text, and with it the acceptance, differs ~1.3 % between
+  identical controls); qeval at T = 0 3.978 / 3.979 / 3.979 accepted tokens per verify step.
+- **Long-prompt decode** (flushed 32K x 2 and 131K x 3 documents, each followed by a 512-token greedy continuation):
+  decode 98.91 / 101.82 / 100.82 tok/s, 3.92 / 4.00 / 4.00 tokens per step.
+- **Memory and the rest.** Head memory low-water over the common phases 8.50 / 8.43 / 8.46 GiB, during the cold 1M
+  prompts 8.71 / 8.68 / 8.65 GiB; the issue-16 soak 308 / 308 requests ok and its companion load 230 requests, 0
+  failed; idle first token median 193 / 191 / 194 ms; a short prompt beside a cold 131K prefill answered its first
+  token in 0.33 / 0.29 / 0.33 s; no Xid on any boot. A deliberately cold boot of v2.7.3 (tuning caches off) before the
+  arms: ready in 182 s, no Xid, core dump or fault line on any node.
+
 ## 2026-11-10 v2.7.2
 
 v2.7.1 plus one lossless prefill change in the production profile (`DSV41_PREFILL_CED_SKIP=1`, one key appended to

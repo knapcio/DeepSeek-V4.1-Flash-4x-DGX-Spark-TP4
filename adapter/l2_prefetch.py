@@ -55,6 +55,21 @@ v4 knobs (read per call through ab_variant.env(); all unset = v3):
                               the real b12x MoE it slows the MoE by ~12.6 us per 10 MB and the lines
                               do not outlive the next layer's dense stream: -13 us per layer.
   (v3's TILED experiment, scales + a K prefix of every row, lost on GB10 and was removed.)
+v6 knob (read per plan through ab_variant.env(); unset / 0 = v4 bit for bit: no extra event is even recorded;
+needs DSV41_L2_PREFETCH_WOA=1, the production gate, because the wo_a call is the fork point):
+  DSV41_L2_PREFETCH_WOB2_MB=6 second wo_b window ("W2"), forked at the wo_a call itself, on the second side
+                              stream, right before the wo_a kernel launches: it takes the wo_b bytes (weight,
+                              then scales) that the attention-core window after wq_b did not take (WOA_MB of
+                              wo_a, then WOB_MB of wo_b; this one continues where that take stopped, so no
+                              byte is prefetched twice), cut at the budget. The window is the wo_a kernel's own
+                              run: with wo_a L2-warm (WOA_MB > 0) DRAM is ~60 % idle for ~29 us there, and the
+                              only traffic between the prefetch and its consumer is wo_a's L2-served reads,
+                              so the lines do not have to survive a DRAM stream (the X2e failure mode). Joined
+                              at the end of the forward. Cache hints only: outputs bit-identical by
+                              construction. Pairs with DSV41_WO_A_W8_EVICT_FIRST=1 (adapter/wo_a_w8.py), which
+                              marks wo_a's own single-use stream evict-first so the W2 lines outlive it.
+                              Receipt: the plan line's " wob2=<windows>/<MB> MB" and the capture line's
+                              " wob2=<forks>". Stage 1 of diagnostics/megakernel-20261109/DESIGN.md.
 
 Wiring (all gated by the env flag in sitecustomize.py):
   sglang.srt.layers.quantization.fp8_utils  -> l2_prefetch.install_fp8_utils(module)  (after mxfp8_b12x)
@@ -129,6 +144,7 @@ extern "C" int dsv41_l2pf_el(const void* segs, int n, const void* old, int n_old
 """
 
 _state = {"lib": None, "learning": {}, "plans": {}, "sig": None, "idx": 0, "lin": 0, "eng": 0, "moe": 0,
+          "woa": 0, "woa_forks": 0,
           "side": {}, "side2": {}, "pending": None, "pending2": None, "stats": [0, 0],
           "installed": set(), "logged": set(), "frozen": set(), "keepalive": [], "lm_head": {},
           "woa_depth": 0}
@@ -167,6 +183,11 @@ def _budget():
     return _mb("DSV41_L2_PREFETCH_MB", "6")
 
 
+def _wob2():
+    """v6 W2 budget in bytes for the variant being learned / captured / replayed (0 = off)."""
+    return _mb("DSV41_L2_PREFETCH_WOB2_MB", "0") if _sub("WOA") else 0
+
+
 def _lib():
     if _state["lib"] is None:
         cache = Path(os.environ.get("B12X_COMPILE_CACHE_DIR", "/tmp")) / "dsv41_l2pf"
@@ -196,6 +217,7 @@ def _begin_forward(sig):
     SGLang runs right before each capture are what the capture replays, so the latest eager
     observation wins, and a shape is frozen once captured."""
     _state["sig"], _state["idx"], _state["lin"], _state["eng"], _state["moe"] = sig, 0, 0, 0, 0
+    _state["woa"], _state["woa_forks"] = 0, 0
     _state["stats"][1] = 0
     if _sub("WOA"):
         _ensure_wo_a()
@@ -226,7 +248,7 @@ def _side_stream(second=False):
 
 
 def _counts():
-    return (_state["idx"], _state["lin"], _state["eng"], _state["moe"])
+    return (_state["idx"], _state["lin"], _state["eng"], _state["moe"], _state["woa"])
 
 
 def _end_forward():
@@ -253,10 +275,13 @@ def _end_forward():
             _side_stream(True)
             nbytes = sum(int(it[0][1::2].sum()) for it in plan.values())
             extra = sum(1 for k in plan if k[0] != "c")
+            wk = [k for k in plan if k[0] == "W"]
+            wob2 = (f" wob2={len(wk)}/{sum(int(plan[k][0][1::2].sum()) for k in wk) / 2**20:.1f} MB"
+                    if _wob2() > 0 else "")
             logger.warning("DSV41_L2_PREFETCH plan tokens=%d mode=%s collectives=%d windows=%d "
-                           "prefetch=%.1f MB/forward%s%s", sig[1], sig[2], n, len(plan), nbytes / 2**20,
+                           "prefetch=%.1f MB/forward%s%s%s", sig[1], sig[2], n, len(plan), nbytes / 2**20,
                            f" (of which {extra} linear/engram windows)" if extra else "",
-                           "" if old is None else f" (relearned; was {old[0]} collectives)")
+                           "" if old is None else f" (relearned; was {old[0]} collectives)", wob2)
     elif sig is not None and capturing:
         _state["frozen"].add(sig)
         key = ("capture",) + sig[1:]
@@ -267,7 +292,8 @@ def _end_forward():
             ok = (entry is not None and learned == _state["idx"] and entry[3] == _counts()
                   and _state["stats"][1] > 0)
             logger.warning("DSV41_L2_PREFETCH captured tokens=%d mode=%s branches=%d collectives=%d "
-                           "(learned %d)%s", sig[1], sig[2], _state["stats"][1], _state["idx"], learned,
+                           "(learned %d)%s%s", sig[1], sig[2], _state["stats"][1], _state["idx"], learned,
+                           f" wob2={_state['woa_forks']}" if _wob2() > 0 else "",
                            "" if ok else " MISMATCH: this graph runs without prefetch")
     _state["sig"] = None
 
@@ -296,12 +322,18 @@ def _skip_n():
 
 
 def _windows(events):
-    """Event sequence -> [(key, budget, queue, look_ahead)] in forward order. Queue items are
-    (ptr, nbytes, rows or None, kind) with kind "r" (linear / router) or "w" (wo_a)."""
+    """Event sequence -> [(key, budget, queue, look_ahead[, ("W", n)])] in forward order. Queue items are
+    (ptr, nbytes, rows or None, kind) with kind "r" (linear / router) or "w" (wo_a). A v6 ("W", n) event
+    (the n-th wo_a call) marks the wo_a window it falls in: _make_plan then plans the W2 continuation
+    for that window under the key ("W", n)."""
     woa, ahead = _sub("WOA"), _sub("AHEAD")
     windows, cur, last_lin = [], None, None
     for ev in events:
         kind = ev[0]
+        if kind == "W":  # v6 W2 fork point: attaches to the current wo_a window, never a window of its own
+            if cur is not None and cur[0][0] == "l" and len(cur) == 4:
+                cur.append(("W", ev[1]))
+            continue
         if kind == "m":  # v4 MOE mark: plans against the windows that follow (see _make_plan)
             windows.append([("m", ev[1]), _mb("DSV41_L2_PREFETCH_MOE_MB", "10"), [], False])
             continue
@@ -349,9 +381,12 @@ def _make_plan(events):
     plan = {}
     start = (0, 0)
     wob = _mb("DSV41_L2_PREFETCH_WOB_MB", "0")
+    wob2 = _wob2()
     cover = {}            # window index -> queue position already held (evict_last) by a MOE window
     moe_items = []
-    for j, (key, budget, queue, look_ahead) in enumerate(windows):
+    for j, w in enumerate(windows):
+        key, budget, queue, look_ahead = w[:4]
+        w2key = w[4] if len(w) > 4 else None   # v6: this wo_a window's W2 fork point ("W", n)
         if key[0] == "m":
             # v4 MOE: during the MoE phase (DRAM at ~157 of ~250 GB/s) prefetch the next layer's dense
             # weights with evict_last, up to the next MOE mark; later windows start past them
@@ -375,17 +410,25 @@ def _make_plan(events):
             # weights after wo_a, up to the post-attention AR) instead of the rest of wo_a
             n_w = next((i for i, it in enumerate(queue) if it[3] != "w"), len(queue))
             segs, _ = _take(queue[:n_w], (0, 0), budget)
-            more, _ = _take(queue[n_w:], (0, 0), wob)
+            more, end_r = _take(queue[n_w:], (0, 0), wob)
             segs += more
             start = (0, 0)
             if segs:
                 t = torch.tensor([v for s in segs for v in s[:2]], dtype=torch.int64, device="cuda")
                 plan[key] = (t, len(segs))
                 _state["keepalive"].append(t)
+            if w2key is not None and wob2 > 0:
+                _plan_w2(plan, w2key, queue[n_w:], end_r, wob2)
             continue
         segs, end = _take(queue, start, budget)
         start = (0, 0)
         used = sum(s[1] for s in segs)
+        if key[0] == "l" and w2key is not None and wob2 > 0:
+            # v6 W2 without WOB: the wo_b items start after the wo_a items; continue past what the
+            # WOA take reached into them (nothing, at the production budgets)
+            n_w = next((i for i, it in enumerate(queue) if it[3] != "w"), len(queue))
+            end_r = (end[0] - n_w, end[1]) if end[0] >= n_w else (0, 0)
+            _plan_w2(plan, w2key, queue[n_w:], end_r, wob2)
         if look_ahead and j + 1 < len(windows) and end[0] >= len(queue) and budget - used >= 16:
             more, start = _take(windows[j + 1][2], cover.get(j + 1, (0, 0)), budget - used)
             segs += more
@@ -397,6 +440,16 @@ def _make_plan(events):
         _, pt, pn = moe_items[i - 1]  # demote the previous MOE window's lines (wraps to the last)
         plan[key] = (t, n, "el", pt if len(moe_items) > 1 else t, pn if len(moe_items) > 1 else 0)
     return plan
+
+
+def _plan_w2(plan, w2key, items, start, budget):
+    """v6 W2: the wo_b bytes (weight, then scales) from position start of the wo_a window's non-wo_a items,
+    at most budget, under key ("W", n). Nothing is planned when the earlier take already holds them all."""
+    segs, _ = _take(items, start, budget)
+    if segs:
+        t = torch.tensor([v for s in segs for v in s[:2]], dtype=torch.int64, device="cuda")
+        plan[w2key] = (t, len(segs))
+        _state["keepalive"].append(t)
 
 
 # -- hooks --------------------------------------------------------------------------------------
@@ -481,6 +534,25 @@ def _after_linear():
         _fork(item, second=True)
 
 
+def _before_wo_a():
+    """v6 W2: numbered wo_a call (per bracketed forward); forks the wo_b continuation planned for this
+    call on the second side stream, right before the wo_a kernel launches. No-op (and no event) when
+    DSV41_L2_PREFETCH_WOB2_MB is 0 for the variant, so off is the v4 event stream bit for bit."""
+    sig = _state["sig"]
+    if sig is None or _wob2() <= 0:
+        return
+    _state["woa"] += 1
+    n = _state["woa"]
+    _rec(("W", n))
+    entry = _state["plans"].get(sig)
+    if entry is None or len(entry[3]) < 5 or n > entry[3][4] or _state["idx"] > entry[0]:
+        return
+    item = entry[1].get(("W", n))
+    if item is not None:
+        _fork(item, second=True)
+        _state["woa_forks"] += 1
+
+
 def _after_router():
     """v4 MOE: the MoE phase starts after the router GEMM; fork the evict_last prefetch there."""
     _state["moe"] += 1
@@ -537,12 +609,14 @@ def _wrap_wo_a(inner):
     def _apply_wo_a_bf16_matmul(o, wo_a, *args, **kwargs):
         if _state["woa_depth"] == 0:  # outermost wrapper only: one record per call
             _record_wo_a(o, wo_a)
+            _before_wo_a()
         _state["woa_depth"] += 1
         try:
             return inner(o, wo_a, *args, **kwargs)
         finally:
             _state["woa_depth"] -= 1
 
+    _apply_wo_a_bf16_matmul.__wrapped__ = inner  # inspect.unwrap reaches the inner dispatch (engine pins)
     _apply_wo_a_bf16_matmul._dsv41_l2_prefetch = True
     return _apply_wo_a_bf16_matmul
 
@@ -573,6 +647,7 @@ def install_fp8_utils(module):
             _after_linear()
         return out
 
+    linear.__wrapped__ = original
     module.flashinfer_mxfp8_blockscaled_linear = linear
     logger.warning("DSV41_L2_PREFETCH: MXFP8 linears recorded (budget %.1f MB/window)", _budget() / 2**20)
 
@@ -592,6 +667,7 @@ def install_router(module):
             _after_router()
         return out
 
+    tiny_gemm_bf16.__wrapped__ = original
     module.tiny_gemm_bf16 = tiny_gemm_bf16
 
 
@@ -614,6 +690,7 @@ def install_roce(module):
         _before_collective("ag", kwargs.get("stream"))
         return ag(self, inp, *args, **kwargs)
 
+    all_reduce.__wrapped__, all_gather.__wrapped__ = ar, ag
     cls.all_reduce, cls.all_gather = all_reduce, all_gather
     _lib()
     logger.warning("DSV41_L2_PREFETCH: RoCE collectives prefetch the next weights into L2")
@@ -641,6 +718,8 @@ def _bracket(cls, lm_head=False, gate=None):
         finally:
             _end_forward()
 
+    # inspect.unwrap reaches the engine's forward (prefill_sp pins v4.DeepseekV4Model.forward)
+    forward.__wrapped__ = original
     cls.forward = forward
 
 
@@ -661,6 +740,8 @@ def install_model(module):
     if _installed("WOA"):
         _ensure_wo_a([module])
         extras.append(f"wo_a windows ({_mb('DSV41_L2_PREFETCH_WOA_MB', '6') / 2**20:.1f} MB)")
+        if os.environ.get("DSV41_L2_PREFETCH_WOB2_MB", "0").strip() not in ("", "0"):
+            extras.append(f"W2 wo_b windows at the wo_a call ({_mb('DSV41_L2_PREFETCH_WOB2_MB', '0') / 2**20:.1f} MB)")
     if lm_head:
         causal = module.DeepseekV4ForCausalLM
         orig_causal = causal.forward
@@ -671,6 +752,7 @@ def install_model(module):
                 _state["lm_head"][id(self.model)] = head
             return orig_causal(self, *args, **kwargs)
 
+        causal_forward.__wrapped__ = orig_causal
         causal.forward = causal_forward
         extras.append("LM head")
     if _installed("AHEAD"):
@@ -710,6 +792,7 @@ def install_engram(module):
         _before_engram()
         return original(self, indices, *args, **kwargs)
 
+    _owned_rows.__wrapped__ = original
     emb._owned_rows = _owned_rows
     logger.warning("DSV41_L2_PREFETCH: Engram row joins prefetch %.1f MB of engram.wkv",
                    _mb("DSV41_L2_PREFETCH_ENGRAM_MB", "12") / 2**20)
