@@ -2,10 +2,12 @@
 
 ## v2.7.3 (candidate, release gate pending)
 
-v2.7.2 plus two lossless prefill changes in the production profile (`DSV41_PREFILL_SP_FP8_MOE=1
-DSV41_PREFILL_GEMM_TACTIC=1`, two keys appended to `EXTRA_CONTAINER_ENV`). The image stack (SGLang tree, FlashInfer
-0.7.2, NCCL 2.30.7 with #2393), the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
-`--swa-prefix-tails 384` and every v2.7.2 key are unchanged. Measured on the four Sparks against the v2.7.2 profile in
+v2.7.2 plus two lossless prefill changes and one lossless decode change in the production profile
+(`DSV41_PREFILL_SP_FP8_MOE=1 DSV41_PREFILL_GEMM_TACTIC=1`; `DSV41_L2_PREFETCH_WOA_MB=6 DSV41_L2_PREFETCH_WOB_MB=0`
+(were 0 / 6) `DSV41_L2_PREFETCH_WOB2_MB=10 DSV41_WO_A_W8_EVICT_FIRST=1`: four keys appended to `EXTRA_CONTAINER_ENV`,
+two values changed in place). The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin
+(8,541,952 tokens at fraction 0.85), the launch line, `--swa-prefix-tails 384` and every other v2.7.2 key are
+unchanged. Measured on the four Sparks against the v2.7.2 profile in
 the same boot (in-boot A/B with two control arms, the official 1017 checkpoint, 2026-11-10); the release gate has not
 run yet.
 
@@ -36,6 +38,28 @@ run yet.
   the serving call. Measured on top of stage 2b (servebench cold prefill): 131K **+1.90 % [1.20, 2.60]**, 32K +1.79 %
   [0.45, 3.12] (A / A' 0.04 %); boot check 8 / 8 shapes on every rank (1.2 s); first tokens and the 131K continuations
   inside the controls' states; head memory +0.005 GiB.
+- **Decode: a second `wo_b` L2 window at the `wo_a` call (`DSV41_L2_PREFETCH_WOA_MB=6 DSV41_L2_PREFETCH_WOB_MB=0
+  DSV41_L2_PREFETCH_WOB2_MB=10 DSV41_WO_A_W8_EVICT_FIRST=1`, `adapter/l2_prefetch.py` v6 and `adapter/wo_a_w8.py`).**
+  Since v2.7.1 the attention-core L2 window (after `wq_b`) warmed 6 MB of `wo_b` and left `wo_a` cold. The new layout
+  warms 6 MB of `wo_a` there again and forks a second window ("W2") at the `wo_a` call itself, on the second side
+  stream right before the `wo_a` kernel launches: it prefetches the `wo_b` bytes (weight, then scales) the first window
+  did not take, up to 10 MB, while `wo_a` runs from L2 and DRAM is mostly idle; `wo_a`'s single-use FP8 twin loads
+  carry an L2 evict-first policy (`createpolicy.fractional.L2::evict_first`, checked from the PTX). Cache hints only:
+  values, kernels and their order are unchanged, outputs bit-identical. Measured in one boot against the v2.7.2 profile
+  (tier-8 window M, two control arms, four rounds): c1 greedy step **-0.205 ms** (paired per prompt on the 25 prompts
+  whose work is identical in every run, CI95 -0.302 to -0.108; the controls' A' - A -0.032 ms), c1 sampled -0.30 ms
+  (CI95 -0.39 to -0.21), c4 **+1.09 %** (CI95 +0.16 to +2.01; per-step time -1.04 %); c8 / c16 per-step time -0.6 /
+  -0.5 % (inside the noise; tok/s there carries ~1.3 % of T = 0 acceptance noise between identical controls). Trace,
+  rank 0, c1: `wo_a` 44.6 -> 34.7 us per call, block span 109.4 -> 101.5 us per layer, the post-attention all-reduce
+  not slower; `wo_b` 23.9 -> 25.2 us (this layout drops the 6 MB `wo_b` window of the attention core). qeval 75 / 75
+  T = 0 outputs byte-identical to the controls'; head low-water during the speedbench 14.97 GiB (control 14.77). Evict-first alone was flat (+0.010
+  ms, CI95 -0.10 to +0.13); it is kept because the measured layout carries it. Receipts: the bracket line names
+  `W2 wo_b windows at the wo_a call (10.0 MB)`, every learned plan line ends ` wob2=<windows>/<MB> MB`, every capture
+  line ` wob2=<forks>`.
+- **`adapter/l2_prefetch.py`: every wrapper keeps `__wrapped__`** (the MXFP8 linear, the router GEMM, RoCE all-reduce /
+  all-gather, the model / LM-head / DSpark draft forwards, the Engram row join and the `wo_a` recorder), so the
+  adapters that hash-pin engine sources through `inspect.unwrap` (prefill_sp pins `DeepseekV4Model.forward`) see the
+  stock source after the bracket. Behaviour unchanged; the tier-8 window measured the stage-1 layout on this code.
 - **Receipts:** every rank logs its own stage-2b self-check per chunk row count (`... (M=<rows>) rank <r>: local ...
   -> agreed ON`) and its stage-2b call counts (`DSV41_PREFILL_SP fp8 MoE calls rank <r>: mxfp8 <n> bf16 <m> danger
   <d>`, first call and every 256); every rank logs its own GEMM-tactic boot-check count and its tactic call counts
@@ -43,14 +67,24 @@ run yet.
 - **In-boot A/B registry:** `DSV41_PREFILL_SP_FP8_MOE` is a union gate read per MoE call and
   `DSV41_PREFILL_GEMM_TACTIC` a runtime key (`adapter/ab_variant.py`, test only); `prefill_sp`, `moe_b12x_next` and
   `prefill_gemm_tactic` are hashed sources.
-- **Image tests:** the canary-roce image runs `tests/test_prefill_gemm_tactic.py` and
-  `tests/test_prefill_sp_fp8_moe_ab.py` at build; `tests/test_adapter_engine_pins.py` checks that the tactic's
-  `ModelRunner.load_model` hook unwraps to the engine function.
-- Rollback, config only: unset both keys (= the v2.7.2 profile on the same image).
+- **Image tests:** the canary-roce image runs `tests/test_prefill_gemm_tactic.py`,
+  `tests/test_prefill_sp_fp8_moe_ab.py`, `tests/test_l2_prefetch_wob2.py` (the W2 plan, the fork, and
+  `test_every_wrapper_unwraps_to_engine`) and `tests/test_wo_a_w8_evict_first.py` (interpreter bitwise and the PTX hint
+  placement) at build; `tests/test_adapter_engine_pins.py` checks that the tactic's `ModelRunner.load_model` hook, the
+  l2_prefetch bracket and the `wo_a` recorder unwrap to the engine, and re-runs prefill_sp's drift guard after every
+  adapter installed.
+- Rollback, config only: unset `DSV41_PREFILL_SP_FP8_MOE`, `DSV41_PREFILL_GEMM_TACTIC`, `DSV41_L2_PREFETCH_WOB2_MB` and
+  `DSV41_WO_A_W8_EVICT_FIRST` and set `DSV41_L2_PREFETCH_WOA_MB=0 DSV41_L2_PREFETCH_WOB_MB=6` (= the v2.7.2 profile on
+  the same image); the decode change alone reverts with the last four.
+- Open follow-up (not in this candidate): an attribution boot of `DSV41_L2_PREFETCH_WOA_MB=6 DSV41_L2_PREFETCH_WOB_MB=6`
+  plus W2 on the `wo_b` remainder, which would keep the attention core's `wo_b` window that this layout drops (`wo_b`
+  +1.4 us per call at c1), and of the layout without evict-first.
 - **Credits:** the GEMM tactic is FlashInfer's CUTLASS SM120 block-scaled MXFP8 GEMM (built on NVIDIA CUTLASS); we
   only select it at measured shapes. The per-kernel comparison with Christopher Owen's spark-ds41f stack (its TileLang
   `mxfp8_gemm`, bitwise equal to b12x and a comparison arm of the bench) led us to measure a second kernel at the
-  prefill shapes; no spark-ds41f code is included. Stage 2b is ours.
+  prefill shapes; no spark-ds41f code is included. Stage 2b is ours. The W2 window and the evict-first twin loads are
+  ours (megakernel stage 1); that `wo_b` was worth warming at all came from v2.7.1's per-kernel comparison with
+  Christopher Owen's spark-ds41f stack (credited there).
 
 ## 2026-11-10 v2.7.2
 
