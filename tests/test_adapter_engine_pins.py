@@ -21,13 +21,21 @@ ROOT = Path(__file__).resolve().parents[1]
 # Pins that only the off-by-default stages check at install; DSV41_WO_A_INPUT_FP8 (off by default) checks
 # the wo_a dispatch it wraps and its install order against wo_a_w8's mid/drop wrapper.
 # DSV41_EXTEND_NOSYNC (off by default) pins the backend tail-metadata source it edits.
-EXTRA_FLAGS = {"DSV41_PREFILL_SP_FP8_MOE": "1", "DSV41_WO_A_INPUT_FP8": "1", "DSV41_EXTEND_NOSYNC": "1"}
+# DSV41_PREFILL_GEMM_TACTIC (off by default) wraps ModelRunner.load_model for its boot check; its wrapper must unwrap to
+# the engine function.
+EXTRA_FLAGS = {"DSV41_PREFILL_SP_FP8_MOE": "1", "DSV41_WO_A_INPUT_FP8": "1", "DSV41_EXTEND_NOSYNC": "1",
+               "DSV41_PREFILL_GEMM_TACTIC": "1"}
 
 PROBE = """
+import inspect
 import sglang.srt.models.deepseek_v4 as v4
 import prefill_sp
 prefill_sp._load_modules(v4)
 prefill_sp._check_tail_engine()
+import sglang.srt.model_executor.model_runner as mrm
+mr = mrm.ModelRunner
+assert getattr(mr.load_model, "_dsv41_prefill_gemm_tactic", False), "GEMM tactic boot check not installed"
+assert inspect.unwrap(mr.load_model).__qualname__ == "ModelRunner.load_model", "load_model does not unwrap to the engine"
 print("adapter engine pins OK")
 """
 
