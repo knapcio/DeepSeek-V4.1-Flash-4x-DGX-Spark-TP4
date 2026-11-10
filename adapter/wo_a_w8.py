@@ -25,6 +25,15 @@ DSV41_WO_A_INPUT_FP8=1 (adapter/wo_a_input_fp8.py): the routes this adapter serv
 stock dispatch (DROP's 2-8 rows, MID's 9-192) round the loaded `o` tile in registers as DeepSeek's
 reference rounds o (QX); every call that reaches the stock dispatch was already rounded by that
 adapter's wrapper, so the kernels it reaches (`small`, `small_mx`) run with QX off.
+DSV41_WO_A_W8_EVICT_FIRST=1 (read per call; in-boot A/B key): the twin's weight and exponent loads in
+both kernels carry Triton's `eviction_policy="evict_first"`, which on sm_121 lowers to a
+`createpolicy.fractional.L2::evict_first` policy on `ld.global...L2::cache_hint` (checked from the PTX,
+tests/test_wo_a_w8_evict_first.py). wo_a is a single-use 9 MB stream per layer; marking it evict-first
+lets the L2 drop its lines before the lines the attention-core / W2 windows prefetched for wo_b
+(adapter/l2_prefetch.py). A cache policy only: loaded values and the MMA order are unchanged, so the
+output is bitwise identical (the same kernel source with EV=""). Stage 1 of
+diagnostics/megakernel-20261109/DESIGN.md; whether GB10 honours the hint is what the tier-6
+evict_first microbench and the in-boot A/B measure.
 """
 import os
 
@@ -35,12 +44,24 @@ import triton.language as tl
 from wo_a_input_fp8 import ENABLED as QX
 from wo_a_input_fp8 import qdq_tile
 
+try:  # DSV41_AB_VARIANTS in-boot A/B (test only): per-variant value; plain os.environ when off
+    from ab_variant import env as _env
+except ImportError:
+    _env = os.environ.get
+
 ENABLED = os.environ.get("DSV41_WO_A_W8", "0").strip() not in ("0", "", "off", "false")
 _TWINS = {}          # bf16 weight data_ptr -> (e4m3 [2,1024,4096], exponent uint8 [2,32,128])
 
 
+def _ev():
+    """Eviction policy of the twin loads for the variant being captured / replayed: "" or "evict_first"."""
+    on = str(_env("DSV41_WO_A_W8_EVICT_FIRST", "0") or "0").strip().lower() not in ("0", "", "off", "false", "no")
+    return "evict_first" if on else ""
+
+
 @triton.jit
-def _wo_a_partial_w8(X, W8, S, P, M: tl.constexpr, SX: tl.constexpr, QX: tl.constexpr = False):
+def _wo_a_partial_w8(X, W8, S, P, M: tl.constexpr, SX: tl.constexpr, QX: tl.constexpr = False,
+                     EV: tl.constexpr = ""):
     tile, group, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     m = tl.arange(0, 16)
     n = tile * 64 + tl.arange(0, 64)
@@ -53,8 +74,8 @@ def _wo_a_partial_w8(X, W8, S, P, M: tl.constexpr, SX: tl.constexpr, QX: tl.cons
         )
         if QX:  # 128 columns = four whole 32-blocks of the group's 4096
             x = qdq_tile(x, 16, 128)
-        w8 = tl.load(W8 + (group * 1024 + n[None, :]) * 4096 + offsets[:, None])
-        e = tl.load(S + (group * 32 + n[None, :] // 32) * 128 + offsets[:, None] // 32)
+        w8 = tl.load(W8 + (group * 1024 + n[None, :]) * 4096 + offsets[:, None], eviction_policy=EV)
+        e = tl.load(S + (group * 32 + n[None, :] // 32) * 128 + offsets[:, None] // 32, eviction_policy=EV)
         w = (w8.to(tl.float32) * tl.exp2(e.to(tl.float32) - 127.0)).to(tl.bfloat16)
         acc += tl.dot(x, w)
     tl.store(
@@ -81,7 +102,7 @@ def make_twin(w: torch.Tensor):
 def _partial_w8(x, twin, m, qx=False):
     w8, s = twin
     partial = torch.empty((8, m, 2, 1024), dtype=torch.float32, device=x.device)
-    _wo_a_partial_w8[(16, 2, 8)](x, w8, s, partial, m, x.stride(0), QX=qx, num_warps=4, num_stages=3)
+    _wo_a_partial_w8[(16, 2, 8)](x, w8, s, partial, m, x.stride(0), QX=qx, EV=_ev(), num_warps=4, num_stages=3)
     return partial
 
 
@@ -93,7 +114,7 @@ _MID_CFG = ((16, (4, 16, 64, 8)), (32, (2, 32, 32, 4)), (64, (1, 64, 32, 4)), (1
 
 @triton.jit
 def _wo_a_mid_kernel(X, W8, S, Y, M, SXM, SPLIT_K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-                     BK: tl.constexpr, QX: tl.constexpr = False):
+                     BK: tl.constexpr, QX: tl.constexpr = False, EV: tl.constexpr = ""):
     pid_n = tl.program_id(0)
     g = tl.program_id(1)
     pid_mk = tl.program_id(2)
@@ -108,8 +129,8 @@ def _wo_a_mid_kernel(X, W8, S, Y, M, SXM, SPLIT_K: tl.constexpr, BM: tl.constexp
         x = tl.load(X + m[:, None] * SXM + g * 4096 + k[None, :], m[:, None] < M, 0.0)
         if QX:  # k0 is a multiple of BK = 128: whole 32-blocks
             x = qdq_tile(x, BM, BK)
-        w8 = tl.load(W8 + g * 1024 * 4096 + n[None, :] * 4096 + k[:, None])
-        e = tl.load(S + g * 32 * 128 + (n[None, :] // 32) * 128 + k[:, None] // 32)
+        w8 = tl.load(W8 + g * 1024 * 4096 + n[None, :] * 4096 + k[:, None], eviction_policy=EV)
+        e = tl.load(S + g * 32 * 128 + (n[None, :] // 32) * 128 + k[:, None] // 32, eviction_policy=EV)
         w = (w8.to(tl.float32) * tl.exp2(e.to(tl.float32) - 127.0)).to(tl.bfloat16)
         acc += tl.dot(x, w)
     if SPLIT_K == 1:
@@ -126,12 +147,15 @@ def wo_a_mid(o, twin, qx=False):
     m = o.shape[0]
     sk, bm, bn, warps = next(cfg for lim, cfg in _MID_CFG if m <= lim)
     grid = (1024 // bn, 2, triton.cdiv(m, bm) * sk)
+    ev = _ev()
     if sk == 1:
         y = torch.empty((m, 2, 1024), dtype=torch.bfloat16, device=o.device)
-        _wo_a_mid_kernel[grid](o, w8, s, y, m, o.stride(0), 1, bm, bn, 128, QX=qx, num_warps=warps, num_stages=3)
+        _wo_a_mid_kernel[grid](o, w8, s, y, m, o.stride(0), 1, bm, bn, 128, QX=qx, EV=ev, num_warps=warps,
+                               num_stages=3)
         return y
     y = torch.empty((sk, m, 2, 1024), dtype=torch.float32, device=o.device)
-    _wo_a_mid_kernel[grid](o, w8, s, y, m, o.stride(0), sk, bm, bn, 128, QX=qx, num_warps=warps, num_stages=3)
+    _wo_a_mid_kernel[grid](o, w8, s, y, m, o.stride(0), sk, bm, bn, 128, QX=qx, EV=ev, num_warps=warps,
+                           num_stages=3)
     return y.sum(dim=0).to(torch.bfloat16)
 
 
