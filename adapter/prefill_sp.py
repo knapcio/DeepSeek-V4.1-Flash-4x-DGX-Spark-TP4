@@ -906,6 +906,12 @@ _MOE8 = {}                      # M -> {"ok", "router", "sf_shape", "sf_dtype"} 
 _MOE8_CLS = []
 _MOE8_LOG = set()
 _MOE8_DANGER = [0]              # layer calls that fell back because of a tiny-block row
+# Per-call receipt (every rank): sharded MoE calls with stage 2b on for the call, on the MXFP8 input ("mxfp8") or back
+# on the bf16 gather ("bf16": a size whose self-check said OFF, a tiny-block row, no pre-quantized plan). Each rank logs
+# `DSV41_PREFILL_SP fp8 MoE calls rank <r>: mxfp8 <n> bf16 <m> danger <d>` at its first call and every
+# MOE8_RECEIPT_EVERY calls after it (a 131K prompt makes ~320 such calls per rank).
+_MOE8_CALLS = {"mxfp8": 0, "bf16": 0}
+MOE8_RECEIPT_EVERY = 256
 
 
 def _mbn():
@@ -1118,6 +1124,14 @@ def _moe8_call(moe, p, orig, args, kwargs, xf, topk_out, pre):
     return out
 
 
+def _moe8_count(p, used):
+    _MOE8_CALLS["mxfp8" if used else "bf16"] += 1
+    n = _MOE8_CALLS["mxfp8"] + _MOE8_CALLS["bf16"]
+    if n == 1 or n % MOE8_RECEIPT_EVERY == 0:
+        print(f"DSV41_PREFILL_SP fp8 MoE calls rank {p.rank}: mxfp8 {_MOE8_CALLS['mxfp8']} bf16 {_MOE8_CALLS['bf16']} "
+              f"danger {_MOE8_DANGER[0]}", flush=True)
+
+
 def _moe8_log(key, msg):
     if key not in _MOE8_LOG and len(_MOE8_LOG) < 16:
         _MOE8_LOG.add(key)
@@ -1279,6 +1293,10 @@ def _moe8_first(moe, p, x, orig, args, kwargs, a, tgt):
     if p.rank == 0:
         print(f"DSV41_PREFILL_SP fp8 MoE input (M={p.rows}): router on the {router or 'none'}, "
               f"rank 0 {detail} -> {'ON' if ok else 'OFF (bf16 gather for this size)'}", flush=True)
+    else:
+        # every rank's own self-check result (the agreed verdict above is the MIN over the TP group)
+        print(f"DSV41_PREFILL_SP fp8 MoE input (M={p.rows}) rank {p.rank}: local {bool(local)} {detail} -> agreed "
+              f"{'ON' if ok else 'OFF'}", flush=True)
     if _ctx.dbg is not None:
         _rec("min", xb, True)
     del xb
@@ -1377,6 +1395,8 @@ def _make_moe_forward(orig):
         v4 = _M["v4"]
         if p.sharded and fp8_moe_on():
             o8 = _moe8_forward(self, p, hidden_states, orig, args, kwargs)
+            # the first call of a size returns the stock output when its self-check said OFF
+            _moe8_count(p, o8 is not None and bool(_MOE8.get(p.rows, {}).get("ok")))
             if o8 is not None:
                 if o8.shape[0] != p.rows:
                     raise RuntimeError(f"DSV41_PREFILL_SP: MoE returned {tuple(o8.shape)} for {p.rows} rows")

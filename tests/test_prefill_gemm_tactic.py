@@ -243,6 +243,47 @@ def test_wrapper_dispatch_and_fail_closed():
     reset()
 
 
+def test_per_call_and_per_rank_receipts():
+    """Release-gate receipts: every rank logs its tactic-call count at its first call and every RECEIPT_EVERY calls,
+    and every rank but 0 logs its own boot-check result (rank 0 keeps the per-shape lines and the summary)."""
+    import contextlib
+    import io
+    reset(shapes="64x256@256")
+    os.environ[pgt.GATE] = "1"
+    calls = []
+    serving = make_serving(calls)
+    use_runner(FakeRunner(calls=calls))
+    mm = pgt.make_raw_mm(serving)
+    pgt._DECIDED[(64, 256, 256)] = True
+    qx, qw, sx, sw = operands()
+    every, pgt.RECEIPT_EVERY = pgt.RECEIPT_EVERY, 3
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            for _ in range(7):
+                mm(qx, qw.t(), sx, sw, out_dtype=BF16, backend="b12x")
+            mm(operands(m=128)[0], qw.t(), operands(m=128)[2], sw, out_dtype=BF16, backend="b12x")  # not a table M
+    finally:
+        pgt.RECEIPT_EVERY = every
+    lines = [ln for ln in buf.getvalue().splitlines() if " calls rank " in ln]
+    assert lines == [f"{pgt.TAG} calls rank -1: tactic {n} serving 0 errors 0" for n in (1, 3, 6)], lines
+    assert pgt.STATS["tactic_calls"] == 7
+    # boot check on a non-zero rank: its own line, no shape lines
+    _arm(make_serving(), "64x256@256,128x512@128")
+    use_runner(FakeRunner(bump_m=128))
+    r0 = pgt._rank0
+    pgt._rank0 = lambda: False
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            pgt.boot_check(device=torch.device("cpu"))
+    finally:
+        pgt._rank0 = r0
+    out = buf.getvalue().splitlines()
+    assert out == [f"{pgt.TAG} boot check rank -1: local 1/2 bit-identical -> agreed 1/2"], out
+    reset()
+
+
 def _arm(serving, shapes):
     reset(shapes=shapes)
     os.environ[pgt.GATE] = "1"

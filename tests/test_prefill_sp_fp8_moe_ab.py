@@ -6,7 +6,9 @@
 2. prefill_sp.fp8_moe_on() follows the replayed variant per call (variant 0 off, variant 1 on), the process gate
    alone without the harness, and is off whenever FP8_MOE is off;
 3. the MoE wrapper dispatches on fp8_moe_on() (not on the import-time constant), so A and A' run the bf16 gather;
-4. prefill_sp and moe_b12x_next are among the hashed sources (two nodes with different copies refuse to run).
+4. prefill_sp and moe_b12x_next are among the hashed sources (two nodes with different copies refuse to run);
+5. the release-gate receipts: every rank counts its stage-2b MoE calls (MXFP8 input vs bf16 fallback) and logs them at
+   its first call and every MOE8_RECEIPT_EVERY calls; every rank but 0 logs its own per-size self-check line.
   python3 tests/test_prefill_sp_fp8_moe_ab.py
 """
 import importlib.util
@@ -88,13 +90,37 @@ def main():
         for k in (KEY, "DSV41_PREFILL_SP", "DSV41_AB_BASE"):
             os.environ.pop(k, None)
         sys.meta_path[:] = [f for f in sys.meta_path if type(f).__name__ != "_Finder"]
+    # 5. receipts (prefill_sp loaded fresh: the counters start at zero)
+    import contextlib
+    import io
+    import types
+    spr = load("prefill_sp_receipts", os.path.join(ADAPTER, "prefill_sp.py"))
+    spr.MOE8_RECEIPT_EVERY = 3
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        for used in (True, False, True, True, True, False, True):
+            spr._moe8_count(types.SimpleNamespace(rank=2), used)
+    lines = buf.getvalue().splitlines()
+    want = ["DSV41_PREFILL_SP fp8 MoE calls rank 2: mxfp8 1 bf16 0 danger 0",
+            "DSV41_PREFILL_SP fp8 MoE calls rank 2: mxfp8 2 bf16 1 danger 0",
+            "DSV41_PREFILL_SP fp8 MoE calls rank 2: mxfp8 4 bf16 2 danger 0"]
+    if lines != want:
+        fails.append(f"per-call receipt lines {lines}")
+    if spr._MOE8_CALLS != {"mxfp8": 5, "bf16": 2}:
+        fails.append(f"per-call counters {spr._MOE8_CALLS}")
+    src = inspect.getsource(spr._make_moe_forward)
+    if '_moe8_count(p, o8 is not None and bool(_MOE8.get(p.rows, {}).get("ok")))' not in src:
+        fails.append("the MoE wrapper does not count its stage-2b calls (a first call whose check said OFF is bf16)")
+    src = inspect.getsource(spr._moe8_first)
+    if 'rank {p.rank}: local {bool(local)} {detail} -> agreed' not in src:
+        fails.append("no per-rank self-check line on the non-zero ranks")
     # default: no env -> off, and the harness inactive
     sp0 = load("prefill_sp_default", os.path.join(ADAPTER, "prefill_sp.py"))
     if sp0.FP8_MOE or sp0.fp8_moe_on() or sp0.MODE != "off":
         fails.append("not off by default")
     for f in fails:
         print("FAIL", f)
-    print(f"test_prefill_sp_fp8_moe_ab: {'ALL 1 OK' if not fails else str(len(fails)) + ' FAIL'}")
+    print(f"test_prefill_sp_fp8_moe_ab: {'ALL OK' if not fails else str(len(fails)) + ' FAIL'}")
     return 1 if fails else 0
 
 

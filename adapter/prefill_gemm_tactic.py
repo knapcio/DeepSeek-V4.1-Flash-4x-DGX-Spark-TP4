@@ -85,6 +85,7 @@ _DECIDED = {}            # (n, k, m) -> True after the agreed boot check; absent
 _LOGGED = set()
 STATE = {"armed": False, "booted": False, "pins": None, "boot_s": None, "reason": "not installed"}
 STATS = {"tactic_calls": 0, "serving_calls": 0, "errors": 0}
+RECEIPT_EVERY = 4096        # `<TAG> calls rank <r>: tactic <n> ...` at the first tactic call and every 4096th after it
 AGREE = [True]           # CPU tests switch the TP agreement off
 _RUNNER = [None]         # (runner, workspace getter) once resolved
 _CONFIG = [None]
@@ -280,6 +281,13 @@ def _capturing(t):
     return t.is_cuda and torch.cuda.is_current_stream_capturing()
 
 
+def _rank():
+    try:
+        return torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:  # noqa: BLE001
+        return -1
+
+
 def _rank0():
     try:
         return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -308,6 +316,11 @@ def make_raw_mm(original):
                     res = None
                 if res is not None:
                     STATS["tactic_calls"] += 1
+                    n = STATS["tactic_calls"]
+                    if n == 1 or n % RECEIPT_EVERY == 0:
+                        # per-call receipt, every rank (a 131K prompt makes ~2,700 tactic calls per rank)
+                        print(f"{TAG} calls rank {_rank()}: tactic {n} serving {STATS['serving_calls']} "
+                              f"errors {STATS['errors']}", flush=True)
                     if key not in _LOGGED and _rank0():
                         _LOGGED.add(key)
                         print(f"{TAG} first live call N={key[0]} K={key[1]} M={key[2]} -> {LABEL}", flush=True)
@@ -475,6 +488,10 @@ def boot_check(device=None, tactic=None):
                   f"{LABEL if ok else BACKEND + ' (serving call)'}", flush=True)
         print(f"{TAG} boot check: {n_on}/{len(shapes)} shapes on {LABEL.split(' ')[0]}, agreed over TP, "
               f"{STATE['boot_s']} s; gate {'ON' if _gate_any() else 'off'} at start", flush=True)
+    else:
+        # every other rank's own result (the shape lines above are rank 0's; the verdict is the MIN over TP)
+        print(f"{TAG} boot check rank {_rank()}: local {sum(local)}/{len(shapes)} bit-identical -> agreed {n_on}/{len(shapes)}",
+              flush=True)
     STATE["reason"] = f"boot check {n_on}/{len(shapes)}"
     return dict(_DECIDED)
 
