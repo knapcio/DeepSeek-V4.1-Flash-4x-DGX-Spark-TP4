@@ -616,6 +616,7 @@ def _wrap_wo_a(inner):
         finally:
             _state["woa_depth"] -= 1
 
+    _apply_wo_a_bf16_matmul.__wrapped__ = inner  # inspect.unwrap reaches the inner dispatch (engine pins)
     _apply_wo_a_bf16_matmul._dsv41_l2_prefetch = True
     return _apply_wo_a_bf16_matmul
 
@@ -646,6 +647,7 @@ def install_fp8_utils(module):
             _after_linear()
         return out
 
+    linear.__wrapped__ = original
     module.flashinfer_mxfp8_blockscaled_linear = linear
     logger.warning("DSV41_L2_PREFETCH: MXFP8 linears recorded (budget %.1f MB/window)", _budget() / 2**20)
 
@@ -665,6 +667,7 @@ def install_router(module):
             _after_router()
         return out
 
+    tiny_gemm_bf16.__wrapped__ = original
     module.tiny_gemm_bf16 = tiny_gemm_bf16
 
 
@@ -687,6 +690,7 @@ def install_roce(module):
         _before_collective("ag", kwargs.get("stream"))
         return ag(self, inp, *args, **kwargs)
 
+    all_reduce.__wrapped__, all_gather.__wrapped__ = ar, ag
     cls.all_reduce, cls.all_gather = all_reduce, all_gather
     _lib()
     logger.warning("DSV41_L2_PREFETCH: RoCE collectives prefetch the next weights into L2")
@@ -714,6 +718,8 @@ def _bracket(cls, lm_head=False, gate=None):
         finally:
             _end_forward()
 
+    # inspect.unwrap reaches the engine's forward (prefill_sp pins v4.DeepseekV4Model.forward)
+    forward.__wrapped__ = original
     cls.forward = forward
 
 
@@ -746,6 +752,7 @@ def install_model(module):
                 _state["lm_head"][id(self.model)] = head
             return orig_causal(self, *args, **kwargs)
 
+        causal_forward.__wrapped__ = orig_causal
         causal.forward = causal_forward
         extras.append("LM head")
     if _installed("AHEAD"):
@@ -785,6 +792,7 @@ def install_engram(module):
         _before_engram()
         return original(self, indices, *args, **kwargs)
 
+    _owned_rows.__wrapped__ = original
     emb._owned_rows = _owned_rows
     logger.warning("DSV41_L2_PREFETCH: Engram row joins prefetch %.1f MB of engram.wkv",
                    _mb("DSV41_L2_PREFETCH_ENGRAM_MB", "12") / 2**20)

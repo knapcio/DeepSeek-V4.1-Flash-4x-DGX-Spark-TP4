@@ -10,7 +10,12 @@
 4. a WOB take that already holds every wo_b byte leaves the scales only; one that holds everything plans no W2;
 5. two layers: one W2 window per wo_a call, each on its own layer's wo_b;
 6. the fork: _before_wo_a numbers the wo_a calls, forks the planned window on the second side stream, is a no-op
-   past the learned count, when the forward is not bracketed, and when WOB2 is off (no event either).
+   past the learned count, when the forward is not bracketed, and when WOB2 is off (no event either);
+7. every wrapper l2_prefetch installs (every install_* with every sub-gate on, incl. the v6 W2 hook inside the wo_a
+   recorder) unwraps to the engine's own function (inspect.unwrap: the adapters that hash-pin engine sources, e.g.
+   prefill_sp's v4.DeepseekV4Model.forward, see the stock source after the bracket), and a second install changes
+   nothing; the sweep compares every callable of the fake modules, so a new wrapper without __wrapped__ fails here,
+   not in the image's engine-pin probe.
   CUDA_VISIBLE_DEVICES= PYTHONPATH=adapter python3 tests/test_l2_prefetch_wob2.py
 """
 import os
@@ -177,6 +182,88 @@ def test_wrapper_order():
         assert outer(None, None) == "out" and calls == ["record", "W"], calls
     finally:
         l2._record_wo_a, l2._before_wo_a = saved_rec, saved_before
+
+
+
+def test_every_wrapper_unwraps_to_engine():
+    """Every install_* of l2_prefetch, every install-time sub-gate on: each engine attribute it replaced unwraps to
+    the stock function (the sweep compares every callable of the fake modules, so it catches a new wrapper too).
+    Nine wrappers: no v5 SHPF in this tree, so DeepseekV2MoE._forward_shared_experts and
+    DeepseekV4DecoderLayer._hc_mix_stats must stay the engine's own."""
+    import inspect
+
+    def stock(name):
+        def fn(*args, **kwargs):
+            return (name, args[-1] if args else None)
+        fn.__name__ = fn.__qualname__ = name
+        return fn
+
+    def cls(name, *methods):
+        return type(name, (), {m: stock(f"{name}.{m}") for m in methods})
+
+    v2 = types.SimpleNamespace(DeepseekV2MoE=cls("DeepseekV2MoE", "_forward_shared_experts"),
+                               tiny_gemm_bf16=stock("tiny_gemm_bf16"))
+    fp8 = types.SimpleNamespace(flashinfer_mxfp8_blockscaled_linear=stock("flashinfer_mxfp8_blockscaled_linear"))
+    roce = types.SimpleNamespace(RoceOneshotAllReduce=cls("RoceOneshotAllReduce", "all_reduce", "all_gather"))
+    v4 = types.SimpleNamespace(DeepseekV4Model=cls("DeepseekV4Model", "forward"),
+                               DeepseekV4DecoderLayer=cls("DeepseekV4DecoderLayer", "_hc_mix_stats"),
+                               DeepseekV4ForCausalLM=cls("DeepseekV4ForCausalLM", "forward"),
+                               _apply_wo_a_bf16_matmul=stock("_apply_wo_a_bf16_matmul"))
+    draft = types.SimpleNamespace(DeepseekV4ForCausalLMDSpark=cls("DeepseekV4ForCausalLMDSpark", "forward"))
+    engram = types.SimpleNamespace(EngramEmbedding=cls("EngramEmbedding", "_owned_rows"))
+    mods = dict(v2=v2, fp8=fp8, roce=roce, v4=v4, draft=draft, engram=engram)
+
+    def callables():
+        out = {}
+        for mname, m in mods.items():
+            for k, v in vars(m).items():
+                if isinstance(v, type):
+                    out.update({(mname, k, a): f for a, f in vars(v).items() if callable(f) and not a.startswith("__")})
+                elif callable(v):
+                    out[(mname, k)] = v
+        return out
+
+    def install_all():
+        l2.install_fp8_utils(fp8)
+        l2.install_router(v2)
+        l2.install_roce(roce)
+        l2.install_model(v4)
+        l2.install_draft(draft)
+        l2.install_engram(engram)
+        l2._ensure_wo_a([v4])
+
+    before = callables()
+    gates = {f"DSV41_L2_PREFETCH_{g}": "1" for g in ("WOA", "LMHEAD", "DRAFT", "ENGRAM", "MOE", "AHEAD")}
+    gates.update(DSV41_L2_PREFETCH_WOB2_MB="10", DSV41_L2_PREFETCH_WOA_MB="6", DSV41_L2_PREFETCH_WOB_MB="0",
+                 DSV41_L2_PREFETCH_ENGRAM_MB="12")
+    saved = {k: os.environ.get(k) for k in gates}
+    lib, l2._lib = l2._lib, lambda: None    # install_roce builds the CUDA helper; not needed for wrapping
+    try:
+        os.environ.update(gates)
+        install_all()
+        after = callables()
+        install_all()                        # idempotent: no wrapper of a wrapper
+        assert callables() == after
+    finally:
+        l2._lib = lib
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert before.keys() == after.keys()
+    wrapped = {k for k in before if after[k] is not before[k]}
+    expect = {("fp8", "flashinfer_mxfp8_blockscaled_linear"), ("v2", "tiny_gemm_bf16"),
+              ("roce", "RoceOneshotAllReduce", "all_reduce"), ("roce", "RoceOneshotAllReduce", "all_gather"),
+              ("v4", "DeepseekV4Model", "forward"), ("v4", "DeepseekV4ForCausalLM", "forward"),
+              ("v4", "_apply_wo_a_bf16_matmul"), ("draft", "DeepseekV4ForCausalLMDSpark", "forward"),
+              ("engram", "EngramEmbedding", "_owned_rows")}
+    assert wrapped == expect, sorted(wrapped ^ expect)
+    for k in sorted(wrapped):
+        w = after[k]
+        assert getattr(w, "__module__", None) == "l2_prefetch", k
+        assert inspect.unwrap(w) is before[k], f"{'.'.join(k)} does not unwrap to the engine's function"
+        assert inspect.getsource(inspect.unwrap(w)) == inspect.getsource(before[k])
 
 
 if __name__ == "__main__":
