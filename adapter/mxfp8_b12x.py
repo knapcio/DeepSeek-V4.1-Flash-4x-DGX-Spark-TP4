@@ -67,6 +67,13 @@ def install(module):
     if mxfp8_backend_disabled(want):
         return
     original = module.flashinfer_mxfp8_blockscaled_linear
+    # DSV41_PREFILL_GEMM_TACTIC (adapter/prefill_gemm_tactic.py, off by default): measured prefill shapes on CUTLASS
+    # tactic 5 after a boot bit-identity check. Wraps the raw mm_mxfp8 FIRST, so the row split below captures it.
+    try:
+        import prefill_gemm_tactic
+        prefill_gemm_tactic.install_fp8_utils(module, want)
+    except Exception as exc:  # an opt-in knob must not stop the stock route
+        logger.warning('DSV41_PREFILL_GEMM_TACTIC not installed: %r', exc)
     # DSV41_PREFILL_GEMM_ROW_SPLIT (adapter/prefill_gemm_split.py, off by default): K >= 5120 GEMMs of >= 8192 rows as
     # row blocks of the same kernel, bit-identity checked per shape. None = not installed, the path below is unchanged.
     row_split = None

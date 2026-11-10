@@ -359,6 +359,10 @@ V272_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
     r"            # Gated on DSV41_PREFILL_CED_SKIP=1 \(or an armed in-boot A/B naming it.*?install_ced_backend\(module\)\n",
     r"            # DSV41_PREFILL_CED_SKIP: final prompt lengths by rid.*?install_ced_forward_batch\(module\)\n",
 ))
+# perf/prefill-gemm-tactic-20261110: the DSV41_PREFILL_GEMM_TACTIC boot-check hook (default off)
+PGT_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
+    r"            # Gated on DSV41_PREFILL_GEMM_TACTIC \(off by default\).*?boot check not installed: \{exc!r\}', flush=True\)\n",
+))
 
 
 class DefaultOff(unittest.TestCase):
@@ -373,7 +377,7 @@ class DefaultOff(unittest.TestCase):
         self.assertEqual(n, 1, "trim2 block")
         s, n = T.PROMPT_TAIL_SITE_BLOCK.subn("", s)        # v2.6.6's prompt-tail hook
         self.assertEqual(n, 1, "prompt-tail block")
-        for rx in V271_SITE_BLOCKS + V272_SITE_BLOCKS:      # v2.7.1's and v2.7.2's hooks
+        for rx in V271_SITE_BLOCKS + V272_SITE_BLOCKS + PGT_SITE_BLOCKS:   # v2.7.1's, v2.7.2's and later hooks
             s, n = rx.subn("", s)
             self.assertEqual(n, 1, rx.pattern[:60])
         self.assertEqual(hashlib.sha256(s.encode()).hexdigest(), T.SITE_F744D83_SHA)
