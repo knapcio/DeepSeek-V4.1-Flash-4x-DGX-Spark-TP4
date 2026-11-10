@@ -1,12 +1,13 @@
 # Changelog
 
-## v2.7.2 (candidate; release gate pending)
+## 2026-11-10 v2.7.2
 
 v2.7.1 plus one lossless prefill change in the production profile (`DSV41_PREFILL_CED_SKIP=1`, one key appended to
 `EXTRA_CONTAINER_ENV`). The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin
 (8,541,952 tokens at fraction 0.85), the launch line, `--swa-prefix-tails 384` and every v2.7.1 key are unchanged.
 Measured on the four Sparks against v2.7.1 in the same boot (in-boot A/B with two control arms, the official 1017
-checkpoint, 2026-11-09); the release gate is still to run.
+checkpoint, 2026-11-09), then in the release gate below (official 1017 checkpoint). In production on the four Sparks
+since 2026-11-10 01:02 (abliterated checkpoint).
 
 - **Prefill: non-final chunks run the late layers on one row (`DSV41_PREFILL_CED_SKIP=1`,
   `adapter/prefill_ced_skip.py`).** The launch runs SGLang's decoder SWA bounded replay: every prefill chunk runs
@@ -41,6 +42,43 @@ checkpoint, 2026-11-09); the release gate is still to run.
   (vLLM patches 0229-0255, 0255 "keep one decoder row of unread nonfinal chunks", and 0526-0527, Apache-2.0) to
   SGLang's decoder SWA bounded replay; the adaptation and its proof of which rows are read are described in the
   adapter's header.
+
+Release gate (run `run-20261109-191418-2004513`, 2026-11-09/10, 342 min including the restore of production): v2.7.1 /
+v2.7.2 / v2.7.1, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU
+clock capped at 2200 MHz. The controls are production v2.7.1's image and profile; the v2.7.2 boot ran a gate image of
+`1993630` (production v2.7.1's image with this release's changed files added) with one profile difference,
+`DSV41_PREFILL_CED_SKIP=1`. KV pool 8,541,952 tokens on all three boots. Verdict: **PASS -> RELEASE**, every rule
+(decode, sampled, load, cold prefill, memory, qeval, idle CPU, idle first token, inter-token gaps, long-prompt decode),
+0 safety, 0 kill, 0 invalid, restore PASS.
+- **Prefill, cold** (median of three flushed prompts; v2.7.1 / v2.7.2 / v2.7.1): 64K 6,264 / 6,488 / 6,395 tok/s
+  (x1.025 of the controls' mean), 131K 6,379 / 6,611 / 6,393 (x1.035), 1M (968K tokens) 5,233 / 5,485 / 5,247 (x1.047).
+  A cold 388,000-token prompt (solo, median of three): first token 62.78 / 59.72 / 62.46 s (x1.051 / x1.046 the speed of
+  the two controls). Smaller than the in-boot A/B above (+6.2 % at 131K).
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.7.1 / v2.7.2 / v2.7.1): greedy c1 all-prompt geomean 90.09 /
+  89.91 / 89.86 tok/s (runs 89.82 / 90.37, 89.46 / 90.37, 89.06 / 90.66) and prose 66.74 / 66.64 / 66.54; c4 135.72 /
+  135.30 / 135.81, c8 167.96 / 172.37 / 171.39 and c16 216.59 / 215.56 / 216.03 aggregate tok/s. Sampled (T 0.7, top-p
+  0.95, one run per cell): c1 87.84 / 87.35 / 87.47 and prose 62.50 / 64.62 / 64.06 tok/s, c4 133.36 / 131.92 / 134.59.
+  Speedbench load c16 226.33 / 228.62 / 228.52 aggregate tok/s (median TTFT 468 / 468 / 466 ms, p99 inter-token gap
+  296 / 282 / 290 ms). v2.7.2 against the mean of the controls: greedy c1 x0.999, c4 x0.997, c8 x1.016, c16 x0.997;
+  sampled c1 x0.997, c4 x0.985; load c16 x1.005; all inside the gate's bands (the skip touches only non-final prefill
+  chunks). Median first token at c1 166-167 ms on every boot.
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; all 75 T = 0 prompts inside the
+  controls' bracket (75 stable, 0 outside). KLD against the controls: short 0.0057, long 0.0037 (limit 0.035). T = 1
+  distribution check PASS (p 0.994, 12,000 samples). The 16 thinking-on reasoning prompts gave the same lengths on all
+  three boots (mean 122.7 tokens). Needles 256K (248,153 tokens, 38.3 s) and 1M (968,936 tokens, 177.2 s) found. An
+  evicted 302,048-token resume point replayed one 8,192-token chunk on every boot (first token 2.19 / 2.07 / 2.17 s).
+- **Draft acceptance.** The rule now judges the pooled ratio (all tokens over all steps, both runs), as decided after
+  the v2.7.1 gate: c1 x1.001, c4 x0.997, c8 x1.009, c16 x0.999 of the lower control; qeval at T = 0 3.979 accepted
+  tokens per verify step on all three boots.
+- **Long-prompt decode** (new rule: flushed 32K x 2 and 131K x 3 documents of natural text, each followed by a 512-token
+  greedy continuation with the server's DSpark counters): decode 92.32 / 92.87 / 92.86 tok/s, 3.59 / 3.64 / 3.61 tokens
+  per step.
+- **Memory and the rest.** Head memory low-water 8.41 GiB (controls 8.48 / 8.54), during the cold 1M prompts 8.56 GiB
+  (8.62 / 8.54; new rule: within 0.25 GiB of the lower control); the issue-16 soak 313 / 313 requests ok and its
+  companion load 226 requests, 0 failed; idle first token median 194 ms (190 / 193); a short prompt beside a cold 131K
+  prefill answered its first token in 0.33 s (0.37 / 0.36); every node logged the CED skip armed and its forward
+  receipts, with no unknown-length warning; no Xid on any boot. A deliberately cold boot of v2.7.2 (tuning caches off)
+  before the arms: ready in 171 s, no Xid, core dump or fault line on any node.
 
 ## 2026-11-09 v2.7.1
 
