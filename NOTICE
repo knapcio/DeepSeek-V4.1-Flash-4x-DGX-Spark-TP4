@@ -112,6 +112,11 @@ Third-party components and their licences:
   LICENSE.sglang), split into its projection and its stores. adapter/extend_nosync.py (DSV41_EXTEND_NOSYNC, default
   off) applies small textual edits to SGLang's late-layer tail metadata functions at import and copies no other
   SGLang source. The prefill row split, the keep-cache and the wo_b L2 window are this repository's own code.
+- v2.7.2: adapter/prefill_ced_skip.py (DSV41_PREFILL_CED_SKIP) is ported from Christopher Owen (christopherowen),
+  spark-ds41f (Apache License 2.0): vLLM patches 0229-0255 (0255 "CED skip: keep one decoder row of unread nonfinal
+  chunks") and 0526-0527 (ced.py nonfinal_limits), adapted to SGLang's decoder SWA bounded replay (the late-layer tail
+  layout of the dsv4.1 branch); the port's changes are described in the file header. It wraps SGLang's tail metadata
+  builder at import and copies no SGLang source.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

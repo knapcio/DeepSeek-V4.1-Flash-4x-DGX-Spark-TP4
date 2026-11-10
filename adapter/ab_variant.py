@@ -93,14 +93,17 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            "DSV41_PREFILL_KEEP_CACHE", "DSV41_PREFILL_KEEP_CACHE_PAD",
            # adapter/cert_head.py X3b: masked-mode row cap, read per verify step on the host (same graphs);
            # and the qualified row counts, read per capture (a subset of the process list; X3 arm, TEST ONLY)
-           "DSV41_CERT_HEAD_MASK_MAX_M", "DSV41_CERT_HEAD_M")
+           "DSV41_CERT_HEAD_MASK_MAX_M", "DSV41_CERT_HEAD_M",
+           # adapter/prefill_ced_skip.py: non-final prefill chunks run the late layers on one row (eager, per call)
+           "DSV41_PREFILL_CED_SKIP")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
                 "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0}
 HASHED_SOURCES = ("ab_variant", "l2_prefetch", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
                   "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
-                  "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early")
+                  "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early",
+                  "prefill_ced_skip")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")

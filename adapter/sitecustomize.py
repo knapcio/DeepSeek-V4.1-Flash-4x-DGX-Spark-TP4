@@ -80,6 +80,13 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_EXTEND_NOSYNC', '0').strip().lower() not in ('0', '', 'off', 'false', 'no'):
                 from extend_nosync import install_backend as install_extend_nosync_backend
                 install_extend_nosync_backend(module)
+            # Gated on DSV41_PREFILL_CED_SKIP=1 (or an armed in-boot A/B naming it; off by default): non-final prefill
+            # chunks with >= 128 prompt rows after them run the late layers on their last row only
+            # (adapter/prefill_ced_skip.py). AFTER extend_nosync: it wraps whatever is bound. Gate checked inside.
+            from prefill_ced_skip import wanted_at_install as _ced_wanted
+            if _ced_wanted():
+                from prefill_ced_skip import install_backend as install_ced_backend
+                install_ced_backend(module)
             # DSV41_KV_LAYOUT=v41c (adapter/v41c_pool.py) / v41 (adapter/v41_pool.py, v2.7): the writer / reader call
             # sites must be the pinned ones.
             if os.environ.get('DSV41_KV_LAYOUT', '').strip() not in _V41C_OFF:
@@ -95,10 +102,16 @@ class EngramLoader(importlib.abc.Loader):
             # Gated on DSV41_PREFILL_KEEP_CACHE=1 (or an armed in-boot A/B naming it): extend batches carry the
             # requests' final prompt lengths for the keep-cache policy and the indexer padding
             # (adapter/prefill_keep_cache.py). Gate checked inside before anything is wrapped.
+            # The same plumbing serves DSV41_PREFILL_CED_SKIP (adapter/prefill_ced_skip.py: which chunks are non-final).
             from prefill_keep_cache import wanted_at_install as _keep_wanted
-            if _keep_wanted():
+            from prefill_ced_skip import wanted_at_install as _ced_wanted_fb
+            if _keep_wanted() or _ced_wanted_fb():
                 from prefill_keep_cache import install_forward_batch as install_keep_cache_forward_batch
                 install_keep_cache_forward_batch(module)
+            # DSV41_PREFILL_CED_SKIP: final prompt lengths by rid (the eager runner's batch copy drops extra attributes)
+            if _ced_wanted_fb():
+                from prefill_ced_skip import install_forward_batch as install_ced_forward_batch
+                install_ced_forward_batch(module)
         elif module.__name__ == 'sglang.srt.mem_cache.deepseek_v4_memory_pool':
             # Only in the finder when DSV41_KV_LAYOUT is set and not v4: ratio-1/2 pools as V4.1 FP4 records (v41c),
             # or the whole V4.1 layout pair on SM12x (v41, v2.7). v41c_pool.enabled() raises on any value but v4 /

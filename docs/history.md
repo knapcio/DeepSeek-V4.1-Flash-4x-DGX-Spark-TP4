@@ -4,6 +4,57 @@ Every dated table, note and rejected experiment that used to live in the README,
 
 The rows from before the sparkDash 1.8.8 sections were taken with sparkDash up to 1.8.6. sparkDash 1.8.7 replaced the code prompts (c1 and the concurrent waves), so those code columns are not comparable with the 1.8.8 tables; the prose, structured and prefill prompts are unchanged. From v2.6 (2026-10-27) the README reports speedbench only.
 
+## v2.7.1 release, 2026-11-09, speedbench (the README's current results until v2.7.2)
+
+The README's v2.7.1 results and release gate, moved here (headings demoted, links adjusted, text unchanged) when v2.7.2 was released on 2026-11-10. The v2.7.2 numbers are in the [README](../README.md#current-results).
+
+**v2.7.1** (2026-11-09, in production on the four Sparks since 2026-11-09 14:48) is v2.7 plus five lossless changes in the production profile: the two K = 5120 dense GEMMs of a prefill chunk run on 4096-row blocks that stay in L2 (`DSV41_PREFILL_GEMM_ROW_SPLIT=4096 DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152`, every shape checked bit for bit against the stock GEMM on every rank at its first call); the L2 window beside the attention core warms `wo_b` instead of `wo_a` (`DSV41_L2_PREFETCH_WOA_MB=0 DSV41_L2_PREFETCH_WOB_MB=6`); extends without host syncs and MoE launches without the PyTorch dispatcher (`DSV41_EXTEND_NOSYNC=1`, `DSV41_MOE_LAUNCH_PREPARED=plan,direct`); for sampled requests, the draft-KV commit reused from the verify graph and the draft probabilities computed while it runs (`DSV41_SAMPLED_COMMIT_REUSE=1 DSV41_SAMPLED_DRAFT_PROBS_EARLY=1`); and a wider prefill bypass (`DSV41_PREFILL_BYPASS=8192`, was 256: a 500-token prompt beside a cold 131K prefill answers in 1.3-1.7 s instead of 26-28 s). In its release gate against two v2.7 control boots on the official checkpoint: greedy decode c1 **+1.0 %**, c4 **+2.6 %**, c8 +3.2 % and c16 **+3.6 %** (aggregate, against the mean of the controls), sampled c1 +2.7 % and c4 +3.4 %, speedbench load at c16 +6.3 %, median first token at c1 166 ms instead of 207 ms, and cold prefill **+4.1 to +4.7 %** at 64K, 131K and 1M. Outputs: qeval 71 / 71 / 71, all 75 T = 0 qeval prompts inside the controls' own spread, KLD 0.007 short / 0.006 long (limit 0.035), draft acceptance on qeval identical on the three boots, reasoning length identical. The image stack, the KV pool (8,541,952 tokens at fraction 0.85) and the launch line are v2.7's.
+
+#### speedbench
+
+[speedbench](https://github.com/knapcio/speedbench) 0.3 (`6733653`), full mode: 73 frozen prompts in six categories (prompt set speedbench-v1), 256 output tokens, thinking off, run on the head. v2.7.1 release-gate boot (2026-11-09, official 1017 checkpoint, KV pool pinned at 8,541,952 tokens as in the production profile), mean of two full runs per greedy cell and one run per sampled cell; c1 is the decode tok/s geometric mean over the prompts, c4 to c16 the aggregate tok/s:
+
+| tok/s | all 73 prompts, c1 | prose, c1 | c4 aggregate | c8 aggregate | c16 aggregate |
+|---|---:|---:|---:|---:|---:|
+| greedy (temperature 0) | **89.8** | 66.7 | **135.2** | 171.8 | **216.2** |
+| sampled (temperature 0.7, top-p 0.95, seed 1) | 87.1 | 64.8 | 133.6 | – | – |
+
+The two v2.7 control boots of the same gate gave greedy c1 89.0 / 88.8, c4 131.3 / 132.2, c8 166.2 / 166.8, c16 209.6 / 207.6 and sampled c1 84.4 / 85.3, c4 128.7 / 129.8 tok/s. Speedbench load at c16 gave 229.5 aggregate tok/s, median TTFT 466 ms, per-stream median 17.3 tok/s (controls 216.0 / 216.0 tok/s, 539 / 533 ms).
+
+Per category, greedy c1 (same boots, mean of two full runs):
+
+| tok/s | prose | code | structured | agentic | multilingual | long context | all 73 prompts |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| v2.7.1 | **66.7** | 113.0 | 111.8 | 98.0 | 71.8 | 92.4 | **89.8** |
+| v2.7 (two control boots) | 65.8 / 65.9 | 111.7 / 111.9 | 110.6 / 110.8 | 100.4 / 97.9 | 70.8 / 70.9 | 89.4 / 90.0 | 89.0 / 88.8 |
+
+v2.7.1 runs: all 89.52 / 90.07, prose 66.12 / 67.24, code 112.48 / 113.57, structured 111.05 / 112.50, agentic 98.40 / 97.60, multilingual 71.18 / 72.34, long context 93.25 / 91.46. Median time to first token 166.4 / 166.3 ms (controls 207.3-207.5 ms); 73 of 73 prompts valid in both runs, none failed. Agentic and long context vary most from run to run.
+
+**Under load** (v2.6, one fresh boot of the v2.6 image and profile, the last full load sweep; speedbench load: closed loop, 90 s per level, 256 output tokens, thinking off)
+
+| concurrency | block tok/s | per stream, median tok/s | TTFT, median |
+|---|---:|---:|---:|
+| c1 | 77.3 | 83.3 | 207 ms |
+| c4 | 131.7 | 38.7 | 310 ms |
+| c16 | **211.0** | 16.0 | 539 ms |
+
+Block tok/s is all completion tokens over the wall time of the level, including request start and prefill, so the c1 value sits below the decode geomean above. The v2.7.1 release gate ran load at c16 only: 229.5 aggregate tok/s, median TTFT 466 ms, per-stream median 17.3 tok/s.
+
+**Prefill, cold** (v2.7.1 release gate, the gate's own probes, not speedbench: median of three flushed prompts of 62K, 127K and 968K tokens)
+
+| tok/s | 64K | 131K | 1M (968K tokens) |
+|---|---:|---:|---:|
+| v2.7.1 | **6,308** | **6,400** | **5,253** |
+| v2.7 (two control boots) | 6,028 / 6,045 | 6,096 / 6,134 | 5,022 / 5,067 |
+
+The needle tests at 248K and 968K tokens passed. The four Sparks serve the abliterated variant in production ([`mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated) `517efab`); its edit touches only `attn.wo_b` and `shared_experts.w2` of the main layers (the DSpark draft layers are identical), so the two run within a few percent of each other. The v2.7 tables (abliterated checkpoint) are in [docs/history.md](history.md).
+
+#### v2.7.1 release gate
+
+v2.7 / v2.7.1 / v2.7, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU clock capped at 2200 MHz, 2026-11-09 (run `run-20261109-085149-628062`, 341 min including the restore of production). The controls are production v2.7's image and profile with v2.7.1's `DSV41_PREFILL_BYPASS=8192`, which every boot ran; KV pool 8,541,952 tokens on all three. Every speed, prefill, memory, qeval, idle and latency rule passed, 0 safety, 0 invalid. qeval 71 / 71 / 71 with the same four failed tasks on every boot, all 75 T = 0 prompts inside the controls' bracket, KLD 0.0069 short / 0.0061 long against the controls (limit 0.035), the sampled-token distribution test p 0.994, the 16 thinking-on reasoning prompts the same length on all three boots. Head memory low-water 8.32 GiB (controls 8.34 / 8.36), idle first token 189.6 ms (187.0 / 187.2), load c16 p99 inter-token gap 283 ms (355 / 354). Every node logged the eight new keys armed, and the row split's first-call check passed for both widths on every rank. A deliberately cold boot of v2.7.1 (tuning caches off) was ready in 171 s with no Xid, core dump or fault line.
+
+The verdict text was **FAIL on one rule, draft acceptance at c4**: the median over the 73 speedbench prompts of tokens per stream step was 3.091 for v2.7.1 against 3.168 / 3.250 for the controls, below the rule's 0.98 band. With 255 decoded tokens per prompt that median moves in steps of 255/n (one stream step is about 1.2 %), and the same rule fails a control at c16 (0.976). The pooled acceptance (all tokens over all steps) is equal: c4 2.899 against 2.898 / 2.931, c1, c8 and c16 within 0.3 %; on the 45 prompts whose output was identical in all six runs, tokens per step are identical (3.033), and qeval's T = 0 acceptance is identical on the three boots (3.979). Greedy text at c4 depends on which requests share a batch, which the faster admission shifts. Accepted on review as release-equivalent.
+
 ## v2.7 release, 2026-11-08, speedbench (the README's current results until v2.7.1)
 
 The README's v2.7 results and release gate, moved here (headings demoted, links adjusted, text unchanged) when v2.7.1 was released on 2026-11-09. The v2.7.1 numbers are in the [README](../README.md#current-results).

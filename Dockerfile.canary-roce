@@ -231,7 +231,9 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_extend_nosync.py /sgl-workspace/sglang/python \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_extend_sync_audit_stream.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_sampled_commit_reuse.py \
- && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_sampled_draft_probs_early.py
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_sampled_draft_probs_early.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_prefill_ced_skip.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_prefill_ced_skip_engine.py
 # SGLANG_RUST_BUILD_MODE=never still probes `cargo --version --verbose`, and rustup can
 # hang there for minutes trying to fetch a toolchain (a TP rank stuck before torch
 # distributed init). With no reachable dist server the probe fails at once and the
