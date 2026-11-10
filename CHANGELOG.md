@@ -1,5 +1,57 @@
 # Changelog
 
+## v2.7.3 (candidate, release gate pending)
+
+v2.7.2 plus two lossless prefill changes in the production profile (`DSV41_PREFILL_SP_FP8_MOE=1
+DSV41_PREFILL_GEMM_TACTIC=1`, two keys appended to `EXTRA_CONTAINER_ENV`). The image stack (SGLang tree, FlashInfer
+0.7.2, NCCL 2.30.7 with #2393), the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
+`--swa-prefix-tails 384` and every v2.7.2 key are unchanged. Measured on the four Sparks against the v2.7.2 profile in
+the same boot (in-boot A/B with two control arms, the official 1017 checkpoint, 2026-11-10); the release gate has not
+run yet.
+
+- **Prefill: the MoE input is gathered as MXFP8 (`DSV41_PREFILL_SP_FP8_MOE=1`, `adapter/prefill_sp.py` stage 2b).**
+  Prefill sequence parallel all-gathers each full-row layer's MoE input as bf16 rows, and b12x then quantizes them to
+  MXFP8 inside the kernel. Stage 2b quantizes on each rank's quarter of the rows, gathers the MXFP8 bytes and UE8M0
+  scales (half the bytes), runs the router and top-k on the shard and hands b12x the gathered input pre-quantized. The
+  first chunk of every row count runs both paths and keeps the MXFP8 gather only if the routing, the gathered bytes
+  (against b12x's own in-kernel quantization) and the MoE output are bit-identical on every rank (MIN over TP); a row
+  with a FlashInfer scale-byte-0 block keeps the bf16 gather for that layer. Measured (five rounds, servebench cold
+  prefill): 131K **+2.52 % [2.40, 2.64]** (A / A' 0.12 %), 32K +0.12 % (four of five rounds +0.4 to +1.4 %, one
+  transient round -3.2 % shared with another arm); cold first token of a flushed 131K document -2.4 % and of a 32K one
+  -2.2 % (all three X runs below all six control runs), about 30 ms per 8192-row chunk; trace: -1.7 ms of non-collective
+  kernel time per full-row layer. Exactness: the 32K first token's top-20 logprobs bit-identical to the controls (3 of
+  3); at 131K, where the controls themselves vary run to run, every X state is a control's or stock code's exact state
+  or inside the controls' spread; the 64-token continuations equal a control's text. Head memory unchanged (11.98
+  against 11.98 / 11.99 GiB). It existed since 2026-09 (off by default); it is in the production profile now.
+- **Prefill: eight dense GEMM shapes on FlashInfer's CUTLASS SM120 MXFP8 tactic 5 (`DSV41_PREFILL_GEMM_TACTIC=1`,
+  `adapter/prefill_gemm_tactic.py`).** The prefill dense MXFP8 GEMMs ran on FlashInfer's b12x kernel with its pinned
+  default plan. A single-GB10 bench of the serving call against every alternative at the prefill row counts found
+  FlashInfer's CUTLASS SM120 block-scaled MXFP8 GEMM, tactic 5 of `mm_mxfp8(backend="cutlass")` (CTA 128x128x128,
+  swap_ab), returning the same bytes and faster: `wo_b` 1.28x and `q_b` 1.12x at 8192 rows, `wqkv_a` 1.33x and the
+  shared FC1 1.37x at the row split's 4096-row blocks, the indexer `q_b` 1.10x. Only an exact (N, K, M) table entry
+  switches (decode, verify and short extends never match). After the target model loads, every rank runs every table
+  shape both ways on three synthetic operand sets quantized as production quantizes activations (gauss, mixed scales,
+  mirrored K halves), compares the bf16 outputs byte for byte (tactic 5 twice), and the ranks agree in one MIN
+  collective; a difference, an exception, FlashInfer sources other than the pinned 0.7.2 ones or no boot check keep
+  the serving call. Measured on top of stage 2b (servebench cold prefill): 131K **+1.90 % [1.20, 2.60]**, 32K +1.79 %
+  [0.45, 3.12] (A / A' 0.04 %); boot check 8 / 8 shapes on every rank (1.2 s); first tokens and the 131K continuations
+  inside the controls' states; head memory +0.005 GiB.
+- **Receipts:** every rank logs its own stage-2b self-check per chunk row count (`... (M=<rows>) rank <r>: local ...
+  -> agreed ON`) and its stage-2b call counts (`DSV41_PREFILL_SP fp8 MoE calls rank <r>: mxfp8 <n> bf16 <m> danger
+  <d>`, first call and every 256); every rank logs its own GEMM-tactic boot-check count and its tactic call counts
+  (`DSV41_PREFILL_GEMM_TACTIC calls rank <r>: tactic <n> ...`, first call and every 4096). Host prints only.
+- **In-boot A/B registry:** `DSV41_PREFILL_SP_FP8_MOE` is a union gate read per MoE call and
+  `DSV41_PREFILL_GEMM_TACTIC` a runtime key (`adapter/ab_variant.py`, test only); `prefill_sp`, `moe_b12x_next` and
+  `prefill_gemm_tactic` are hashed sources.
+- **Image tests:** the canary-roce image runs `tests/test_prefill_gemm_tactic.py` and
+  `tests/test_prefill_sp_fp8_moe_ab.py` at build; `tests/test_adapter_engine_pins.py` checks that the tactic's
+  `ModelRunner.load_model` hook unwraps to the engine function.
+- Rollback, config only: unset both keys (= the v2.7.2 profile on the same image).
+- **Credits:** the GEMM tactic is FlashInfer's CUTLASS SM120 block-scaled MXFP8 GEMM (built on NVIDIA CUTLASS); we
+  only select it at measured shapes. The per-kernel comparison with Christopher Owen's spark-ds41f stack (its TileLang
+  `mxfp8_gemm`, bitwise equal to b12x and a comparison arm of the bench) led us to measure a second kernel at the
+  prefill shapes; no spark-ds41f code is included. Stage 2b is ours.
+
 ## 2026-11-10 v2.7.2
 
 v2.7.1 plus one lossless prefill change in the production profile (`DSV41_PREFILL_CED_SKIP=1`, one key appended to
