@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # the wo_a dispatch it wraps and its install order against wo_a_w8's mid/drop wrapper.
 # DSV41_EXTEND_NOSYNC (off by default) pins the backend tail-metadata source it edits.
 # DSV41_PREFILL_GEMM_TACTIC (off by default) wraps ModelRunner.load_model for its boot check; its wrapper must unwrap to
-# the engine function.
+# the engine function. The probe also re-runs prefill_sp's drift guard after every install (the l2_prefetch bracket wraps
+# the pinned DeepseekV4Model.forward; with the production line's W2 keys its wo_a recorder carries the W2 fork).
 EXTRA_FLAGS = {"DSV41_PREFILL_SP_FP8_MOE": "1", "DSV41_WO_A_INPUT_FP8": "1", "DSV41_EXTEND_NOSYNC": "1",
                "DSV41_PREFILL_GEMM_TACTIC": "1"}
 
@@ -36,6 +37,19 @@ import sglang.srt.model_executor.model_runner as mrm
 mr = mrm.ModelRunner
 assert getattr(mr.load_model, "_dsv41_prefill_gemm_tactic", False), "GEMM tactic boot check not installed"
 assert inspect.unwrap(mr.load_model).__qualname__ == "ModelRunner.load_model", "load_model does not unwrap to the engine"
+import os
+if os.environ.get("DSV41_L2_PREFETCH") == "1":
+    # l2_prefetch brackets DeepseekV4Model.forward (pinned by prefill_sp) and, with _WOA, wraps the wo_a dispatch that
+    # carries the W2 fork: both installed, both unwrap to the engine (every l2_prefetch wrapper keeps __wrapped__)
+    assert getattr(v4.DeepseekV4Model, "_dsv41_l2_prefetch", False), "l2_prefetch bracket not installed"
+    assert inspect.unwrap(v4.DeepseekV4Model.forward).__qualname__ == "DeepseekV4Model.forward", "bracket does not unwrap"
+    if os.environ.get("DSV41_L2_PREFETCH_WOA") == "1":
+        assert getattr(v4._apply_wo_a_bf16_matmul, "_dsv41_l2_prefetch", False), "l2_prefetch wo_a recorder not installed"
+        # the inner dispatch is wo_a_w8's / wo_a_input_fp8's own wrapper (no source pin on it): one level is enough
+        inner = getattr(v4._apply_wo_a_bf16_matmul, "__wrapped__", None)
+        assert inner is not None and not getattr(inner, "_dsv41_l2_prefetch", False), "wo_a recorder without __wrapped__"
+# prefill_sp's drift guard again AFTER every adapter installed: each pinned engine source still unwraps to the stock one
+prefill_sp.check_engine()
 print("adapter engine pins OK")
 """
 
