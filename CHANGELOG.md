@@ -1,5 +1,47 @@
 # Changelog
 
+## v2.7.5 (candidate, release gate pending)
+
+v2.7.4 plus two lossless decode changes in the production profile (`DSV41_MOE_SCALE_CODES=1
+DSV41_MOE_SCALE_CODES_MIN_ROWS=2 DSV41_MOE_EVICT_FIRST=1 DSV41_L2_PREFETCH_SHPF_MB=6 DSV41_L2_PREFETCH_SHPF_EL=0` appended
+to `EXTRA_CONTAINER_ENV`). The image stack, the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
+`--swa-prefix-tails 384` and every v2.7.4 key are unchanged; the image's `runtime/b12x_next` gains two kernel modes
+(scale codes, evict-first; patch chain `... topk-sum-accumulate, scale-codes, evict-first`, `SOURCE_PATCH`
+5e7cd728135ff0df). Each change was measured on the four Sparks against the v2.7.4 profile in the same boot (in-boot A/B
+with two control arms, the official 1017 checkpoint, 2026-11-11); the two were measured in separate boots, never
+together before the release gate. Release gate: TBD.
+
+- **Decode: routed-expert scales as 4-bit codes in the CUDA graphs (`DSV41_MOE_SCALE_CODES=1`, retain mode,
+  `adapter/scale_codes.py`).** Idea: Christopher Owen (spark-ds41f, experiments/2026-10-18-scale-codes). After
+  b12x_next's in-place N64 repack each expert's UE8M0 scale bytes become a 16-byte header (the expert's smallest byte) plus
+  nibbles in storage order, round-tripped on the device at load; FC1 / FC2 expand them into the same shared-memory bytes
+  as the native scales, so outputs are bit-identical. Retain mode keeps the native scales too (+2.03 GiB per rank): the
+  coded experts run only inside CUDA-graph captures of >= `DSV41_MOE_SCALE_CODES_MIN_ROWS` (2) rows, on capacities
+  prepared for codes (compiled and run once at load, so a capture never compiles); the M=1 draft graphs and every eager
+  forward (prefill, stage 2b, eager decode) stay native. New in this release: retain mode without the in-boot A/B (a
+  call is coded while the current stream captures); `DSV41_MOE_SCALE_CODES=release` keeps the codes-only path (native
+  storage released), not fleet-qualified. Measured (tier-12o window Q, 5 rounds, A / X / A'): c16 per step **-3.56 ms**
+  [-5.67, -1.44], c16 sampled -2.35 ms, c4 -1.41 ms [-2.17, -0.64], c1 paired step **-0.32 ms** [-0.36, -0.28]; tok/s
+  c16 +1.67 %, c4 +1.61 %, c1 +1.08 %. Exactness: qeval 75 / 75 T = 0 outputs equal to A, draft acceptance bit-identical
+  at T = 0 (7003 / 11755 on A, A' and X). Head memory low-water 11.87 GiB against A 11.82 GiB (3 graph sets).
+- **Decode: evict-first expert loads protecting a shared-expert L2 window (`DSV41_MOE_EVICT_FIRST=1
+  DSV41_L2_PREFETCH_SHPF_MB=6 DSV41_L2_PREFETCH_SHPF_EL=0`).** Christopher Owen's spark-ds41f #966 (evict_first TMA
+  weight loads in his TileLang MoE) ported to b12x_next's CuTe kernels (`scripts/b12x_next-evict-first.patch`, no code
+  copied): the routed-expert weight copies of the split-materialized W4A8 phase kernels (FC1 w13, FC2 down) carry an L2
+  evict_first policy in CUDA-graph captures of <= 128 rows, so the ~4.4 MB a routed expert streams per step stops
+  flushing the lines worth keeping; the flag-on kernels have their own cache key and are compiled at load (also for the
+  coded experts). The protected window is l2_prefetch v5's SHPF: 6 MB at the FFN-side hyper-connection entry, the shared
+  expert's FC1 remainder and FC2, as a plain prefetch. Cache hints only: bit-identical by construction; the SASS gate
+  (`tests/sass_desc_check.py`) and the unit probe check the hinted copies (the first build hit a ptxas descriptor
+  miscompile, fixed with a 64-bit shared address). Measured (tier-12o window P, A / X / A'): c1 paired step **-0.19 ms**
+  [-0.34, -0.04], c4 per step -0.38 ms [-0.74, -0.01], c4 tok/s +0.83 %; qeval 75 / 75 equal to A. SHPF alone was flat.
+- **Test only:** the in-boot A/B registry keys of both changes (`adapter/ab_variant.py`). Not taken from the test
+  branches: the greedy no-gather draft / verify flavours, the A/B graph-set sharing (`DSV41_AB_GRAPH_SETS`) and the
+  per-variant L2 receipt annotation.
+- **Release gate:** TBD.
+
+Rollback, config only: unset the five keys (= the v2.7.4 profile, same image).
+
 ## 2026-11-11 v2.7.4
 
 v2.7.3 plus three lossless changes in the production profile (`DSV41_DENSE_TILE_TABLE=1 DSV41_PREFILL_MOE_FOLD=1
