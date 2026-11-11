@@ -42,10 +42,14 @@ echo "$COMMIT" > "$OUT/b12x_next/SOURCE_COMMIT"
 #                    producer-loop batch-claim read (dynamic.py). The leader reuses ctrl[7] for the next claim;
 #                    without the barrier a lagging warp can read the NEXT batch_base. Every CTA thread reaches
 #                    it, once per producer iteration.
+#   topk-sum-accumulate: inside fused_moe._impl.topk_sum_accumulate() the dynamic deterministic top-k sum ADDS the
+#                    routed sum into the caller's bf16 output (out = bf16(float(out) + float(bf16(sum))), torch's
+#                    add_ bit for bit) instead of overwriting it; other launch paths refuse under it
+#                    (adapter/prefill_moe_fold.py, DSV41_PREFILL_MOE_FOLD; off unless that context is entered)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PATCHES=("$HERE/b12x_next-compact-n64-m64.patch" "$HERE/b12x_next-prequant-input.patch"
          "$HERE/b12x_next-barrier-zero.patch" "$HERE/b12x_next-det-triton-planner.patch"
-         "$HERE/b12x_next-claim-barrier.patch")
+         "$HERE/b12x_next-claim-barrier.patch" "$HERE/b12x_next-topk-sum-accumulate.patch")
 for PATCH in "${PATCHES[@]}"; do
   (cd "$OUT" && patch -p0 --forward --quiet < "$PATCH")
 done
@@ -55,6 +59,7 @@ grep -q "def _zero_barrier_state" "$OUT/b12x_next/moe/fused_moe/_impl.py" || { e
 grep -q "_compact_w4a8_query(query) and not query.deterministic_output" "$OUT/b12x_next/moe/fused_moe/_tuning.py" \
   && { echo "det-triton-planner patch did not apply" >&2; exit 1; }
 grep -q "All warps retain the claim before the leader can reuse its slot" "$OUT/b12x_next/moe/_shared/kernels/dynamic.py" || { echo "claim-barrier patch did not apply" >&2; exit 1; }
+grep -q "def topk_sum_accumulate" "$OUT/b12x_next/moe/fused_moe/_impl.py" || { echo "topk-sum-accumulate patch did not apply" >&2; exit 1; }
 if command -v sha256sum >/dev/null; then sum=sha256sum; else sum="shasum -a 256"; fi
 cat "${PATCHES[@]}" | $sum | cut -c1-16 > "$OUT/b12x_next/SOURCE_PATCH"
 # leftovers: only thread names / lock-file names of the form "b12x-..." may keep the old word

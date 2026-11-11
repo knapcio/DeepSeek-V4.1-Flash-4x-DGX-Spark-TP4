@@ -332,6 +332,14 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', ''):
                 from l2_prefetch import install_router as install_l2_prefetch_router
                 install_l2_prefetch_router(module)
+            # Gated on DSV41_PREFILL_MOE_FOLD (off by default; per call under an in-boot A/B): the shared-expert add of
+            # a prefill MoE call folded into b12x_next's top-k sum, checked bit for bit per plan capacity
+            # (adapter/prefill_moe_fold.py; needs scripts/b12x_next-topk-sum-accumulate.patch).
+            try:
+                import prefill_moe_fold
+                prefill_moe_fold.install_v2(module)
+            except Exception as exc:
+                print(f'DSV41_PREFILL_MOE_FOLD not installed: {exc!r}', flush=True)
         elif module.__name__ in ('b12x.comm.roce.roce_oneshot', 'b12x.comm.roce_ring.roce_oneshot',
                                  'b12x.comm.roce_twoshot.roce_oneshot'):
             # Gated on DSV41_L2_PREFETCH: RoCEnante all-reduce/all-gather fork the prefetch branch.

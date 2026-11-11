@@ -1,5 +1,144 @@
 # Changelog
 
+## 2026-11-11 v2.7.4
+
+v2.7.3 plus three lossless changes in the production profile (`DSV41_DENSE_TILE_TABLE=1 DSV41_PREFILL_MOE_FOLD=1
+DSV41_WO_A_CFG_TABLE=1` appended to `EXTRA_CONTAINER_ENV`). The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin
+(8,541,952 tokens at fraction 0.85), the launch line, `--swa-prefix-tails 384` and every v2.7.3 key are unchanged; the
+image's `runtime/b12x_next` gains one kernel mode (below). Each change was measured on the four Sparks against the
+v2.7.3 profile in the same boot (in-boot A/B with two control arms, the official 1017 checkpoint, 2026-11-10/11), then
+in the release gate below (official 1017 checkpoint). In production on the four Sparks since 2026-11-11 10:08
+(abliterated checkpoint).
+
+- **Decode: the narrow dense GEMMs on the measured b12x tile (`DSV41_DENSE_TILE_TABLE=1`, `adapter/dense_tile_table.py`).**
+  b12x's default plan runs every N x 5120 MXFP8 weight on the M-independent (64, 64) tile. A single-GB10 sweep of every
+  tile / tile_k / stage-cap config against the production plan (two activations per cell, whole-output byte compare)
+  found all 24 configs bitwise and the (16, 64) tile at M <= 16, (32, 64) at 17..32 rows about 2x faster per call with
+  warm L2 for `qa_kv` (512 x 5120 per rank, 17.4 -> 11.1 us at M 6), the shared-expert FC1 (1152 x 5120, 29.2 -> 13.1 us)
+  and the draft `wkv` (1536 x 5120, 37.9 -> 15.7 us). `adapter/mxfp8_b12x.py` dispatches those keys to the same b12x
+  runner with an explicit tactic; the first eager call of every (shape, M) runs the serving call and the tile on the same
+  inputs and keeps the tile only if the output bytes are equal on every rank (MIN over TP); a default plan other than the
+  measured one, a mismatch or a disagreement keeps the serving call for that key, and an unchecked key inside a graph
+  capture takes the serving call. Measured (tier-10 window S2, 8 rounds, A / X / A'): c1 greedy step **-0.132 ms**
+  paired per prompt (CI95 -0.265 to -0.0003); speed c1 +0.08 %, c1 sampled +1.25 %, c4 +0.62 %, c8 +0.33 %, c16 -0.99 %
+  (c8 / c16: the table is inert above 32 rows; reported only); head memory 13.5 GiB at READY. Exactness: qeval 75 / 75
+  T = 0 outputs equal to both controls (0 noisy tasks), 50 c1 greedy texts on the stable prompts equal. Prefill rows and
+  every other shape are untouched.
+- **Prefill: the shared-expert add folded into the top-k sum (`DSV41_PREFILL_MOE_FOLD=1`, `adapter/prefill_moe_fold.py`).**
+  A prefill MoE call (eager, >= 2048 rows, b12x_next deterministic routed experts, shared experts first, routed scale
+  folded into top-k) wrote the routed top-k sum into a new tensor and added it to the shared experts' output in a
+  separate pass (168 MB in, 84 MB out per 8192-row layer). b12x_next's top-k sum kernel gains an accumulate-into-output
+  mode (`scripts/b12x_next-topk-sum-accumulate.patch`: `out = bf16(float(out) + float(bf16(sum)))`, `add.rn.f32`
+  without ftz, torch's `out.add_(routed)` bit for bit; its own op, the stock op's schema unchanged; `SOURCE_PATCH`
+  a76ad82d137d9c5f), compiled and zero-checked at load per geometry, and the add site returns that tensor. The first call
+  of every plan capacity runs both ways, compares bit for bit and agrees over TP before any fold (that call returns the
+  stock result); a difference, an exception, drifted engine sources (sha256 pins), a missing accumulate variant or a
+  broken return chain keep the stock add. Measured (tier-13 window P, 4 rounds, carried on review): cold 131K first
+  token **-0.96 %** in the exact phase (19.67 s, n 6, against 19.86 s for the controls, n 12; every X sample below every
+  A sample), servebench cold 131K +0.81 / +1.08 / +0.83 % in three rounds (the fourth drifted with A), 32K +0.86 %;
+  memory flat (low-water -0.003 GiB), decode c1 -0.49 % / c4 +0.27 % (inside the controls' own 2.0 / 1.4 % A / A).
+  Boot check bit-identical at capacities 8192 and 4096 on all four ranks; T = 0 states inside the stock code's own
+  (the one new 131K state was also produced by an arm without the fold).
+- **Decode: `wo_a`'s launch table (`DSV41_WO_A_CFG_TABLE=1`, `adapter/wo_a_cfg_table.py`).** An exact-M table of
+  `wo_a`'s 8-bit twin GEMM launches from a single-GB10 sweep (tier-12o window B: every configuration built from the
+  image's own kernel text, bytewise against production on two inputs, eager and graph replay): M = 6 -> `p:64:2:2:b`
+  (production's 16x64 tile, grid, BK 128, SPLIT_K 8 and k order; 2 warps, 2 stages, one exp2 per 32x32 scale block:
+  warm 28.14 -> 11.77 us, cold -2.45 us per call), M = 96 -> `mid:1:32:64:2:3` (production's split_k 1 / BM 32, 2 warps
+  instead of 4: warm -19.18 us, cold -0.96 us). Every other M (M = 24 included) stays on production's launch.
+  `_partial_w8` / `wo_a_mid` ask the table first; the production bodies move unchanged to `_partial_w8_stock` /
+  `_wo_a_mid_stock`. A call takes the table only with the key on, qx off, no `_MID_CFG` drift, a passed load
+  self-check (both launches on the first twinned layer's real bytes and two seeded inputs, a perturbed-exponent negative
+  control that must differ, one TP MIN all-reduce for all entries) and a passed first eager call of its key (uint8
+  compare, TP MIN); unchecked keys inside a capture take production's launch. Measured in one boot against the v2.7.3
+  profile (tier-15 window w, two control arms, 6 rounds, with arms for the `wo_a` table alone, the tile table alone and
+  both): the `wo_a` table c1 greedy step **-0.140 ms** paired per prompt (CI95 -0.283 to +0.003; 5 of 6 rounds
+  faster), c4 / c16 step time -0.21 / -0.51 %, tok/s c1 / c4 / c8 / c16 +0.04 / +0.51 / +0.63 / +0.33 %. In the same
+  boot the tile table alone c1 -0.196 ms (CI95 -0.383 to -0.010), repeating tier-10 S2, and both tables together c1
+  -0.129 ms (CI95 -0.259 to +0.0004), step time c4 -0.82 %, c8 +0.15 % (CI95 -0.30 to +0.59), c16 +0.04 %: at c1 the two
+  do not add up (both shorten GEMMs in the same latency-bound block). qeval 75 / 75 T = 0 outputs equal to the
+  controls' on every arm; every rank logged the load self-check ON at M = 6 and M = 96. Image tests: `test_wo_a_cfg_table.py` (13; interpreter bitwise and, with
+  `TRITON_INTERPRET=0`, the sm_121 PTX lowering).
+- Receipts (every rank): `DSV41_DENSE_TILE_TABLE armed: 3 shapes ...` and one `DSV41 dense tile table N=... K=... M=...
+  tile=...: ...` line per key; `[moe_b12x_next] accumulate top-k sum ready (capacity ..., zero rows -> zero output)`,
+  `DSV41_PREFILL_MOE_FOLD installed: ...`, `DSV41_PREFILL_MOE_FOLD capacity <c> (M=<m>): fold vs stock add ... -> ON`
+  per capacity, `DSV41_PREFILL_MOE_FOLD calls rank <r>: fold <n> check <c> stock <s> errors <e>` at the first fold and
+  every 4096 calls; `[wo_a_cfg_table]` armed, load self-check and first-eager-call lines.
+- Image tests: `test_dense_tile_table.py` (7: identical pair, mismatch incl. -0.0, plan drift, capture guard, M buckets,
+  TP disagreement, gate off per call) and `test_prefill_moe_fold.py` (22: the fold's arithmetic against torch's bf16 add
+  bit for bit over a stride of all bf16 pairs, the frame logic, the runtime patch on disk and its bookkeeping, the real
+  SGLang MoE forward with a CPU stand-in for the b12x launches) join the `Dockerfile.canary-roce` chain; the
+  engine-pin probe checks the three fold wrappers are installed and unwrap to the engine functions; the profile-order
+  tests check the new tail.
+- Not taken from the same test branches: megakernel stage 3 (the b12x dense B-prologue and the early quant trigger,
+  closed), the tier-10 in-boot A/B graph sets (test only) and the prefill hc early-stats rider (closed: slower at 131K
+  and a -6.6 GiB transient).
+- Rollback, config only: unset `DSV41_DENSE_TILE_TABLE`, `DSV41_PREFILL_MOE_FOLD` and `DSV41_WO_A_CFG_TABLE` (= the v2.7.3
+  profile; the adapters do nothing unset, and the patched b12x_next kernel is only selected under the fold key).
+- **Credits:** the tile table runs FlashInfer's b12x SM120 dense MXFP8 GEMM on tiles it already ships (passed as an
+  explicit tactic); the fold extends b12x's W4A16 top-k sum kernel (local-inference-lab / Luke Alonso and Jason,
+  original-el8) with an accumulate-into-output mode. The tables, their sweeps, the patch and the per-rank checks are
+  ours; the `wo_a` table re-launches our own W8 Triton kernel.
+
+Release gate (run `run-20261111-032219-2349055`, 2026-11-11, 03:22 to 09:19, then the restore of production): v2.7.3 /
+v2.7.4 / v2.7.3, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU
+clock capped at 2200 MHz. The controls are production v2.7.3's image and profile; the v2.7.4 boot ran a gate image of
+`891f5e1` (production v2.7.3's image with this release's changed files added) with the three profile keys above. KV
+pool 8,541,952 tokens on all three boots. Verdict: **FAIL -> NO-RELEASE on two rules (the c8 decode step time, and
+exactness at 131K), both reviewed as not caused by the release and accepted as release-equivalent** (below); every
+other rule PASS (decode, sampled, load, c1 step, cold prefill, first-token speed of the flushed documents, memory, qeval,
+idle CPU, idle first token, inter-token gaps, long-prompt decode), 0 safety, restore PASS.
+- **Prefill, cold** (median of three flushed prompts; v2.7.3 / v2.7.4 / v2.7.3): 64K 6,731 / 6,860 / 6,744 tok/s
+  (x1.018 of the controls' mean), 131K 6,915 / 7,053 / 6,888 (x1.022), 1M (969K tokens) 5,630 / 5,734 / 5,720 (x1.010).
+  A cold 388,000-token prompt (solo, median of three): first token 57.30 / 56.47 / 57.15 s (x1.015 / x1.012 the speed
+  of the two controls). The flushed-document first tokens of the exactness probes: 32K 5.07 / 4.98 / 5.10 s, 131K
+  19.83 / 19.61 / 19.86 s, 1M 181.9 / 179.0 / 179.9 s (x1.020 / x1.012 / x1.010 of the controls' mean speed).
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.7.3 / v2.7.4 / v2.7.3): greedy c1 all-prompt geomean 90.05 /
+  90.70 / 91.03 tok/s (runs 90.33 / 89.77, 89.87 / 91.53, 90.72 / 91.35) and prose 66.89 / 67.33 / 67.26; c4 136.98 /
+  138.11 / 136.44, c8 172.93 / 170.00 / 170.39 and c16 216.88 / 216.24 / 215.66 aggregate tok/s. Sampled (T 0.7, top-p
+  0.95, one run per cell): c1 87.87 / 87.52 / 87.92 and prose 65.92 / 65.05 / 64.66 tok/s, c4 133.42 / 136.33 / 135.07.
+  Speedbench load c16 226.82 / 227.91 / 227.24 aggregate tok/s (median TTFT 464 / 467 / 464 ms, p99 inter-token gap
+  284 / 288 / 287 ms). v2.7.4 against the mean of the controls: greedy c1 x1.002, c4 x1.010, c8 x0.990, c16 x1.000;
+  sampled c1 x0.996, c4 x1.016; load c16 x1.004; all inside the gate's tok/s bands. The c1 step paired per prompt on
+  identical work: -0.127 ms (CI95 -0.164 to -0.091) against the controls, but the two controls differed from each other
+  by 0.269 ms (CI95 0.183 to 0.354), more than the rule's A / A limit of 0.15 ms, and v2.7.4 equals the second control
+  to 0.007 ms; this gate shows no c1 loss and resolves no gain, which rests on the in-boot windows above.
+- **c8 decode step time (the rule fired):** 127.01 / 128.85 / 127.49 ms per step (c16 194.42 / 195.00 / 194.64 ms); the
+  rule kills when the release is more than 0.5 % slower than both controls, and v2.7.4 was 1.1 % slower than the
+  closer one. Reviewed as boot-to-boot variation, not a defect: one control boot's own two runs differed by 1.4 % (128.40 /
+  126.58 ms), v2.7.4's c8 tok/s was x0.998 of that control, and a c8 step runs mostly at 36-48 rows, where neither
+  decode table has an entry (the tile table stops at 32 rows, the `wo_a` table has only M = 6 and 96) and the fold never
+  acts. The in-boot A/B of both decode tables against the v2.7.3 profile (tier-15 window w, above) measured the c8 step
+  time +0.15 % (CI95 -0.30 to +0.59); combined with this gate, about +0.3 % +- 0.2 %. A c8 cost of up to ~0.5 % is not
+  excluded; c4 and c16, where the tables act, are faster or flat. Draft acceptance at c8 was equal (pooled 2.904 against
+  2.913 / 2.884).
+- **Exactness** (flushed 32K, 131K and 1M documents; the first token's top-20 logprobs and a 64-token greedy
+  continuation; five samples per boot at 32K, three at 131K, two at 1M). 32K: the first token identical in every run
+  on all three boots, continuations on control states. 1M: inside the controls' spread. 131K continuation **invalid
+  (not kill)**: two of the three v2.7.4 samples gave the commonest stock continuation; the third left it at token 11 on
+  an exact tie (two tokens at -0.738 nats). One v2.7.3 control sample split at the same token on its own tie (-0.728 /
+  -0.728) and also gave a text not seen before, so the controls produced a new state as often as the release did (1 in
+  6 against 1 in 3; at the stock code's rate of new states, about 4 in 22, at least one of three samples is new about
+  45 % of the time). Two of the three v2.7.4 first-token top-20 vectors after the full 131K prefill, with the fold, the
+  tile table and the `wo_a` table armed, are bit-identical to control vectors from this gate. Reviewed as the engine's
+  known T = 0 nondeterminism at 131K (the DSA indexer's top-k order varies from call to call), not a numerical change.
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; all 75 T = 0 prompts inside the
+  controls' bracket (75 stable, 0 outside). KLD against the controls: short 0.0053, long 0.0050 (limit 0.035). T = 1
+  distribution check PASS (p 0.987, 12,000 samples). The 16 thinking-on reasoning prompts gave the same lengths on all
+  three boots (mean 122.7 tokens). Needles 256K (248,167 tokens, 35.6 s) and 1M (968,648 tokens, 166.1 s) found.
+- **Draft acceptance** (pooled over all prompts): c1 x1.000, c4 x1.009 of the lower control; c8 x1.007 and c16 x1.004
+  reported only; qeval at T = 0 3.979 accepted tokens per verify step on all three boots.
+- **Long-prompt decode** (flushed 32K x 2 and 131K x 3 documents, each followed by a 512-token greedy continuation):
+  decode 84.75 / 85.87 / 85.39 tok/s, 3.20 / 3.28 / 3.26 tokens per step.
+- **Memory and the rest.** Head memory low-water over the common phases 8.50 / 8.54 / 8.51 GiB, during the cold 1M
+  prompts 8.73 / 8.79 / 8.61 GiB; the issue-16 soak 297 / 297 requests ok and its companion load 234 requests, 0
+  failed; idle first token median 193 / 192 / 194 ms; a short prompt beside a cold 131K prefill answered its first
+  token in 0.30 / 0.28 / 0.29 s; no Xid on any boot. A deliberately cold boot of v2.7.4 (tuning caches off) before the
+  arms: ready in 191 s, no Xid, core dump or fault line on any node.
+- **Receipts** (every rank): the tile table serving every key it met (M = 1 keeps the image's default plan, which
+  already is the tabled tile); the `wo_a` table's load self-check bit-identical with the negative control differing at
+  M = 6 and M = 96, and both keys serving after their first-call check; the fold's check bit-identical at capacities
+  4096 and 8192, and its last call-count receipt at 36,862 folded calls, 0 stock adds, 0 errors.
+
 ## 2026-11-10 v2.7.3
 
 v2.7.2 plus two lossless prefill changes and one lossless decode change in the production profile

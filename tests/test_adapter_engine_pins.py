@@ -24,8 +24,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # DSV41_PREFILL_GEMM_TACTIC (off by default) wraps ModelRunner.load_model for its boot check; its wrapper must unwrap to
 # the engine function. The probe also re-runs prefill_sp's drift guard after every install (the l2_prefetch bracket wraps
 # the pinned DeepseekV4Model.forward; with the production line's W2 keys its wo_a recorder carries the W2 fork).
+# DSV41_PREFILL_MOE_FOLD (production profile since the v2.7.4 candidate) wraps pinned engine functions (forward_normal,
+# _forward_shared_experts, maybe_fuse_routed_scale_and_shared_add): installed, and every wrapper unwraps to the engine.
 EXTRA_FLAGS = {"DSV41_PREFILL_SP_FP8_MOE": "1", "DSV41_WO_A_INPUT_FP8": "1", "DSV41_EXTEND_NOSYNC": "1",
-               "DSV41_PREFILL_GEMM_TACTIC": "1"}
+               "DSV41_PREFILL_GEMM_TACTIC": "1", "DSV41_PREFILL_MOE_FOLD": "1"}
 
 PROBE = """
 import inspect
@@ -48,6 +50,15 @@ if os.environ.get("DSV41_L2_PREFETCH") == "1":
         # the inner dispatch is wo_a_w8's / wo_a_input_fp8's own wrapper (no source pin on it): one level is enough
         inner = getattr(v4._apply_wo_a_bf16_matmul, "__wrapped__", None)
         assert inner is not None and not getattr(inner, "_dsv41_l2_prefetch", False), "wo_a recorder without __wrapped__"
+if os.environ.get("DSV41_PREFILL_MOE_FOLD") == "1":
+    import sglang.srt.models.deepseek_v2 as v2
+    import prefill_moe_fold
+    assert prefill_moe_fold.STATE["installed"], f"MoE fold not installed: {prefill_moe_fold.STATE['reason']}"
+    for fn, name in ((v2.DeepseekV2MoE.forward_normal, "DeepseekV2MoE.forward_normal"),
+                     (v2.DeepseekV2MoE._forward_shared_experts, "DeepseekV2MoE._forward_shared_experts"),
+                     (v2.maybe_fuse_routed_scale_and_shared_add, "maybe_fuse_routed_scale_and_shared_add")):
+        assert getattr(fn, "_dsv41_moe_fold", False), f"MoE fold wrapper missing on {name}"
+        assert inspect.unwrap(fn).__qualname__ == name, f"MoE fold wrapper on {name} does not unwrap to the engine"
 # prefill_sp's drift guard again AFTER every adapter installed: each pinned engine source still unwraps to the stock one
 prefill_sp.check_engine()
 print("adapter engine pins OK")

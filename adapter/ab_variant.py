@@ -72,7 +72,13 @@ UNION_BOOL = ("DSV41_L2_PREFETCH", "DSV41_L2_PREFETCH_WOA", "DSV41_L2_PREFETCH_D
               # adapter/prefill_sp.py stage 2b: engine pins, modules and b12x_next's pre-quantized front-end
               # (moe_b12x_next.PREQUANT_WARM) installed when any variant enables it; the MXFP8 MoE-input gather
               # read per call (eager prefill only; the per-size bitwise self-check state is shared by the variants)
-              "DSV41_PREFILL_SP_FP8_MOE")
+              "DSV41_PREFILL_SP_FP8_MOE",
+              # adapter/dense_tile_table.py: the dispatch installed when any variant enables it; the gate read per call
+              # (the runner keys its compile cache on the tile)
+              "DSV41_DENSE_TILE_TABLE",
+              # adapter/wo_a_cfg_table.py: the load self-check runs when any variant enables it; the gate read per call
+              # (per capture: a variant that changes it needs its own graph set)
+              "DSV41_WO_A_CFG_TABLE")
 UNION_PARTS = {"DSV41_FUSE_QUANT": ("qnorm", "wo_a", "hcpad"),
                # adapter/spec_sync_free.py: per-step rank-0 broadcasts kept / dropped per variant
                "DSV41_SPEC_SYNC_FREE": ("draft", "accept", "vcap", "merge"),
@@ -105,16 +111,21 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # adapter/prefill_ced_skip.py: non-final prefill chunks run the late layers on one row (eager, per call)
            "DSV41_PREFILL_CED_SKIP",
            # adapter/prefill_gemm_tactic.py: boot-checked prefill shapes on CUTLASS tactic 5 (eager prefill, per call)
-           "DSV41_PREFILL_GEMM_TACTIC")
+           "DSV41_PREFILL_GEMM_TACTIC",
+           # adapter/prefill_moe_fold.py: shared-expert add folded into the top-k sum (eager prefill, per MoE call; the
+           # per-capacity bitwise self-check state is shared by the variants; hooks + accumulate warm-up installed when
+           # any variant names it)
+           "DSV41_PREFILL_MOE_FOLD")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
                 "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0,
                 "DSV41_L2_PREFETCH_WOB2_MB": 0.0}
-HASHED_SOURCES = ("ab_variant", "l2_prefetch", "wo_a_w8", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
+HASHED_SOURCES = ("ab_variant", "l2_prefetch", "wo_a_w8", "mxfp8_b12x", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
                   "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
                   "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early",
-                  "prefill_ced_skip", "prefill_gemm_tactic", "prefill_sp", "moe_b12x_next")
+                  "prefill_ced_skip", "prefill_gemm_tactic", "prefill_sp", "moe_b12x_next",
+                  "dense_tile_table", "prefill_moe_fold", "wo_a_cfg_table")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")

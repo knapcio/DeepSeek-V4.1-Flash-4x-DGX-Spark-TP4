@@ -34,8 +34,14 @@ lets the L2 drop its lines before the lines the attention-core / W2 windows pref
 output is bitwise identical (the same kernel source with EV=""). Stage 1 of
 diagnostics/megakernel-20261109/DESIGN.md; whether GB10 honours the hint is what the tier-6
 evict_first microbench and the in-boot A/B measure.
+DSV41_WO_A_CFG_TABLE=1 (adapter/wo_a_cfg_table.py, read per call; in-boot A/B union key): at the row counts its table
+lists (M = 6 on the partial route, M = 96 on the mid route) `_partial_w8` / `wo_a_mid` launch the measured faster
+configuration that is bit-identical to production's, after a bytewise device self-check at load and at the first eager
+call of every key (TP-agreed, fail closed); every other call, and every call with the key off, is the production launch
+below (`_partial_w8_stock` / `_wo_a_mid_stock`, unchanged).
 """
 import os
+import sys
 
 import torch
 import triton
@@ -43,6 +49,12 @@ import triton.language as tl
 
 from wo_a_input_fp8 import ENABLED as QX
 from wo_a_input_fp8 import qdq_tile
+
+try:  # DSV41_WO_A_CFG_TABLE (off by default): None = the production launches only
+    import wo_a_cfg_table as _CFG_TABLE
+except Exception as _exc:  # noqa: BLE001 - an opt-in knob must not stop the stock route
+    print(f"[wo_a_cfg_table] not importable ({_exc!r}): production's launches only", flush=True)
+    _CFG_TABLE = None
 
 try:  # DSV41_AB_VARIANTS in-boot A/B (test only): per-variant value; plain os.environ when off
     from ab_variant import env as _env
@@ -100,6 +112,14 @@ def make_twin(w: torch.Tensor):
 
 
 def _partial_w8(x, twin, m, qx=False):
+    if _CFG_TABLE is not None:
+        p = _CFG_TABLE.partial(x, twin, m, qx, _ev(), lambda: _partial_w8_stock(x, twin, m, qx))
+        if p is not None:
+            return p
+    return _partial_w8_stock(x, twin, m, qx)
+
+
+def _partial_w8_stock(x, twin, m, qx=False):
     w8, s = twin
     partial = torch.empty((8, m, 2, 1024), dtype=torch.float32, device=x.device)
     _wo_a_partial_w8[(16, 2, 8)](x, w8, s, partial, m, x.stride(0), QX=qx, EV=_ev(), num_warps=4, num_stages=3)
@@ -143,6 +163,15 @@ def _wo_a_mid_kernel(X, W8, S, Y, M, SXM, SPLIT_K: tl.constexpr, BM: tl.constexp
 def wo_a_mid(o, twin, qx=False):
     """o [M, 2, 4096] (stride (>=8192, 4096, 1)) bf16, 9 <= M <= 192 -> bf16 [M, 2, 1024].
     qx: round o as DeepSeek's reference does (adapter/wo_a_input_fp8.py) on the loaded tiles."""
+    if _CFG_TABLE is not None:
+        y = _CFG_TABLE.mid(o, twin, qx, _ev(), _wo_a_mid_kernel, _MID_CFG, lambda: _wo_a_mid_stock(o, twin, qx))
+        if y is not None:
+            return y
+    return _wo_a_mid_stock(o, twin, qx)
+
+
+def _wo_a_mid_stock(o, twin, qx=False):
+    """Production's wo_a_mid launch (the _MID_CFG row for M, 3 stages)."""
     w8, s = twin
     m = o.shape[0]
     sk, bm, bn, warps = next(cfg for lim, cfg in _MID_CFG if m <= lim)
@@ -320,6 +349,9 @@ def _wrap_load(cls):
         build_twins(self)
         if DROP:
             drop_bf16(self)
+        if _CFG_TABLE is not None and _CFG_TABLE.wanted_at_install():
+            # the load self-check of DSV41_WO_A_CFG_TABLE (once per process, every rank, before any capture)
+            _CFG_TABLE.boot_check(sys.modules[__name__])
         return out
 
     cls.load_weights = load_weights
@@ -332,6 +364,8 @@ def install_model(dsv4_module):
     import importlib
     _patch_kernels(dsv4_module, importlib.import_module("sglang.kernels.ops.attention.dsv4.wo_a_bf16"))
     install_mid(dsv4_module)
+    if _CFG_TABLE is not None and _CFG_TABLE.wanted_at_install():
+        print(_CFG_TABLE.armed_line(), flush=True)
     _wrap_load(dsv4_module.DeepseekV4ForCausalLM)
 
 
