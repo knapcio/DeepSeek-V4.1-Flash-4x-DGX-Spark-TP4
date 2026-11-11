@@ -62,6 +62,23 @@ def fi7676_receipt(path=None):
     return f'DSV41 b12x dense GEMM fence (FlashInfer #7676): {state} sha256={digest[:16]}'
 
 
+def _agree(flag, device):
+    """TP-wide MIN of a rank-local verdict (adapter/replicated_split.py's pattern): every rank serves the same kernel for
+    a key, or none does. Rank-local only when no TP group exists (unit tests, single process). Used by
+    adapter/dense_tile_table.py's per-(shape, M) self-check."""
+    try:
+        from sglang.srt.distributed import get_tp_group
+        group = get_tp_group()
+        if group is None or group.world_size <= 1:
+            return bool(flag)
+        t = torch.tensor([1 if flag else 0], dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group.device_group)
+        return bool(t.item())
+    except Exception as exc:  # noqa: BLE001 - no group: the verdict stays rank-local and says so
+        logger.warning('DSV41 MXFP8: no TP agreement (%r): rank-local verdict', exc)
+        return bool(flag)
+
+
 def install(module):
     want = os.environ.get('DSV41_MXFP8_BACKEND', 'b12x').strip()
     if mxfp8_backend_disabled(want):
@@ -76,6 +93,16 @@ def install(module):
         logger.warning('DSV41_PREFILL_GEMM_TACTIC not installed: %r', exc)
     # DSV41_PREFILL_GEMM_ROW_SPLIT (adapter/prefill_gemm_split.py, off by default): K >= 5120 GEMMs of >= 8192 rows as
     # row blocks of the same kernel, bit-identity checked per shape. None = not installed, the path below is unchanged.
+    # DSV41_DENSE_TILE_TABLE (adapter/dense_tile_table.py, off by default): the narrow decode GEMMs on the measured b12x tile,
+    # self-checked bit for bit per (shape, M), TP-agreed. None = not installed, the path below is unchanged.
+    tile_table = None
+    try:
+        import dense_tile_table
+        if dense_tile_table.wanted_at_install():
+            tile_table = dense_tile_table.make(module, want)
+    except Exception as exc:  # an opt-in knob must not stop the stock route
+        logger.warning('DSV41_DENSE_TILE_TABLE not installed: %r', exc)
+        tile_table = None
     row_split = None
     try:
         import prefill_gemm_split
@@ -98,6 +125,10 @@ def install(module):
                 if out is not None:
                     return out
             try:
+                if tile_table is not None:
+                    out = tile_table(original, (input, weight, weight_scale, input_scale, bias, output_dtype), want, pin_tactic)
+                    if out is not None:
+                        return out
                 return original(input, weight, weight_scale, input_scale, bias,
                                 output_dtype, backend=want, pin_tactic=pin_tactic)
             except Exception as exc:  # shape/backend rejection: keep serving

@@ -423,11 +423,11 @@ class Profile(unittest.TestCase):
         items = self._production_line().split('"')[1].split()
         # v2.6.6's SWA prompt tail follows the v2.7 keys and trim2; v2.7.1's seven new keys follow them, then v2.7.2's CED
         # skip, then v2.7.3's stage 2b, GEMM tactic and W2 / evict-first decode keys (WOA_MB / WOB_MB flipped in place)
-        self.assertEqual(items[-16:-12], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
+        self.assertEqual(items[-17:-13], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",
                                          "DSV41_TOKENIZER_HEAP=trim2", "DSV41_SWA_PROMPT_TAIL_KEEP=1024"])
-        self.assertEqual(items[-5:], ["DSV41_PREFILL_CED_SKIP=1", "DSV41_PREFILL_SP_FP8_MOE=1", "DSV41_PREFILL_GEMM_TACTIC=1",
-                                      "DSV41_L2_PREFETCH_WOB2_MB=10", "DSV41_WO_A_W8_EVICT_FIRST=1"])
-        self.assertEqual(items[-12:-5], ["DSV41_PREFILL_GEMM_ROW_SPLIT=4096", "DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152",
+        self.assertEqual(items[-6:], ["DSV41_PREFILL_CED_SKIP=1", "DSV41_PREFILL_SP_FP8_MOE=1", "DSV41_PREFILL_GEMM_TACTIC=1",
+                                      "DSV41_L2_PREFETCH_WOB2_MB=10", "DSV41_WO_A_W8_EVICT_FIRST=1", "DSV41_DENSE_TILE_TABLE=1"])
+        self.assertEqual(items[-13:-6], ["DSV41_PREFILL_GEMM_ROW_SPLIT=4096", "DSV41_PREFILL_GEMM_ROW_SPLIT_N=1792,1152",
                                         "DSV41_L2_PREFETCH_WOA_MB=6", "DSV41_L2_PREFETCH_WOB_MB=0", "DSV41_EXTEND_NOSYNC=1",
                                         "DSV41_SAMPLED_COMMIT_REUSE=1", "DSV41_SAMPLED_DRAFT_PROBS_EARLY=1"])
         for k in ("DSV41_KV_LAYOUT", "SGLANG_SM120_V41_PRECISION"):
