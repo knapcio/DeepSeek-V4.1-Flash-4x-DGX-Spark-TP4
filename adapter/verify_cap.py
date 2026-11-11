@@ -16,7 +16,21 @@ k comes from DSV41_VERIFY_CAP:
                per-position survival stays >= T (at least DSV41_VERIFY_CAP_MIN, default 1).
                The head's value for position i is computed from drafts before i only, so the
                cut is a stopping rule: it never looks at the token it drops (exact for sampling).
+  "conf:T/4:T4/8:T8"
+               the same rule with a threshold per batch size: each "/<bs>:<thr>" entry applies from
+               that batch size up (ascending, 2..64), the leading value below the first entry; an
+               entry that repeats the leading value closes a band (conf:0.1/4:0.25/8:0.1 = 0.25 at
+               bs 4-7 only, 0.1 everywhere else). Every threshold may also be the per-position form
+               "t2,t3,t4,t5". A batch size is known before the drafts exist, so this is still a
+               stopping rule. Without a "/" the spec parses exactly as before (same values, same
+               code path). Measured basis: RUNLOG 10-27 (conf:0.1/4:0.25, c4 +1.88 % greedy).
 Sampled rows go through block_verify, which treats dead positions as q = 0, p(X) = 0.
+
+A table changes nothing else: the live-length update is the same code (eager, or captured into the
+draft graph by adapter/eager_glue.py's vcap / vcapk parts, a draft graph being captured per batch
+size, so its threshold is that size's constant), and the live lengths are shared exactly as for
+one threshold (rank-0 broadcast, or skipped under DSV41_SPEC_SYNC_FREE's vcap token: the decision
+is a deterministic function of the confidences and the batch size, both identical on every rank).
 """
 import os
 
@@ -29,16 +43,58 @@ STRIDE = int(os.environ.get("DSV41_VERIFY_CAP_STRIDE") or int(os.environ.get("DS
 MAX_BS = 64
 E_TARGET, K_TARGET = 384, 6
 
-_state = {"live": None, "in_verify": False, "conf": None, "fixed": None, "thr": None,
-          "kmin": int(os.environ.get("DSV41_VERIFY_CAP_MIN", "1")), "logged": False}
+from vcap_spec import bands, one_threshold as _one_threshold, parse_conf_spec, threshold_for  # noqa: E402,F401
+
+
+_state = {"live": None, "in_verify": False, "conf": None, "fixed": None, "thr": None, "thr_bs": (),
+          "kmin": int(os.environ.get("DSV41_VERIFY_CAP_MIN", "1")), "logged": False, "thr_tabs": {}}
+_specs = {}
 if ENABLED:
     if SPEC.startswith("conf:"):
-        # one threshold for every draft, or one per draft 2..5 ("conf:0.25,0.25,0.03,0.06");
-        # draft 1 is always verified (DSV41_VERIFY_CAP_MIN, default 1)
-        vals = [float(v) for v in SPEC.split(":", 1)[1].split(",")]
-        _state["thr"] = vals[0] if len(vals) == 1 else [0.0] + vals
+        _state["thr"], _state["thr_bs"] = parse_conf_spec(SPEC)
     else:
         _state["fixed"] = int(SPEC)
+
+
+def _parsed_for(spec):
+    got = _specs.get(spec)
+    if got is None:
+        got = _specs[spec] = parse_conf_spec(spec)
+    return got
+
+
+def thresholds(bs):
+    """The threshold for a step of this batch size (a float or the per-position list)."""
+    return threshold_for((_state["thr"], _state["thr_bs"]), bs)
+
+
+def all_specs():
+    """Every conf: spec this process can run (the base one)."""
+    return [SPEC]
+
+
+def thr_tensor(thr, n, device):
+    """The per-position threshold list as a cached fp32 tensor of n entries (last value repeated).
+    Built outside graph capture (live_buf prebuilds every spec's); a miss inside a capture is refused."""
+    cache = _state["thr_tabs"]
+    key = (tuple(thr), n, str(device))
+    t = cache.get(key)
+    if t is None:
+        if _capturing():
+            raise RuntimeError(f"verify_cap: per-position thresholds {thr} not prebuilt before graph capture")
+        t = cache[key] = torch.tensor((list(thr) + [thr[-1]] * n)[:n], dtype=torch.float32, device=device)
+    return t
+
+
+def _prebuild_thr_tensors(device):
+    for spec in all_specs():
+        if not spec.startswith("conf:"):
+            continue
+        default, table = _parsed_for(spec)
+        for thr in [default] + [t for _, t in table]:
+            if isinstance(thr, list):
+                for n in (STRIDE - 1, 5):
+                    thr_tensor(thr, n, device)
 
 
 def _capturing():
@@ -54,6 +110,8 @@ def live_buf(device=None):
         if _state["fixed"] is not None:
             buf.fill_(1 + _state["fixed"])
         _state["live"] = buf
+        if _state["thr"] is not None:
+            _prebuild_thr_tensors(buf.device)
     return buf
 
 
@@ -68,12 +126,9 @@ def set_live_from_confidence(confidence, bs):
     buf = live_buf(confidence.device)
     _state["last_conf"] = confidence
     cum = torch.cumprod(confidence.float().clamp(0, 1), dim=1)
-    thr = _state["thr"]
+    thr = thresholds(bs)
     if isinstance(thr, list):
-        if _state.get("thr_t") is None or _state["thr_t"].device != cum.device:
-            t = (thr + [thr[-1]] * cum.shape[1])[:cum.shape[1]]
-            _state["thr_t"] = torch.tensor(t, dtype=torch.float32, device=cum.device)
-        thr = _state["thr_t"]
+        thr = thr_tensor(thr, cum.shape[1], cum.device)
     k = (cum >= thr).to(torch.int64).cumprod(dim=1).sum(dim=1).clamp(min=_state["kmin"], max=STRIDE - 1)
     buf[:bs].copy_(k + 1)
     share_live(buf, bs)
@@ -180,6 +235,11 @@ def install_gate(module):
 
     module.moe_fused_gate = wrapped
     print(f"[verify_cap] armed ({SPEC}): dead verify rows route to the anchor's experts", flush=True)
+    if _state["thr"] is not None:
+        for spec in all_specs():
+            # the boot receipt of the per-batch-size bands (one line per distinct spec; the base first)
+            if spec.startswith("conf:"):
+                print(f"[verify_cap] conf thresholds ({spec}): {bands(_parsed_for(spec))}", flush=True)
 
 
 def install_model(dsv4_module):

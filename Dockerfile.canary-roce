@@ -203,6 +203,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_moe_evict_first.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_l2_prefetch_shpf.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_l2_prefetch_shpf_wob2.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_tier16_levers.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_wo_a_w8.py \
  && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_wo_a_w8_evict_first.py \
  && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=0 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_wo_a_w8_evict_first.py \

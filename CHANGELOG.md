@@ -2,13 +2,13 @@
 
 ## v2.7.5 (candidate, release gate pending)
 
-v2.7.4 plus two lossless decode changes in the production profile (`DSV41_MOE_SCALE_CODES=1
+v2.7.4 plus three lossless decode changes in the production profile (`DSV41_MOE_SCALE_CODES=1
 DSV41_MOE_SCALE_CODES_MIN_ROWS=2 DSV41_MOE_EVICT_FIRST=1 DSV41_L2_PREFETCH_SHPF_MB=6 DSV41_L2_PREFETCH_SHPF_EL=0` appended
-to `EXTRA_CONTAINER_ENV`). The image stack, the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
+to `EXTRA_CONTAINER_ENV`; `DSV41_VERIFY_CAP` changed in place from `conf:0.1` to `conf:0.1/4:0.25/8:0.1`). The image stack, the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
 `--swa-prefix-tails 384` and every v2.7.4 key are unchanged; the image's `runtime/b12x_next` gains two kernel modes
 (scale codes, evict-first; patch chain `... topk-sum-accumulate, scale-codes, evict-first`, `SOURCE_PATCH`
 5e7cd728135ff0df). Each change was measured on the four Sparks against the v2.7.4 profile in the same boot (in-boot A/B
-with two control arms, the official 1017 checkpoint, 2026-11-11); the two were measured in separate boots, never
+with two control arms, the official 1017 checkpoint, 2026-11-11); the three were measured in separate boots, never
 together before the release gate. Release gate: TBD.
 
 - **Decode: routed-expert scales as 4-bit codes in the CUDA graphs (`DSV41_MOE_SCALE_CODES=1`, retain mode,
@@ -35,7 +35,13 @@ together before the release gate. Release gate: TBD.
   (`tests/sass_desc_check.py`) and the unit probe check the hinted copies (the first build hit a ptxas descriptor
   miscompile, fixed with a 64-bit shared address). Measured (tier-12o window P, A / X / A'): c1 paired step **-0.19 ms**
   [-0.34, -0.04], c4 per step -0.38 ms [-0.74, -0.01], c4 tok/s +0.83 %; qeval 75 / 75 equal to A. SHPF alone was flat.
-- **Test only:** the in-boot A/B registry keys of both changes (`adapter/ab_variant.py`). Not taken from the test
+- **Decode: verify threshold per batch size (`DSV41_VERIFY_CAP=conf:0.1/4:0.25/8:0.1`,
+  `adapter/vcap_spec.py`).** The draft-confidence stopping threshold is 0.25 at batch sizes 4-7 (0.1 elsewhere, as
+  before); a stopping rule decided before the drafts exist, so it never changes which token is accepted at a verified
+  position (greedy: the target's argmax; sampled: exact in distribution). Measured (tier-16 window P, A / X / A'): c4
+  per-token time **-1.49 %** [-2.16, -0.82] (tokens per step -4.8 %, each step cheaper), c16 -0.13 % [-1.62, +1.35] and
+  the paired c1 step -0.06 ms [-0.23, +0.10]: flat. Rollback, config only: `DSV41_VERIFY_CAP=conf:0.1`.
+- **Test only:** the in-boot A/B registry keys of the scale-codes and evict-first changes (`adapter/ab_variant.py`). Not taken from the test
   branches: the greedy no-gather draft / verify flavours, the A/B graph-set sharing (`DSV41_AB_GRAPH_SETS`) and the
   per-variant L2 receipt annotation.
 - **Release gate:** TBD.
