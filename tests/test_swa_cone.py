@@ -772,7 +772,7 @@ class Profile(unittest.TestCase):
                                          "DSV41_L2_PREFETCH_WOB_MB=0", "DSV41_EXTEND_NOSYNC=1", "DSV41_SAMPLED_COMMIT_REUSE=1",
                                          "DSV41_SAMPLED_DRAFT_PROBS_EARLY=1", "DSV41_PREFILL_CED_SKIP=1",
                                          "DSV41_PREFILL_SP_FP8_MOE=1", "DSV41_PREFILL_GEMM_TACTIC=1",
-                                         "DSV41_L2_PREFETCH_WOB2_MB=10", "DSV41_WO_A_W8_EVICT_FIRST=1", "DSV41_DENSE_TILE_TABLE=1", "DSV41_PREFILL_MOE_FOLD=1"])
+                                         "DSV41_L2_PREFETCH_WOB2_MB=10", "DSV41_WO_A_W8_EVICT_FIRST=1", "DSV41_DENSE_TILE_TABLE=1", "DSV41_PREFILL_MOE_FOLD=1", "DSV41_WO_A_CFG_TABLE=1"])
 
     def test_code_default_is_the_production_chunk(self):
         self.assertEqual(C.DEFAULT_TOKENS, 8192)

@@ -2,7 +2,8 @@
 
 ## v2.7.4 (candidate, release gate pending)
 
-v2.7.3 plus lossless changes in the production profile (`DSV41_DENSE_TILE_TABLE=1 DSV41_PREFILL_MOE_FOLD=1` appended
+v2.7.3 plus lossless changes in the production profile (`DSV41_DENSE_TILE_TABLE=1 DSV41_PREFILL_MOE_FOLD=1
+DSV41_WO_A_CFG_TABLE=1` appended
 to `EXTRA_CONTAINER_ENV`). The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin
 (8,541,952 tokens at fraction 0.85), the launch line, `--swa-prefix-tails 384` and every v2.7.3 key are unchanged; the
 image's `runtime/b12x_next` gains one kernel mode (below). Each change was measured on the four Sparks against the
@@ -38,11 +39,24 @@ numbers are TBD.
   memory flat (low-water -0.003 GiB), decode c1 -0.49 % / c4 +0.27 % (inside the controls' own 2.0 / 1.4 % A / A).
   Boot check bit-identical at capacities 8192 and 4096 on all four ranks; T = 0 states inside the stock code's own
   (the one new 131K state was also produced by an arm without the fold).
+- **Decode: `wo_a`'s launch table (`DSV41_WO_A_CFG_TABLE=1`, `adapter/wo_a_cfg_table.py`).** An exact-M table of
+  `wo_a`'s 8-bit twin GEMM launches from a single-GB10 sweep (tier-12o window B: every configuration built from the
+  image's own kernel text, bytewise against production on two inputs, eager and graph replay): M = 6 -> `p:64:2:2:b`
+  (production's 16x64 tile, grid, BK 128, SPLIT_K 8 and k order; 2 warps, 2 stages, one exp2 per 32x32 scale block:
+  warm 28.14 -> 11.77 us, cold -2.45 us per call), M = 96 -> `mid:1:32:64:2:3` (production's split_k 1 / BM 32, 2 warps
+  instead of 4: warm -19.18 us, cold -0.96 us). Every other M (M = 24 included) stays on production's launch.
+  `_partial_w8` / `wo_a_mid` ask the table first; the production bodies move unchanged to `_partial_w8_stock` /
+  `_wo_a_mid_stock`. A call takes the table only with the key on, qx off, no `_MID_CFG` drift, a passed load
+  self-check (both launches on the first twinned layer's real bytes and two seeded inputs, a perturbed-exponent negative
+  control that must differ, one TP MIN all-reduce for all entries) and a passed first eager call of its key (uint8
+  compare, TP MIN); unchecked keys inside a capture take production's launch. In-boot A/B against the v2.7.3 profile
+  (tier-15 window w): TBD. Image tests: `test_wo_a_cfg_table.py` (13; interpreter bitwise and, with
+  `TRITON_INTERPRET=0`, the sm_121 PTX lowering).
 - Receipts (every rank): `DSV41_DENSE_TILE_TABLE armed: 3 shapes ...` and one `DSV41 dense tile table N=... K=... M=...
   tile=...: ...` line per key; `[moe_b12x_next] accumulate top-k sum ready (capacity ..., zero rows -> zero output)`,
   `DSV41_PREFILL_MOE_FOLD installed: ...`, `DSV41_PREFILL_MOE_FOLD capacity <c> (M=<m>): fold vs stock add ... -> ON`
   per capacity, `DSV41_PREFILL_MOE_FOLD calls rank <r>: fold <n> check <c> stock <s> errors <e>` at the first fold and
-  every 4096 calls.
+  every 4096 calls; `[wo_a_cfg_table]` armed, load self-check and first-eager-call lines.
 - Image tests: `test_dense_tile_table.py` (7: identical pair, mismatch incl. -0.0, plan drift, capture guard, M buckets,
   TP disagreement, gate off per call) and `test_prefill_moe_fold.py` (22: the fold's arithmetic against torch's bf16 add
   bit for bit over a stride of all bf16 pairs, the frame logic, the runtime patch on disk and its bookkeeping, the real
@@ -52,8 +66,8 @@ numbers are TBD.
 - Not taken from the same test branches: megakernel stage 3 (the b12x dense B-prologue and the early quant trigger,
   closed), the tier-10 in-boot A/B graph sets (test only) and the prefill hc early-stats rider (closed: slower at 131K
   and a -6.6 GiB transient).
-- Rollback, config only: unset `DSV41_DENSE_TILE_TABLE` and `DSV41_PREFILL_MOE_FOLD` (= the v2.7.3 profile; both
-  adapters do nothing unset, and the patched b12x_next kernel is only selected under the fold key).
+- Rollback, config only: unset `DSV41_DENSE_TILE_TABLE`, `DSV41_PREFILL_MOE_FOLD` and `DSV41_WO_A_CFG_TABLE` (= the v2.7.3
+  profile; the adapters do nothing unset, and the patched b12x_next kernel is only selected under the fold key).
 
 ## 2026-11-10 v2.7.3
 
