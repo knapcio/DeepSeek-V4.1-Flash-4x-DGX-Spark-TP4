@@ -230,6 +230,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_prefill_gemm_split.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_prefill_gemm_tactic.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_dense_tile_table.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x:/opt/b12x_next python3 test_prefill_moe_fold.py \
  && CUDA_VISIBLE_DEVICES= python3 test_prefill_sp_fp8_moe_ab.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_prefill_keep_cache.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/dsv41/tests python3 test_prefill_hooks.py \

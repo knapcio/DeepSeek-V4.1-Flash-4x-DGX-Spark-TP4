@@ -2167,6 +2167,29 @@ def _prequantized_input_requested() -> bool:
     return bool(getattr(_PREQUANT_STATE, "on", False))
 
 
+# ds41 patch (b12x_next only): accumulate-into-output top-k sum (prefill residual fold). Inside
+# ``topk_sum_accumulate()`` a launch must be the dynamic deterministic route-buffer path (checked
+# before anything is launched); its top-k sum then ADDS the routed sum to the bf16 value already in
+# the caller's output instead of overwriting it: out = bf16(float(out) + float(bf16(sum))), which is
+# torch's ``out.add_(routed)`` with routed the plain kernel's result. Anything else raises.
+_TOPK_SUM_ACCUMULATE_STATE = threading.local()
+TOPK_SUM_ACCUMULATE_STATS = {"launches": 0}
+
+
+@contextmanager
+def topk_sum_accumulate():
+    prev = getattr(_TOPK_SUM_ACCUMULATE_STATE, "on", False)
+    _TOPK_SUM_ACCUMULATE_STATE.on = True
+    try:
+        yield
+    finally:
+        _TOPK_SUM_ACCUMULATE_STATE.on = prev
+
+
+def _topk_sum_accumulate_requested() -> bool:
+    return bool(getattr(_TOPK_SUM_ACCUMULATE_STATE, "on", False))
+
+
 _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active_clusters
 # Micro owns the tiny tail below this routed-row cutover; dynamic owns the rest.
 # The measured GLM crossover under CUDA graph replay is 64 routed rows.
@@ -12109,6 +12132,31 @@ def _launch_dynamic_topk_sum(
     )
 
     element_dtype = _w4a16_element_dtype(route_output.dtype)
+    if _topk_sum_accumulate_requested():
+        # ds41 patch: the residual fold (see topk_sum_accumulate)
+        if element_dtype != "bf16" or output.dtype != torch.bfloat16:
+            raise ValueError(
+                "topk_sum_accumulate needs bf16 route values and a bf16 output, got "
+                f"{route_output.dtype} / {output.dtype}"
+            )
+        compile_w4a16_topk_sum(
+            m=m,
+            topk=num_topk,
+            hidden_size=k,
+            element_dtype=element_dtype,
+            accumulate_output=True,
+        )
+        torch.ops.b12x_next.w4a16_topk_sum_accumulate_launch(
+            route_output,
+            output,
+            m,
+            num_topk,
+            k,
+            element_dtype,
+            int(stream),
+        )
+        TOPK_SUM_ACCUMULATE_STATS["launches"] += 1
+        return
     compile_w4a16_topk_sum(
         m=m,
         topk=num_topk,
@@ -12755,6 +12803,28 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
         raise TypeError("binding must be a TPMoEFP4Binding")
+    if _topk_sum_accumulate_requested():
+        # ds41 patch: refuse before anything is launched unless this launch ends in the dynamic
+        # deterministic top-k sum (the only place the accumulate variant runs); any other path would
+        # overwrite the caller's output (the residual) instead of adding to it.
+        _plan = binding.execution_plan
+        _out = binding.output
+        if not (
+            binding.implementation == "dynamic"
+            and _plan is not None
+            and getattr(_plan, "implementation", None) == "dynamic"
+            and bool(getattr(_plan, "deterministic_output", False))
+            and isinstance(_out, torch.Tensor)
+            and _out.dtype == torch.bfloat16
+            and _out.is_contiguous()
+            and binding.a.dtype == torch.bfloat16
+        ):
+            raise ValueError(
+                "topk_sum_accumulate needs the dynamic deterministic route-buffer launch with a "
+                f"contiguous bf16 output (implementation={binding.implementation!r}, plan="
+                f"{getattr(_plan, 'implementation', None)!r}, deterministic="
+                f"{getattr(_plan, 'deterministic_output', None)!r})"
+            )
 
     a = binding.a
     experts = binding.experts

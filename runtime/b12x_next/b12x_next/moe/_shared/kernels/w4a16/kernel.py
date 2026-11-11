@@ -368,6 +368,32 @@ def _materialize_w4a16_topk_route_f32(value, *, loc=None, ip=None):
     )
 
 
+# ds41 patch (b12x_next only): accumulate-into-output top-k sum (prefill residual fold).
+@dsl_user_op
+def _add_rn_f32_noftz(a, b, *, loc=None, ip=None):
+    """IEEE-754 binary32 a + b, round to nearest even, subnormals kept (``add.rn.f32``, no ``.ftz``).
+
+    The accumulate-into-output top-k sum must reproduce torch's bf16 ``add_`` (opmath float, no fast
+    math) bit for bit, so the add is spelled out: NVVM can neither flush nor contract it.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def _m_specialization_key(size_m: int) -> int:
     """M bucket for branches that genuinely specialize on token count."""
     return 1 if int(size_m) == 1 else 0
@@ -829,6 +855,7 @@ class W4A16TopKSumCompileResult:
     route_ids_dtype: torch.dtype = torch.int32
     use_expert_map: bool = False
     broadcast_svh: bool = False
+    accumulate_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -8562,11 +8589,28 @@ class W4A16TopKSumKernel:
         use_expert_map: bool = False,
         broadcast_svh: bool = False,
         float32_output: bool = False,
+        accumulate_output: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if topk <= 0 or hidden_size <= 0:
             raise ValueError("topk and hidden_size must be positive")
+        # ds41 patch: output[i] = cast(float(cast(sum)) + float(output[i])), i.e. the plain top-k sum
+        # rounded exactly as before, then added to the value already in ``output`` the way torch's
+        # ``output.add_(routed)`` does. Plain bf16 route-buffer reduction only.
+        self.accumulate_output = bool(accumulate_output)
+        if self.accumulate_output and (
+            full_rotation
+            or intermediate_hadamard
+            or use_expert_map
+            or broadcast_svh
+            or float32_output
+            or element_dtype != "bf16"
+        ):
+            raise ValueError(
+                "accumulate_output top-k sum supports only the plain bf16 route-buffer "
+                "reduction (no rotation, expert map or fp32 output)"
+            )
         self.topk = int(topk)
         self.hidden_size = int(hidden_size)
         self.element_dtype = element_dtype
@@ -9034,7 +9078,17 @@ class W4A16TopKSumKernel:
                         cutlass.Float32
                     )
                     acc += _materialize_w4a16_topk_route_f32(route_value)
-            output_flat[idx] = self._cast_elem(acc)
+            if cutlass.const_expr(self.accumulate_output):
+                # ds41 patch: the routed value is rounded to bf16 first (what the plain kernel
+                # stores), then widened (exact) and added in binary32 to the widened residual
+                # already in the output (exact), and rounded once more: torch's bf16 add_.
+                routed = self._cast_elem(acc)
+                residual = output_flat[idx].to(cutlass.Float32)
+                output_flat[idx] = self._cast_elem(
+                    _add_rn_f32_noftz(residual, routed.to(cutlass.Float32))
+                )
+            else:
+                output_flat[idx] = self._cast_elem(acc)
 
     @cute.jit
     def _had128_quad(
@@ -10497,6 +10551,7 @@ def compile_w4a16_topk_sum(
     use_expert_map: bool = False,
     broadcast_svh: bool = False,
     float32_output: bool = False,
+    accumulate_output: bool = False,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if route_ids_dtype not in (torch.int32, torch.int64):
@@ -10518,6 +10573,9 @@ def compile_w4a16_topk_sum(
         bool(broadcast_svh),
         bool(float32_output),
     )
+    if accumulate_output:
+        # ds41 patch: appended only when on, so every existing key (and its disk cache) is unchanged
+        cache_key = cache_key + ("accumulate_output",)
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
         return attach_programs(
@@ -10557,6 +10615,7 @@ def compile_w4a16_topk_sum(
         use_expert_map=use_expert_map,
         broadcast_svh=broadcast_svh,
         float32_output=float32_output,
+        accumulate_output=accumulate_output,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -10591,6 +10650,7 @@ def compile_w4a16_topk_sum(
         route_ids_dtype=route_ids_dtype,
         use_expert_map=bool(use_expert_map),
         broadcast_svh=bool(broadcast_svh),
+        accumulate_output=bool(accumulate_output),
     )
     attach_programs(result, compiled)
     _SUM_CACHE[cache_key] = result
@@ -11624,8 +11684,12 @@ def _w4a16_topk_sum_launch_flat(
     expert_map: torch.Tensor | None = None,
     svh_table: torch.Tensor | None = None,
     launcher: W4A16TopKSumCompileResult | None = None,
+    accumulate_output: bool = False,
 ) -> None:
     full_rotation = bool(full_rotation)
+    accumulate_output = bool(accumulate_output)
+    if launcher is not None and bool(getattr(launcher, "accumulate_output", False)) != accumulate_output:
+        raise ValueError("prepared top-k sum launcher differs in accumulate_output")
     intermediate_hadamard = bool(intermediate_hadamard)
     route_ids_dtype = (
         torch.int32 if route_expert_ids is None else route_expert_ids.dtype
@@ -11651,6 +11715,7 @@ def _w4a16_topk_sum_launch_flat(
         use_expert_map=expert_map is not None,
         broadcast_svh=broadcast_svh,
         float32_output=output.dtype == torch.float32,
+        accumulate_output=accumulate_output,
     )
     dummy_addr = output.data_ptr()
     weights_addr = dummy_addr if topk_weights is None else topk_weights.data_ptr()
@@ -11733,6 +11798,46 @@ def _w4a16_topk_sum_launch_op(
 
 @_w4a16_topk_sum_launch_op.register_fake
 def _w4a16_topk_sum_launch_fake(
+    fc2_out: torch.Tensor,
+    output: torch.Tensor,
+    m: int,
+    topk: int,
+    hidden_size: int,
+    element_dtype: str,
+    stream_int: int,
+) -> None:
+    return None
+
+
+# ds41 patch (b12x_next only): the accumulate-into-output variant as its own op, so the stock op's
+# schema is unchanged. ``output`` holds the residual on entry and residual + routed on exit.
+@torch.library.custom_op(
+    "b12x_next::w4a16_topk_sum_accumulate_launch",
+    mutates_args=("output",),
+)
+def _w4a16_topk_sum_accumulate_launch_op(
+    fc2_out: torch.Tensor,
+    output: torch.Tensor,
+    m: int,
+    topk: int,
+    hidden_size: int,
+    element_dtype: str,
+    stream_int: int,
+) -> None:
+    _w4a16_topk_sum_launch_flat(
+        fc2_out=fc2_out,
+        output=output,
+        m=m,
+        topk=topk,
+        hidden_size=hidden_size,
+        element_dtype=element_dtype,
+        stream_int=stream_int,
+        accumulate_output=True,
+    )
+
+
+@_w4a16_topk_sum_accumulate_launch_op.register_fake
+def _w4a16_topk_sum_accumulate_launch_fake(
     fc2_out: torch.Tensor,
     output: torch.Tensor,
     m: int,

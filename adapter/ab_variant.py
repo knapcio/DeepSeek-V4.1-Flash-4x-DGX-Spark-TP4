@@ -108,7 +108,11 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # adapter/prefill_ced_skip.py: non-final prefill chunks run the late layers on one row (eager, per call)
            "DSV41_PREFILL_CED_SKIP",
            # adapter/prefill_gemm_tactic.py: boot-checked prefill shapes on CUTLASS tactic 5 (eager prefill, per call)
-           "DSV41_PREFILL_GEMM_TACTIC")
+           "DSV41_PREFILL_GEMM_TACTIC",
+           # adapter/prefill_moe_fold.py: shared-expert add folded into the top-k sum (eager prefill, per MoE call; the
+           # per-capacity bitwise self-check state is shared by the variants; hooks + accumulate warm-up installed when
+           # any variant names it)
+           "DSV41_PREFILL_MOE_FOLD")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
@@ -118,7 +122,7 @@ HASHED_SOURCES = ("ab_variant", "l2_prefetch", "wo_a_w8", "mxfp8_b12x", "fuse_qu
                   "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
                   "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early",
                   "prefill_ced_skip", "prefill_gemm_tactic", "prefill_sp", "moe_b12x_next",
-                  "dense_tile_table")
+                  "dense_tile_table", "prefill_moe_fold")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")

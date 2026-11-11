@@ -73,6 +73,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext as _nullctx
 
 import torch
 
@@ -111,6 +112,15 @@ PREQUANT_WARM = (_env("DSV41_PREFILL_SP_FP8_MOE", "0").lower() in _ON
 PREQUANT_MIN_ROWS = int(_env("DSV41_PREFILL_SP_MIN_ROWS", "2048") or 2048)
 PREQUANT_TOPK = int(_env("DSV41_MOE_B12X_NEXT_PREQUANT_TOPK", "6") or 6)
 PREQUANT_STATS = {"calls": 0, "warm_caps": {}}
+# DSV41_PREFILL_MOE_FOLD (adapter/prefill_moe_fold.py): the shared-expert add folded into the top-k sum at prefill.
+# Warm (compile the accumulate variant at load) when the base env or an in-boot A/B variant can enable it.
+try:
+    import prefill_moe_fold as _fold
+except ImportError:  # CPU tests without the module
+    _fold = None
+FOLD_WARM = bool(_fold is not None and _fold.wanted_at_install())
+FOLD_MIN_ROWS = _fold.min_rows() if _fold is not None else 2048
+FOLD_STATE = {"warm": None, "geoms": set()}      # geometries whose accumulate top-k sum compiled + zero-checked
 
 
 def _peak_begin(dev):
@@ -283,7 +293,10 @@ def _b12x():
         print(f"{_TAG} WARNING: DSV41_MOE_B12X_NEXT_DET_TRITON=1 but this b12x_next lacks the "
               f"det-triton-planner patch; deterministic plans use the internal planner", flush=True)
     _B.update(fm=fm, prep=prep, pkg=b12x_next,
-              impl=fimpl if callable(getattr(fimpl, "prequantized_input", None)) else None)
+              impl=fimpl if callable(getattr(fimpl, "prequantized_input", None)) else None,
+              # the topk-sum-accumulate runtime patch (optional: without it DSV41_PREFILL_MOE_FOLD keeps the add)
+              acc=getattr(fimpl, "topk_sum_accumulate", None)
+              if callable(getattr(fimpl, "topk_sum_accumulate", None)) else None)
     # TEST ONLY, both gates checked before the import: prepared eager dynamic launch and launcher timing
     # (adapter/moe_launch_prepared.py; refuses to arm on drifted b12x_next sources)
     if any(_env(g, "0").lower() not in ("0", "", "off", "false", "no")
@@ -516,6 +529,8 @@ class _Geometry:
             self._warm(experts)
         if PREQUANT_WARM and self.topk == PREQUANT_TOPK:
             self._warm_prequant(experts)
+        if FOLD_WARM:
+            self._warm_fold(experts)
         peak = _peak_mb(dev, base)
         torch.cuda.empty_cache()
         persistent = self.arena.numel() + self.ids_buf.numel() * 8
@@ -623,8 +638,9 @@ class _Geometry:
             return False
         return pin[0], psc.view(-1)
 
-    def forward_prequant(self, impl, m, topk_ids, topk_weights, out):
-        """Routed MoE of m rows whose MXFP8 input is already in prequant_views(m)."""
+    def forward_prequant(self, impl, m, topk_ids, topk_weights, out, count=True):
+        """Routed MoE of m rows whose MXFP8 input is already in prequant_views(m). ``count``: whether the launch is
+        this MoE call's (prefill_sp checks one per call; the fold's self-check adds an uncounted second one)."""
         if _B.get("impl") is None:
             raise RuntimeError("DSV41_MOE_B12X_NEXT: pre-quantized input needs the patched b12x_next runtime")
         if not 1 <= m <= self.chunk:
@@ -641,8 +657,36 @@ class _Geometry:
         a = torch.empty((m, self.K), dtype=torch.bfloat16, device=self.device)
         with _B["impl"].prequantized_input():
             self._run(self.cap_for(m), a, ids, w, out, impl)
-        PREQUANT_STATS["calls"] += 1
+        if count:
+            PREQUANT_STATS["calls"] += 1
         return out
+
+    def _warm_fold(self, experts):
+        """Compile b12x_next's accumulate-into-output top-k sum at load (DSV41_PREFILL_MOE_FOLD): one launch of the
+        largest prefill capacity on zero rows into a zero output (the variant does not depend on M)."""
+        if _B.get("acc") is None or not DETERMINISTIC:
+            print(f"{_TAG} WARNING: DSV41_PREFILL_MOE_FOLD wanted but "
+                  f"{'b12x_next lacks the topk-sum-accumulate patch' if _B.get('acc') is None else 'DSV41_MOE_B12X_NEXT_DETERMINISTIC is off'}"
+                  f"; the shared-expert add stays a separate pass", flush=True)
+            return
+        caps = [c for c in self.caps if c >= FOLD_MIN_ROWS] or self.caps[-1:]
+        cap = max(caps)
+        m = min(cap, self.chunk)
+        t0 = time.time()
+        x = torch.zeros(m, self.K, dtype=torch.bfloat16, device=self.device)
+        out = torch.zeros_like(x)
+        ids = torch.zeros(m, self.topk, dtype=torch.int32, device=self.device)
+        w = torch.zeros(m, self.topk, dtype=torch.float32, device=self.device)
+        with _B["acc"]():
+            self._run(cap, x, ids, w, out, experts._impl)
+        torch.cuda.synchronize(self.device)
+        ok = bool((out == 0).all())
+        if ok:
+            FOLD_STATE["geoms"].add(self.key)
+        FOLD_STATE["warm"] = ok if FOLD_STATE["warm"] is None else (FOLD_STATE["warm"] and ok)
+        del x, out, ids, w
+        print(f"{_TAG} accumulate top-k sum ready (capacity {cap}, {time.time() - t0:.1f} s, zero rows -> "
+              f"{'zero output' if ok else 'NONZERO output: fold stays off'})", flush=True)
 
     def _warm_prequant(self, experts):
         """Compile the pre-quantized front-end variant of every prefill capacity at load."""
@@ -954,6 +998,13 @@ def _fused_b12x_next(dispatch_output, quant_info, runner_config):
     topk = dispatch_output.topk_output
     if _ENG["TopKOutputChecker"].format_is_bypassed(topk):
         topk = topk.to_standard()
+    # DSV41_PREFILL_MOE_FOLD: the shared experts' output of this prefill MoE call, when the top-k sum may add the
+    # routed sum into it (adapter/prefill_moe_fold.py decides; None = the stock path below, unchanged)
+    frame = (_fold.claim(st, x.shape[0], x.shape[1], x.device)
+             if _fold is not None and _B.get("acc") is not None and st.geom.key in FOLD_STATE["geoms"]
+             and x.shape[0] else None)
+    if frame is not None:
+        return _fused_fold(st, dispatch_output, x, topk, frame)
     out = _alloc_out(x.shape[0], x.shape[1], x.device)
     pre = getattr(dispatch_output, "hidden_states_pre_quant", None)
     rows = getattr(pre, "_dsv41_b12x_rows", None) if pre is not None else None
@@ -970,6 +1021,34 @@ def _fused_b12x_next(dispatch_output, quant_info, runner_config):
         return _ENG["StandardCombineInput"](hidden_states=out)
     if x.shape[0]:
         st.geom.forward(st.impl, x, topk.topk_ids, topk.topk_weights, out)
+    return _ENG["StandardCombineInput"](hidden_states=out)
+
+
+def _fused_fold(st, dispatch_output, x, topk, frame):
+    """The routed experts of a DSV41_PREFILL_MOE_FOLD frame: the same launches as the stock path; prefill_moe_fold.run
+    decides whether the top-k sum adds into the shared output (b12x_next topk_sum_accumulate) or writes its own."""
+    m = x.shape[0]
+    pre = getattr(dispatch_output, "hidden_states_pre_quant", None)
+    rows = getattr(pre, "_dsv41_b12x_rows", None) if pre is not None else None
+    if rows is not None:
+        views = st.geom.prequant_views(m)
+        if (views is None or rows[0] is not st.geom or rows[1] != m
+                or rows[2] != views[0].data_ptr() or rows[3] != views[1].data_ptr()):
+            raise RuntimeError(f"DSV41_MOE_B12X_NEXT: pre-quantized input marker {rows[1:]} does not "
+                               f"match this layer's plan for {m} rows")
+
+    def launch(o, accumulate, count):
+        with (_B["acc"]() if accumulate else _nullctx()):
+            if rows is not None:
+                st.geom.forward_prequant(st.impl, m, topk.topk_ids, topk.topk_weights, o, count=count)
+            else:
+                st.geom.forward(st.impl, x, topk.topk_ids, topk.topk_weights, o)
+
+    # one launch only: a batch above the chunk (two launches) is a structural, rank-invariant "no" (a failure in a
+    # later launch could otherwise leave the first chunk's rows folded)
+    ok = None if m > st.geom.chunk else _fold.frame_ok(frame, m, x.shape[1], x.device)
+    out = _fold.run(frame, st.geom.cap_for(min(m, st.geom.chunk)), launch,
+                    lambda: _alloc_out(m, x.shape[1], x.device), ok)
     return _ENG["StandardCombineInput"](hidden_states=out)
 
 
