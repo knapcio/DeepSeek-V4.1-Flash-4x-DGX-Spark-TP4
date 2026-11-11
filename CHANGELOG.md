@@ -1,5 +1,60 @@
 # Changelog
 
+## v2.7.4 (candidate, release gate pending)
+
+v2.7.3 plus lossless changes in the production profile (`DSV41_DENSE_TILE_TABLE=1 DSV41_PREFILL_MOE_FOLD=1` appended
+to `EXTRA_CONTAINER_ENV`). The image stack (SGLang tree, FlashInfer 0.7.2, NCCL 2.30.7 with #2393), the KV pool pin
+(8,541,952 tokens at fraction 0.85), the launch line, `--swa-prefix-tails 384` and every v2.7.3 key are unchanged; the
+image's `runtime/b12x_next` gains one kernel mode (below). Each change was measured on the four Sparks against the
+v2.7.3 profile in the same boot (in-boot A/B with two control arms, the official 1017 checkpoint); the release gate's
+numbers are TBD.
+
+- **Decode: the narrow dense GEMMs on the measured b12x tile (`DSV41_DENSE_TILE_TABLE=1`, `adapter/dense_tile_table.py`).**
+  b12x's default plan runs every N x 5120 MXFP8 weight on the M-independent (64, 64) tile. A single-GB10 sweep of every
+  tile / tile_k / stage-cap config against the production plan (two activations per cell, whole-output byte compare)
+  found all 24 configs bitwise and the (16, 64) tile at M <= 16, (32, 64) at 17..32 rows about 2x faster per call with
+  warm L2 for `qa_kv` (512 x 5120 per rank, 17.4 -> 11.1 us at M 6), the shared-expert FC1 (1152 x 5120, 29.2 -> 13.1 us)
+  and the draft `wkv` (1536 x 5120, 37.9 -> 15.7 us). `adapter/mxfp8_b12x.py` dispatches those keys to the same b12x
+  runner with an explicit tactic; the first eager call of every (shape, M) runs the serving call and the tile on the same
+  inputs and keeps the tile only if the output bytes are equal on every rank (MIN over TP); a default plan other than the
+  measured one, a mismatch or a disagreement keeps the serving call for that key, and an unchecked key inside a graph
+  capture takes the serving call. Measured (tier-10 window S2, 8 rounds, A / X / A'): c1 greedy step **-0.132 ms**
+  paired per prompt (CI95 -0.265 to -0.0003); speed c1 +0.08 %, c1 sampled +1.25 %, c4 +0.62 %, c8 +0.33 %, c16 -0.99 %
+  (c8 / c16: the table is inert above 32 rows; reported only); head memory 13.5 GiB at READY. Exactness: qeval 75 / 75
+  T = 0 outputs equal to both controls (0 noisy tasks), 50 c1 greedy texts on the stable prompts equal. Prefill rows and
+  every other shape are untouched.
+- **Prefill: the shared-expert add folded into the top-k sum (`DSV41_PREFILL_MOE_FOLD=1`, `adapter/prefill_moe_fold.py`).**
+  A prefill MoE call (eager, >= 2048 rows, b12x_next deterministic routed experts, shared experts first, routed scale
+  folded into top-k) wrote the routed top-k sum into a new tensor and added it to the shared experts' output in a
+  separate pass (168 MB in, 84 MB out per 8192-row layer). b12x_next's top-k sum kernel gains an accumulate-into-output
+  mode (`scripts/b12x_next-topk-sum-accumulate.patch`: `out = bf16(float(out) + float(bf16(sum)))`, `add.rn.f32`
+  without ftz, torch's `out.add_(routed)` bit for bit; its own op, the stock op's schema unchanged; `SOURCE_PATCH`
+  a76ad82d137d9c5f), compiled and zero-checked at load per geometry, and the add site returns that tensor. The first call
+  of every plan capacity runs both ways, compares bit for bit and agrees over TP before any fold (that call returns the
+  stock result); a difference, an exception, drifted engine sources (sha256 pins), a missing accumulate variant or a
+  broken return chain keep the stock add. Measured (tier-13 window P, 4 rounds, carried on review): cold 131K first
+  token **-0.96 %** in the exact phase (19.67 s, n 6, against 19.86 s for the controls, n 12; every X sample below every
+  A sample), servebench cold 131K +0.81 / +1.08 / +0.83 % in three rounds (the fourth drifted with A), 32K +0.86 %;
+  memory flat (low-water -0.003 GiB), decode c1 -0.49 % / c4 +0.27 % (inside the controls' own 2.0 / 1.4 % A / A).
+  Boot check bit-identical at capacities 8192 and 4096 on all four ranks; T = 0 states inside the stock code's own
+  (the one new 131K state was also produced by an arm without the fold).
+- Receipts (every rank): `DSV41_DENSE_TILE_TABLE armed: 3 shapes ...` and one `DSV41 dense tile table N=... K=... M=...
+  tile=...: ...` line per key; `[moe_b12x_next] accumulate top-k sum ready (capacity ..., zero rows -> zero output)`,
+  `DSV41_PREFILL_MOE_FOLD installed: ...`, `DSV41_PREFILL_MOE_FOLD capacity <c> (M=<m>): fold vs stock add ... -> ON`
+  per capacity, `DSV41_PREFILL_MOE_FOLD calls rank <r>: fold <n> check <c> stock <s> errors <e>` at the first fold and
+  every 4096 calls.
+- Image tests: `test_dense_tile_table.py` (7: identical pair, mismatch incl. -0.0, plan drift, capture guard, M buckets,
+  TP disagreement, gate off per call) and `test_prefill_moe_fold.py` (22: the fold's arithmetic against torch's bf16 add
+  bit for bit over a stride of all bf16 pairs, the frame logic, the runtime patch on disk and its bookkeeping, the real
+  SGLang MoE forward with a CPU stand-in for the b12x launches) join the `Dockerfile.canary-roce` chain; the
+  engine-pin probe checks the three fold wrappers are installed and unwrap to the engine functions; the profile-order
+  tests check the new tail.
+- Not taken from the same test branches: megakernel stage 3 (the b12x dense B-prologue and the early quant trigger,
+  closed), the tier-10 in-boot A/B graph sets (test only) and the prefill hc early-stats rider (closed: slower at 131K
+  and a -6.6 GiB transient).
+- Rollback, config only: unset `DSV41_DENSE_TILE_TABLE` and `DSV41_PREFILL_MOE_FOLD` (= the v2.7.3 profile; both
+  adapters do nothing unset, and the patched b12x_next kernel is only selected under the fold key).
+
 ## 2026-11-10 v2.7.3
 
 v2.7.2 plus two lossless prefill changes and one lossless decode change in the production profile
