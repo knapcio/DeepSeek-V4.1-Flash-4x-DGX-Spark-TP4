@@ -98,6 +98,9 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            "DSV41_L2_PREFETCH_WOB2_MB",
            # adapter/wo_a_w8.py: evict-first L2 policy on the twin loads, read per call (per capture)
            "DSV41_WO_A_W8_EVICT_FIRST",
+           # l2_prefetch v5 SHPF (plan-time, per variant): the shared-expert window at the FFN-side hc entry, and its
+           # window policy (evict_last through l2pf_el, default, or plain); both change the captured prefetch branches
+           "DSV41_L2_PREFETCH_SHPF_MB", "DSV41_L2_PREFETCH_SHPF_EL",
            # adapter/roce_twoshot.py: two-shot all-reduce row threshold (0 = one-shot), per capture
            "DSV41_ROCE_TWOSHOT_ROWS",
            # adapter/indexer_chunked_v3.py: eager prefill indexer slot ids without host syncs
@@ -122,12 +125,16 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            "DSV41_PREFILL_MOE_FOLD",
            # adapter/moe_b12x_next.py scale codes (A/B retain mode): captured MoE calls of fewer rows keep the native
            # experts (default 2: M=1 graphs stay native); read per capture
-           "DSV41_MOE_SCALE_CODES_MIN_ROWS")
+           "DSV41_MOE_SCALE_CODES_MIN_ROWS",
+           # adapter/moe_b12x_next.py: L2 evict_first on the routed-expert weight copies (b12x_next evict-first patch)
+           # and its row cap, read per CUDA-graph capture (decode / verify / draft launches of <= MAX_ROWS rows; never
+           # eager prefill); the flag-on kernels are compiled at load when any variant enables the gate (never unioned)
+           "DSV41_MOE_EVICT_FIRST", "DSV41_MOE_EVICT_FIRST_MAX_ROWS")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
                 "DSV41_L2_PREFETCH_SKIP_N": 0.0, "DSV41_L2_PREFETCH_WOB_MB": 0.0, "DSV41_L2_PREFETCH_MOE_MB": 10.0,
-                "DSV41_L2_PREFETCH_WOB2_MB": 0.0}
+                "DSV41_L2_PREFETCH_WOB2_MB": 0.0, "DSV41_L2_PREFETCH_SHPF_MB": 0.0}
 HASHED_SOURCES = ("ab_variant", "l2_prefetch", "wo_a_w8", "mxfp8_b12x", "fuse_quant", "sitecustomize", "cert_head", "roce_twoshot",
                   "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
                   "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early",
@@ -245,6 +252,20 @@ def _min_rows(value):
     return v
 
 
+def _ef_rows(value):
+    """DSV41_MOE_EVICT_FIRST_MAX_ROWS as adapter/moe_b12x_next.parse_ef_max_rows reads it (unset / empty = 128)."""
+    raw = (value or "").strip()
+    if not raw:
+        return 128
+    try:
+        v = int(raw)
+    except ValueError:
+        raise RuntimeError(f"DSV41_MOE_EVICT_FIRST_MAX_ROWS={value!r}: expected a row count") from None
+    if v < 1:
+        raise RuntimeError(f"DSV41_MOE_EVICT_FIRST_MAX_ROWS={value!r}: must be >= 1")
+    return v
+
+
 def _norm(cfg):
     """Effective behaviour of one variant's registry values (defaults applied; L2 knobs are moot
     while the L2 main gate is off)."""
@@ -260,6 +281,10 @@ def _norm(cfg):
             out[key] = float(value) if value not in (None, "") else _MB_DEFAULTS[key]
         elif key == "DSV41_L2_PREFETCH_AG":
             out[key] = value is None or value.strip() != "0"
+        elif key == "DSV41_L2_PREFETCH_SHPF_EL":   # default on (evict_last); moot while the SHPF budget is 0
+            shpf = cfg.get("DSV41_L2_PREFETCH_SHPF_MB")
+            on = shpf not in (None, "") and float(shpf) > 0
+            out[key] = (value is None or value.strip().lower() not in _OFF) if on else None
         elif key == "DSV41_ROCE_TWOSHOT_ROWS":   # a row threshold; 0 / unset = one-shot only
             out[key] = int(value) if value not in (None, "") and value.strip() else 0
         elif key == "DSV41_CERT_HEAD":   # 0 / 1 / check are three behaviours
@@ -276,6 +301,8 @@ def _norm(cfg):
             out[key] = _mask_cap(value)
         elif key == "DSV41_MOE_SCALE_CODES_MIN_ROWS":   # a row floor; unset = 2
             out[key] = _min_rows(value)
+        elif key == "DSV41_MOE_EVICT_FIRST_MAX_ROWS":   # a row cap; moot while the evict-first gate is off
+            out[key] = _ef_rows(value) if truthy(cfg.get("DSV41_MOE_EVICT_FIRST")) else None
         elif key in ("DSV41_SAMPLED_COMMIT_REUSE", "DSV41_SAMPLED_DRAFT_PROBS_EARLY"):  # off / on / check
             out[key] = _fold_value(value, key)
         else:

@@ -434,6 +434,33 @@ def test_short_prefill_knobs():
         clean_meta_path()
 
 
+def test_shpf_registry():
+    """perf/shpf-nogather-v273-20261110 (the SHPF half): DSV41_L2_PREFETCH_SHPF_MB / _SHPF_EL are call-time (plan-time)
+    keys, never unioned, read per variant; SHPF_MB unset == 0, SHPF_EL unset == 1 and moot while SHPF is off."""
+    base = {"DSV41_L2_PREFETCH": "1", "DSV41_L2_PREFETCH_WOA": "1", "DSV41_L2_PREFETCH_WOA_MB": "6",
+            "DSV41_L2_PREFETCH_WOB_MB": "0", "DSV41_L2_PREFETCH_WOB2_MB": "10"}
+    env = dict(base, DSV41_AB_VARIANTS="4", DSV41_AB_ALLOW_AA="1",
+               DSV41_AB_V0="DSV41_L2_PREFETCH_SHPF_MB=0",
+               DSV41_AB_V1="DSV41_L2_PREFETCH_SHPF_MB=6",
+               DSV41_AB_V2="DSV41_L2_PREFETCH_SHPF_MB=6;DSV41_L2_PREFETCH_SHPF_EL=0",
+               DSV41_AB_V3="DSV41_L2_PREFETCH_SHPF_MB=0")
+    ab = fresh("ab_shng")
+    try:
+        e = dict(env)
+        assert ab.configure(e)
+        assert "DSV41_L2_PREFETCH_SHPF_MB" not in e and "DSV41_L2_PREFETCH_SHPF_EL" not in e   # never unioned
+        assert [ab.env_for(v, "DSV41_L2_PREFETCH_SHPF_MB") for v in range(4)] == ["0", "6", "6", "0"]
+        assert [ab.env_for(v, "DSV41_L2_PREFETCH_WOB2_MB") for v in range(4)] == ["10"] * 4
+        n = ab._norm
+        assert n(dict(base)) == n(dict(base, DSV41_L2_PREFETCH_SHPF_MB="0"))
+        assert n(dict(base)) == n(dict(base, DSV41_L2_PREFETCH_SHPF_EL="0"))                 # moot while off
+        on = dict(base, DSV41_L2_PREFETCH_SHPF_MB="6")
+        assert n(on) == n(dict(on, DSV41_L2_PREFETCH_SHPF_EL="1")) != n(dict(on, DSV41_L2_PREFETCH_SHPF_EL="0"))
+        assert n(on) != n(dict(on, DSV41_L2_PREFETCH_SHPF_MB="4"))
+    finally:
+        clean_meta_path()
+
+
 def test_scale_codes_keys():
     """Scale codes A/B retain mode (2026-11-10): DSV41_MOE_SCALE_CODES is a union gate (moe_b12x_next builds the coded
     experts beside the native ones when any variant enables it; the base value stays per variant), the row floor

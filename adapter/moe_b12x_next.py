@@ -79,6 +79,24 @@ is released (_code_scales; refused with the pre-quantized prefill input).
 Receipts: "[moe_b12x_next] scale codes: retain: <L> layers, native <x> GiB kept + codes <y> GiB, min rows <m>, max
 expert span <s>" ("A/B retain:" under the in-boot A/B) and, once per (variant, M, top-k), "scale codes: capture
 variant=<v> M=<m> coded|native (...)" (variant 0 without the A/B).
+
+Evict-first expert loads (default off; production profile on since v2.7.5; needs the runtime patch
+scripts/b12x_next-evict-first.patch):
+``DSV41_MOE_EVICT_FIRST=1`` marks the routed-expert weight copies (FC1 w13 and FC2 down packed B; not their
+scale words) of b12x's split-materialized W4A8 phase kernels L2 evict_first (cp.async ...L2::cache_hint with
+createpolicy.fractional.L2::evict_first). A decode step streams each routed expert's ~4.4 MB once (TP4 N=576),
+which otherwise flushes GB10's 24 MB L2 of lines that are reused: the shared expert / wo weights l2_prefetch
+put there, the gathered input, the materialized intermediate. Applied only while a CUDA graph is captured and
+only to launches of <= ``DSV41_MOE_EVICT_FIRST_MAX_ROWS`` (128) rows: decode / verify / draft steps, never
+eager prefill (whose larger tiles of one expert re-read the same weight slice, the case Owen keeps on the
+normal policy as well). Under the in-boot A/B both gates are keys read per capture (ab_variant RUNTIME); the flag-on
+kernels (their own b12x cache key) are compiled at load for the capacities <= the largest row cap when any
+variant enables the gate, and kept referenced so later preparations cannot evict them before capture.
+Bit-identical by construction (same bytes copied, same arithmetic; only L2 replacement priority changes).
+Receipts (every rank): ``evict-first expert loads: armed (max rows <n>, sites <list>)`` at boot,
+``evict-first: capture variant=<v> M=<m> on|off`` once per (variant, M) captured (variant 0 without the A/B);
+refusals say ``refused``.
+Idea: Christopher Owen, spark-ds41f #966 (Apache-2.0), there on TileLang TMA weight loads.
 """
 import bisect
 import dataclasses
@@ -135,6 +153,111 @@ except ImportError:  # CPU tests without the module
 FOLD_WARM = bool(_fold is not None and _fold.wanted_at_install())
 FOLD_MIN_ROWS = _fold.min_rows() if _fold is not None else 2048
 FOLD_STATE = {"warm": None, "geoms": set()}      # geometries whose accumulate top-k sum compiled + zero-checked
+
+try:  # DSV41_AB_VARIANTS in-boot A/B (test only): the evict-first gates are read per capture through it
+    import ab_variant as _ab
+except ImportError:
+    _ab = None
+EF_GATE = "DSV41_MOE_EVICT_FIRST"
+EF_MAX_ROWS = "DSV41_MOE_EVICT_FIRST_MAX_ROWS"
+EF_MAX_ROWS_DEFAULT = 128
+# the copies the b12x_next evict-first patch hints (W4A8MaterializedPhase{1,2}Kernel, N64 and N256 repacked B)
+EF_SITES = ("w4a8_phase1.fc1_w13_b", "w4a8_phase2.fc2_down_b")
+EF_KEY_TAG = "evict_first_weights"     # b12x_next _impl._EVICT_FIRST_KEY, the cache-key suffix of flag-on kernels
+_EF = {"armed": False, "impl": None, "kernels": {}, "seen": set(), "restored": 0, "captures_on": 0,
+       "captures_off": 0, "max_rows": EF_MAX_ROWS_DEFAULT}
+
+
+def _truthy(value):
+    return str(value or "").strip().lower() not in ("", "0", "off", "false", "no")
+
+
+def parse_ef_max_rows(value):
+    """DSV41_MOE_EVICT_FIRST_MAX_ROWS: a positive row count; unset / empty = 128."""
+    raw = str(value or "").strip()
+    if not raw:
+        return EF_MAX_ROWS_DEFAULT
+    try:
+        rows = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{EF_MAX_ROWS}={value!r}: expected a row count -- refused") from None
+    if rows < 1:
+        raise RuntimeError(f"{EF_MAX_ROWS}={value!r}: must be >= 1 -- refused")
+    return rows
+
+
+def _ab_active():
+    return _ab is not None and getattr(_ab, "ACTIVE", False)
+
+
+def ef_settings(environ=None):
+    """[(variant, gate on, max rows)] of every in-boot A/B variant, or [(0, ...)] of the process env."""
+    if _ab_active():
+        return [(i, _truthy(_ab.env_for(i, EF_GATE, "0")), parse_ef_max_rows(_ab.env_for(i, EF_MAX_ROWS, "")))
+                for i in range(_ab.N)]
+    environ = os.environ if environ is None else environ
+    return [(0, _truthy(environ.get(EF_GATE, "0")), parse_ef_max_rows(environ.get(EF_MAX_ROWS, "")))]
+
+
+def _ef_current():
+    """(variant, gate on, max rows) of the variant being captured (or the process env without the A/B)."""
+    if _ab_active():
+        return (_ab.current(), _truthy(_ab.env(EF_GATE, "0")), parse_ef_max_rows(_ab.env(EF_MAX_ROWS, "")))
+    return (0, _truthy(os.environ.get(EF_GATE, "0")), parse_ef_max_rows(os.environ.get(EF_MAX_ROWS, "")))
+
+
+def _capturing():
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:  # noqa: BLE001  (no CUDA: CPU tests)
+        return False
+
+
+def install_evict_first(fimpl, settings=None):
+    """Arm DSV41_MOE_EVICT_FIRST when any variant enables it (boot, after the pin checks). Refuses to boot when the
+    runtime lacks the evict-first patch: an in-boot A/B would otherwise silently run as an A/A."""
+    settings = ef_settings() if settings is None else settings
+    on = [(v, rows) for v, gate, rows in settings if gate]
+    if not on:
+        return False
+    if fimpl is None or not callable(getattr(fimpl, "evict_first_weights", None)) \
+            or not isinstance(getattr(fimpl, "_DYNAMIC_KERNEL_CACHE", None), dict):
+        print(f"{_TAG} evict-first expert loads: refused (b12x_next lacks the evict-first patch, "
+              f"scripts/b12x_next-evict-first.patch)", flush=True)
+        _die(f"{EF_GATE}=1 needs the b12x_next evict-first patch")
+    rows = sorted({r for _, r in on})
+    _EF.update(armed=True, impl=fimpl, max_rows=max(rows))
+    shown = str(rows[0]) if len(rows) == 1 else ",".join(f"v{v}:{r}" for v, r in on)
+    print(f"{_TAG} evict-first expert loads: armed (max rows {shown}, sites {','.join(EF_SITES)})", flush=True)
+    return True
+
+
+def ef_decide(m, refused=False):
+    """True when this launch runs the flag-on kernels: armed, inside CUDA-graph capture, the captured variant's
+    gate on and m <= its row cap (and the capacity's plan admits the hint). Logs once per (variant, M)."""
+    if not _EF["armed"] or not _capturing():
+        return False
+    variant, gate, rows = _ef_current()
+    on = bool(gate and m <= rows and not refused)
+    key = (variant, int(m))
+    if key not in _EF["seen"]:
+        _EF["seen"].add(key)
+        why = ""
+        if gate and m <= rows and refused:
+            why = " (refused: this capacity's plan does not run the split-materialized W4A8 phase kernels)"
+        print(f"{_TAG} evict-first: capture variant={variant} M={int(m)} {'on' if on else 'off'}{why}", flush=True)
+        _EF["captures_on" if on else "captures_off"] += 1
+    return on
+
+
+def _ef_restore():
+    """Put back the flag-on kernels a later preparation's eviction dropped from b12x's kernel memo (the adapter
+    holds them since the load-time warm), so a capture never compiles."""
+    cache = _EF["impl"]._DYNAMIC_KERNEL_CACHE
+    for key, compiled in _EF["kernels"].items():
+        if cache.get(key) is None:
+            cache[key] = compiled
+            _EF["restored"] += 1
 
 
 def _peak_begin(dev):
@@ -281,6 +404,7 @@ if RELEASE:
     os.environ["B12X_NEXT_W4A8_SCALE_CODES"] = "1"
 MIN_ROWS_DEFAULT = 2
 _RETAIN = {"layers": 0, "native": 0, "coded": 0, "max_span": 0, "printed": -1, "seen": set(), "decisions": {}}
+_CODED_IMPLS = {}   # id -> the retain mode's coded experts._impl (held by its _LayerState too)
 _CODES = {"layers": 0, "native": 0, "coded": 0, "freed": 0, "aliases": 0, "max_span": 0, "conv_peak": 0,
           "per_layer": []}
 # allocator readers; tests substitute a live-tensor account (REVIEW_sol_scalecodes R1)
@@ -635,6 +759,7 @@ def _code_scales_retain(experts, dev):
     new_rep = dataclasses.replace(rep, value=new_val)
     new_impl = dataclasses.replace(impl, w1_blockscale=c13, w2_blockscale=c2, representation=new_rep)
     coded = dataclasses.replace(experts, _impl=new_impl)
+    _CODED_IMPLS[id(new_impl)] = new_impl      # evict-first: _Geometry._run tells coded experts apart (own refusals)
     _RETAIN["layers"] += 1
     _RETAIN["native"] += sum(t.numel() * t.element_size() for t in (val.w13_sfb, val.w2_sfb))
     _RETAIN["coded"] += c13.numel() + c2.numel()
@@ -669,13 +794,6 @@ def _retain_min_rows():
     return "/".join(f"v{i}={r}" for i, r in sorted(rows.items())) or "none"
 
 
-def _stream_capturing():
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except Exception:  # noqa: BLE001  (no CUDA: CPU tests)
-        return False
-
-
 def _retain_impl(st, m):
     """Which prepared experts a call of m rows runs in retain mode: coded only inside a CUDA-graph capture (under the
     in-boot A/B: a capture of a variant whose DSV41_MOE_SCALE_CODES is on, ab_variant.env, per capture), at m >= the
@@ -688,7 +806,7 @@ def _retain_impl(st, m):
         on = _AB.truthy(_AB.env("DSV41_MOE_SCALE_CODES", "0"))
         min_rows = parse_min_rows(_AB.env("DSV41_MOE_SCALE_CODES_MIN_ROWS", ""))
     else:
-        if not _stream_capturing():
+        if not _capturing():
             return st.impl
         v, on, min_rows = 0, True, _retain_min_rows()
     geom = st.geom
@@ -768,6 +886,7 @@ def _b12x():
               # the topk-sum-accumulate runtime patch (optional: without it DSV41_PREFILL_MOE_FOLD keeps the add)
               acc=getattr(fimpl, "topk_sum_accumulate", None)
               if callable(getattr(fimpl, "topk_sum_accumulate", None)) else None)
+    install_evict_first(fimpl)
     # TEST ONLY, both gates checked before the import: prepared eager dynamic launch and launcher timing
     # (adapter/moe_launch_prepared.py; refuses to arm on drifted b12x_next sources)
     if any(_env(g, "0").lower() not in ("0", "", "off", "false", "no")
@@ -904,6 +1023,10 @@ class _Geometry:
         self.impl0 = None           # any layer's prepared experts (binding views do not depend on it)
         self.pq_views = {}          # capacity -> (packed_input [rows, K] u8, packed_input_scale flat u8)
         self.coded_caps = frozenset()   # retain mode: capacities whose captured calls may run coded experts
+        self.ef_caps = []           # capacities whose flag-on kernels were compiled at load (DSV41_MOE_EVICT_FIRST)
+        self.ef_refused = set()     # capacities <= the row cap whose plan does not admit the hint
+        self.ef_caps_coded = []     # the same for the coded experts (retain mode, prepare_coded)
+        self.ef_refused_coded = set()
 
     def capacities(self):
         rows = sorted({r * b for r in (BLOCK, BLOCK + 1) for b in GRAPH_BS})
@@ -999,6 +1122,8 @@ class _Geometry:
         t_prep = time.time() - t0
         if WARM:
             self._warm(experts)
+        if _EF["armed"]:
+            self._warm_evict_first(experts)
         if PREQUANT_WARM and self.topk == PREQUANT_TOPK:
             self._warm_prequant(experts)
         if FOLD_WARM:
@@ -1014,6 +1139,8 @@ class _Geometry:
             "prepare_s": round(t_prep, 1), "total_s": round(time.time() - t0, 1),
             "peak_transient_mb": peak, "persistent_mb": round(persistent / 2**20, 1),
         }
+        if _EF["armed"]:
+            self.report["evict_first_caps"] = list(self.ef_caps)
         print(f"{_TAG} geometry ready {self.report}", flush=True)
 
     def _race_call(self, cap):
@@ -1081,6 +1208,41 @@ class _Geometry:
         print(f"{_TAG} scale codes: {_retain_label()}: E={self.E} K={self.K} N={self.N} top-k {self.topk}: coded capacities "
               f"{ok}, native only (compact micro plans) {micro}, warm {'on' if WARM else 'off'} "
               f"{time.time() - t0:.1f} s", flush=True)
+        if _EF["armed"]:
+            # DSV41_MOE_EVICT_FIRST + scale codes in one variant: the coded flag-on kernels (their own key: coded and
+            # evict-first suffixes) are compiled here too, so a capture that picks both never compiles
+            self._warm_evict_first(coded, caps=ok, coded=True)
+
+    def _warm_evict_first(self, experts, caps=None, coded=False):
+        """Compile the flag-on kernels of every capacity <= the largest row cap (DSV41_MOE_EVICT_FIRST) and keep
+        them referenced; a capacity whose plan does not run the split-materialized phase kernels is refused.
+        ``coded``: the retain mode's coded experts, over its coded capacities (prepare_coded)."""
+        fimpl = _EF["impl"]
+        stats = getattr(fimpl, "EVICT_FIRST_STATS", {})
+        t0 = time.time()
+        top = self.cap_for(min(_EF["max_rows"], self.chunk))    # every M <= the row cap lands on a cap <= top
+        caps = [c for c in (self.caps if caps is None else caps) if c <= top]
+        done, refused = (self.ef_caps_coded, self.ef_refused_coded) if coded else (self.ef_caps, self.ef_refused)
+        x = torch.zeros(max(caps, default=1), self.K, dtype=torch.bfloat16, device=self.device)
+        out = torch.empty_like(x)
+        ids = torch.zeros(x.shape[0], self.topk, dtype=torch.int32, device=self.device)
+        w = torch.zeros(x.shape[0], self.topk, dtype=torch.float32, device=self.device)
+        for c in caps:
+            before = int(stats.get("ineligible", 0))
+            self._run(c, x[:c], ids[:c], w[:c], out[:c], experts._impl, ef=True)
+            if int(stats.get("ineligible", 0)) != before:
+                refused.add(c)
+            else:
+                done.append(c)
+        torch.cuda.synchronize(self.device)
+        got = {k: v for k, v in fimpl._DYNAMIC_KERNEL_CACHE.items()
+               if isinstance(k, tuple) and k and k[-1] == EF_KEY_TAG}
+        _EF["kernels"].update(got)
+        del x, out, ids, w
+        print(f"{_TAG} evict-first: warmed{' coded' if coded else ''} E={self.E} N={self.N} top-k {self.topk} "
+              f"capacities {done} ({len(got)} flag-on kernels held, {time.time() - t0:.1f} s)"
+              + (f"; refused at capacities {sorted(refused)} (plan not split-materialized W4A8)"
+                 if refused else ""), flush=True)
 
     # ---------------------------------------------------------------------------------------
     # pre-quantized input (prefill SP)
@@ -1215,7 +1377,7 @@ class _Geometry:
         print(f"{_TAG} pre-quantized prefill input ready at capacities {done} "
               f"({time.time() - t0:.1f} s, E={self.E} top-k {self.topk})", flush=True)
 
-    def _run(self, cap, x, ids, w, out, impl):
+    def _run(self, cap, x, ids, w, out, impl, ef=None):
         if x.shape[0] > cap:
             raise RuntimeError(f"DSV41_MOE_B12X_NEXT: {x.shape[0]} rows on the capacity-{cap} plan "
                                f"(chunk {self.chunk}, capacities {self.caps})")
@@ -1226,7 +1388,16 @@ class _Geometry:
         if st.w4a16_launches is not None:
             kw["_w4a16_launches"] = st.w4a16_launches
         b = dataclasses.replace(st.scratch.bind(**kw), compact_launches=st.compact_launches, plan=e.plan)
-        _B["fm"].run(binding=b)
+        if ef is None:      # DSV41_MOE_EVICT_FIRST: graph captures of <= MAX_ROWS rows only (ef=True: load warm)
+            # retain mode's coded experts have their own flag-on kernels (prepare_coded) -> their own refusals
+            refused = cap in (self.ef_refused_coded if id(impl) in _CODED_IMPLS else self.ef_refused)
+            ef = ef_decide(x.shape[0], refused=refused)
+        if ef:
+            _ef_restore()
+            with _EF["impl"].evict_first_weights():
+                _B["fm"].run(binding=b)
+        else:
+            _B["fm"].run(binding=b)
 
     def forward(self, impl, x, topk_ids, topk_weights, out):
         m_all = x.shape[0]
@@ -1583,4 +1754,6 @@ def prequant_target(layer, m):
 
 def geometry_reports():
     return {"geometries": [g.report for g in _GEOMS.values()], "layers": len(_LAYERS),
-            "prepare_weights_peak_mb_max": max(_PREP_PEAK_MB, default=0.0)}
+            "prepare_weights_peak_mb_max": max(_PREP_PEAK_MB, default=0.0),
+            "evict_first": {k: (sorted(v) if isinstance(v, set) else v) for k, v in _EF.items()
+                            if k in ("armed", "max_rows", "restored", "captures_on", "captures_off")}}

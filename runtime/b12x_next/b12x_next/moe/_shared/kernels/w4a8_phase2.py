@@ -19,7 +19,9 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_block_base, coded_row2_u32, coded_row4_u32
 from b12x_next._lib.intrinsics import (
     cp_async4_shared_global,
+    cp_async4_shared_global_l2hint,
     cp_async_u32_shared_global,
+    create_l2_evict_first_policy,
     e2m1x8_to_qmma_e2m1x8,
     get_ptr_as_int64,
     ld_shared_u32,
@@ -80,7 +82,14 @@ class W4A8MaterializedPhase2Kernel:
         n64_tail: bool = False,
         direct_routes: bool = False,
         coded_scales: bool = False,
+        evict_first_weights: bool = False,
     ):
+        # ds41 patch (b12x_next only): the routed-expert FC2 weight copies (packed B, N64 and N256
+        # repacked layouts; not the trellis windows, the SFB scale words, the intermediate A / SFA or
+        # the scatter output) carry an L2 evict_first cache policy. Set by
+        # fused_moe._impl._get_dynamic_kernel under evict_first_weights() (decode-sized launches);
+        # compile-time, so False emits the stock code.
+        self.evict_first_weights = bool(evict_first_weights)
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
         # ds41 scale-codes: down_sfb_rp holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
@@ -194,6 +203,7 @@ class W4A8MaterializedPhase2Kernel:
         total_output_tiles: Int32,
         total_k32: cutlass.Constexpr,
         tid: Int32,
+        ef_policy=None,
     ):
         transfers = 4 * 4 * 32
         total_output_n = total_output_tiles * Int32(128)
@@ -223,10 +233,17 @@ class W4A8MaterializedPhase2Kernel:
                         + Int64(n32 * Int32(128))
                         + Int64(lane * Int32(4))
                     )
-                    cp_async4_shared_global(
-                        dst_addr,
-                        get_ptr_as_int64(weights, source_word),
-                    )
+                    if cutlass.const_expr(self.evict_first_weights):
+                        cp_async4_shared_global_l2hint(
+                            dst_addr,
+                            get_ptr_as_int64(weights, source_word),
+                            ef_policy,
+                        )
+                    else:
+                        cp_async4_shared_global(
+                            dst_addr,
+                            get_ptr_as_int64(weights, source_word),
+                        )
                 else:
                     st_shared_u32(dst_addr, Uint32(0))
                     st_shared_u32(dst_addr + Int32(4), Uint32(0))
@@ -306,6 +323,7 @@ class W4A8MaterializedPhase2Kernel:
         rows_capacity: Int32,
         intermediate_tiles: Int32,
         packed_output_tiles: Int32,
+        ef_policy=None,
     ):
         stage = intermediate_slice & Int32(self.stages - 1)
         a_base = smem_base + stage * Int32(self.a_stage_bytes)
@@ -417,6 +435,7 @@ class W4A8MaterializedPhase2Kernel:
                 total_output_tiles,
                 total_k32,
                 tid,
+                ef_policy,
             )
             self._stage_n64_sfb(
                 down_sfb_rp,
@@ -456,10 +475,17 @@ class W4A8MaterializedPhase2Kernel:
                         + Int64((packed_n32 + chunk) * Int32(32 * 4))
                         + Int64(lane * Int32(4))
                     )
-                    cp_async4_shared_global(
-                        b_base + (idx << Int32(4)),
-                        get_ptr_as_int64(down_rp, src_word),
-                    )
+                    if cutlass.const_expr(self.evict_first_weights):
+                        cp_async4_shared_global_l2hint(
+                            b_base + (idx << Int32(4)),
+                            get_ptr_as_int64(down_rp, src_word),
+                            ef_policy,
+                        )
+                    else:
+                        cp_async4_shared_global(
+                            b_base + (idx << Int32(4)),
+                            get_ptr_as_int64(down_rp, src_word),
+                        )
 
             # An N32 chunk has four N8 scale rows, each with eight K16 words.
             sfb_word_base = Int64(b_tile) * Int64(256)
@@ -500,6 +526,7 @@ class W4A8MaterializedPhase2Kernel:
         rows_capacity: Int32,
         intermediate_tiles: Int32,
         packed_output_tiles: Int32,
+        ef_policy=None,
     ):
         lane = tid & Int32(31)
         q = lane >> Int32(2)
@@ -534,6 +561,7 @@ class W4A8MaterializedPhase2Kernel:
                     rows_capacity,
                     intermediate_tiles,
                     packed_output_tiles,
+                    ef_policy,
                 )
             cute.arch.cp_async_commit_group()
 
@@ -583,6 +611,7 @@ class W4A8MaterializedPhase2Kernel:
                     rows_capacity,
                     intermediate_tiles,
                     packed_output_tiles,
+                    ef_policy,
                 )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(self.stages - 1)
@@ -842,6 +871,10 @@ class W4A8MaterializedPhase2Kernel:
                 lut_copy_i += Int32(self.threads_per_cta)
             cute.arch.sync_threads()
 
+        # ds41 patch: one L2 evict_first policy per thread for every task's expert-weight copies.
+        ef_policy = None
+        if cutlass.const_expr(self.evict_first_weights):
+            ef_policy = create_l2_evict_first_policy()
         rows_capacity = Int32(token_map.shape[0])
         output_tiles = packed_output_tiles * Int32(256 // self.tile_n)
         if cutlass.const_expr(self.direct_routes):
@@ -895,6 +928,7 @@ class W4A8MaterializedPhase2Kernel:
                     rows_capacity,
                     intermediate_tiles,
                     packed_output_tiles,
+                    ef_policy,
                 )
             elif cutlass.const_expr(self.direct_routes):
                 if tid < Int32(self.tile_n):

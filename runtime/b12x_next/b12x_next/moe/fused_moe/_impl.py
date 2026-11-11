@@ -2167,6 +2167,50 @@ def _prequantized_input_requested() -> bool:
     return bool(getattr(_PREQUANT_STATE, "on", False))
 
 
+# ds41 patch (b12x_next only): L2 evict_first on the routed-expert weight copies. Inside
+# ``evict_first_weights()`` a dynamic launch whose FC1 / FC2 run in the split-materialized W4A8-MX
+# phase kernels (W4A8MaterializedPhase1Kernel / W4A8MaterializedPhase2Kernel: compact N64 M16, or
+# M64 / M128 tiles) resolves the specialization whose packed expert-weight cp.async copies carry
+# ``createpolicy.fractional.L2::evict_first`` (one policy per thread). Every other byte (activations,
+# A / weight scales, the materialized intermediate, route / scatter buffers) keeps the default
+# policy. A decode step streams each routed expert's weights once, so marking them first in L2's
+# replacement order keeps lines other kernels reuse (prefetched shared-expert / wo weights, the
+# gathered input, the intermediate) resident. Only the L2 replacement priority changes: the bytes
+# copied, the arithmetic and the launch geometry are the same, so outputs are bit-identical.
+# Launches that do not use those phase kernels ignore the request (the stock kernel, stock key).
+# Idea: Christopher Owen, spark-ds41f #966 (Apache-2.0), there on TileLang TMA weight loads.
+_EVICT_FIRST_STATE = threading.local()
+_EVICT_FIRST_KEY = "evict_first_weights"
+EVICT_FIRST_STATS = {"compiled": 0, "ineligible": 0}
+
+
+@contextmanager
+def evict_first_weights():
+    prev = getattr(_EVICT_FIRST_STATE, "on", False)
+    _EVICT_FIRST_STATE.on = True
+    try:
+        yield
+    finally:
+        _EVICT_FIRST_STATE.on = prev
+
+
+def _evict_first_weights_requested() -> bool:
+    return bool(getattr(_EVICT_FIRST_STATE, "on", False))
+
+
+def _evict_first_weights_eligible(
+    *, is_w4a8: bool, trellis_bits: int, w4a8_repacked: bool, w4a8_n64_repacked: bool,
+    materialize_intermediate: bool, mma_tiler_mn,
+) -> bool:
+    """True when the dynamic kernel runs FC1 / FC2 in the W4A8 split-materialized phase kernels
+    (mirrors MoEDynamicKernelBackend.w4a8_split_materialized; trellis windows are excluded)."""
+    tile = tuple(int(v) for v in mma_tiler_mn)
+    return bool(
+        is_w4a8 and int(trellis_bits) == 0 and w4a8_repacked and materialize_intermediate
+        and ((w4a8_n64_repacked and tile == (16, 128)) or tile in ((64, 128), (128, 128)))
+    )
+
+
 # ds41 patch (b12x_next only): accumulate-into-output top-k sum (prefill residual fold). Inside
 # ``topk_sum_accumulate()`` a launch must be the dynamic deterministic route-buffer path (checked
 # before anything is launched); its top-k sum then ADDS the routed sum to the bf16 value already in
@@ -10893,6 +10937,19 @@ def _get_dynamic_kernel(
                 f"direct_routing={direct_routing})"
             )
         cache_key = cache_key + ("prequantized_input",)
+    evict_first = bool(
+        _evict_first_weights_requested()
+        and _evict_first_weights_eligible(
+            is_w4a8=is_w4a8, trellis_bits=trellis_bits, w4a8_repacked=w4a8_repacked,
+            w4a8_n64_repacked=w4a8_n64_repacked,
+            materialize_intermediate=materialize_intermediate, mma_tiler_mn=mma_tiler_mn,
+        )
+    )
+    if evict_first:
+        # ds41 patch: appended only when on, so every existing key (and its object cache) is unchanged
+        cache_key = cache_key + (_EVICT_FIRST_KEY,)
+    elif _evict_first_weights_requested():
+        EVICT_FIRST_STATS["ineligible"] += 1
     reuse_compiled = _first_env(
         "B12X_NEXT_DYNAMIC_REUSE_COMPILED",
         "B12X_NEXT_LEVEL10_REUSE_COMPILED",
@@ -10970,6 +11027,15 @@ def _get_dynamic_kernel(
                 f"split-materialized W4A8-MX front-end (tile {tuple(mma_tiler_mn)})"
             )
         kernel.prequantized_input = True
+    if evict_first:
+        if not (kernel.w4a8_split_materialized and not kernel.w4a8_trellis):
+            raise ValueError(
+                "evict_first_weights: the resolved dynamic kernel does not run the W4A8 "
+                f"split-materialized phase kernels (tile {tuple(mma_tiler_mn)})"
+            )
+        kernel.materialized_phase1_kernel.evict_first_weights = True
+        kernel.materialized_phase2_kernel.evict_first_weights = True
+        EVICT_FIRST_STATS["compiled"] += 1
     if is_w4a8:
         launch = _DynamicMoEW4A8Launch(
             kernel,

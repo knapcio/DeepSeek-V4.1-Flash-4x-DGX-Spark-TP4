@@ -49,11 +49,16 @@ echo "$COMMIT" > "$OUT/b12x_next/SOURCE_COMMIT"
 #   scale-codes:     N64 W4A8 block scales may be 4-bit codes + a per-expert base (uint8 buffers in the sfb
 #                    slots, w4a8_scale_codes.py); the four N64 staging sites expand them into the same shared-
 #                    memory bytes behind const_expr(coded). Native launches (int32 sfb) compile as before.
+#   evict-first:     (after scale-codes) L2 evict_first cache policy on the routed-expert weight cp.async copies of the
+#                    split-materialized W4A8 phase kernels (FC1 + FC2 packed B), requested per launch by
+#                    _impl.evict_first_weights() (adapter/moe_b12x_next.py DSV41_MOE_EVICT_FIRST); the
+#                    dynamic kernel cache key gains ("evict_first_weights",) only when on, so the stock
+#                    kernels and keys are unchanged. Idea: Christopher Owen, spark-ds41f #966 (Apache-2.0).
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PATCHES=("$HERE/b12x_next-compact-n64-m64.patch" "$HERE/b12x_next-prequant-input.patch"
          "$HERE/b12x_next-barrier-zero.patch" "$HERE/b12x_next-det-triton-planner.patch"
          "$HERE/b12x_next-claim-barrier.patch" "$HERE/b12x_next-topk-sum-accumulate.patch"
-         "$HERE/b12x_next-scale-codes.patch")
+         "$HERE/b12x_next-scale-codes.patch" "$HERE/b12x_next-evict-first.patch")
 for PATCH in "${PATCHES[@]}"; do
   (cd "$OUT" && patch -p0 --forward --quiet < "$PATCH")
 done
@@ -65,6 +70,9 @@ grep -q "_compact_w4a8_query(query) and not query.deterministic_output" "$OUT/b1
   && { echo "det-triton-planner patch did not apply" >&2; exit 1; }
 grep -q "All warps retain the claim before the leader can reuse its slot" "$OUT/b12x_next/moe/_shared/kernels/dynamic.py" || { echo "claim-barrier patch did not apply" >&2; exit 1; }
 grep -q "def topk_sum_accumulate" "$OUT/b12x_next/moe/fused_moe/_impl.py" || { echo "topk-sum-accumulate patch did not apply" >&2; exit 1; }
+grep -q "def evict_first_weights" "$OUT/b12x_next/moe/fused_moe/_impl.py" \
+  && grep -q "cp.async.cg.shared.global.L2::cache_hint" "$OUT/b12x_next/_lib/intrinsics.py" \
+  || { echo "evict-first patch did not apply" >&2; exit 1; }
 if command -v sha256sum >/dev/null; then sum=sha256sum; else sum="shasum -a 256"; fi
 cat "${PATCHES[@]}" | $sum | cut -c1-16 > "$OUT/b12x_next/SOURCE_PATCH"
 # leftovers: only thread names / lock-file names of the form "b12x-..." may keep the old word

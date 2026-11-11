@@ -51,7 +51,8 @@ FILES = {} if T.SG is None else {
 
 
 # v2.7.5's production-line tail (scale codes, then the evict-first experts + SHPF window)
-V275_TAIL = ["DSV41_MOE_SCALE_CODES=1", "DSV41_MOE_SCALE_CODES_MIN_ROWS=2"]
+V275_TAIL = ["DSV41_MOE_SCALE_CODES=1", "DSV41_MOE_SCALE_CODES_MIN_ROWS=2", "DSV41_MOE_EVICT_FIRST=1",
+             "DSV41_L2_PREFETCH_SHPF_MB=6", "DSV41_L2_PREFETCH_SHPF_EL=0"]
 
 
 class FakeTorch:

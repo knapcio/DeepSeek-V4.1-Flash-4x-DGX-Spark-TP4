@@ -55,6 +55,27 @@ v4 knobs (read per call through ab_variant.env(); all unset = v3):
                               the real b12x MoE it slows the MoE by ~12.6 us per 10 MB and the lines
                               do not outlive the next layer's dense stream: -13 us per layer.
   (v3's TILED experiment, scales + a K prefix of every row, lost on GB10 and was removed.)
+v5 knob (read per plan through ab_variant.env(); unset / 0 = v4 bit for bit: no extra event is even recorded):
+  DSV41_L2_PREFETCH_SHPF_MB=6  shared-expert window. The FFN-side hyper-connection entry (the attention-side
+                              mix statistics, hc_attn_fn: TF32x3 stats + Sinkhorn on the stats stream, then the
+                              post / combine / norm, ~25 us of mostly idle DRAM on every rank, right before the
+                              router) forks a prefetch, on the second side stream, of the shared expert's gate_up
+                              (FC1) remainder and down_proj (FC2): the bytes of the next shared-expert call that
+                              no other window of the plan already covers (the post-attention all-reduce window
+                              takes the router and the first ~2 MB of FC1; a v6 W2 window, when on, only wo_b
+                              bytes). Fork point: right before DeepseekV4DecoderLayer._hc_mix_stats(hc_attn_fn) is
+                              recorded (at c1 inside the fused all_reduce_mhc_norm path, before the post-attention
+                              AR; at >8 rows after it). The consumer is the next GEMM chain (router, then FC1 / FC2
+                              on the alt stream), so no dense stream sits between the prefetch and its use (the
+                              X2e failure was 13-18 MB of streaming in between). Joined at the end of the forward.
+                              Cache hints only: outputs are bit-identical by construction. Receipt: the plan line's
+                              " shpf=<windows>/<MB> MB" and the capture line's " shpf=<forks>".
+  DSV41_L2_PREFETCH_SHPF_EL=1  (default 1; only read while SHPF_MB > 0) the SHPF windows go through l2pf_el, the
+                              v4 MOE kernel: the lines are prefetched with an L2::evict_last policy, so FC2's bytes
+                              outlive the router + FC1 reads in front of them, and each window first demotes the
+                              previous SHPF window's lines (consumed one layer earlier) back to evict_normal, so at
+                              most one window (<= SHPF_MB) of evict_last lines is ever resident. 0 = the plain bulk
+                              prefetch of v5 (perf/decode-batch-20261109). Same receipts either way.
 v6 knob (read per plan through ab_variant.env(); unset / 0 = v4 bit for bit: no extra event is even recorded;
 needs DSV41_L2_PREFETCH_WOA=1, the production gate, because the wo_a call is the fork point):
   DSV41_L2_PREFETCH_WOB2_MB=6 second wo_b window ("W2"), forked at the wo_a call itself, on the second side
@@ -144,7 +165,7 @@ extern "C" int dsv41_l2pf_el(const void* segs, int n, const void* old, int n_old
 """
 
 _state = {"lib": None, "learning": {}, "plans": {}, "sig": None, "idx": 0, "lin": 0, "eng": 0, "moe": 0,
-          "woa": 0, "woa_forks": 0,
+          "woa": 0, "woa_forks": 0, "hc": 0, "hc_forks": 0,
           "side": {}, "side2": {}, "pending": None, "pending2": None, "stats": [0, 0],
           "installed": set(), "logged": set(), "frozen": set(), "keepalive": [], "lm_head": {},
           "woa_depth": 0}
@@ -183,6 +204,16 @@ def _budget():
     return _mb("DSV41_L2_PREFETCH_MB", "6")
 
 
+def _shpf():
+    """v5 SHPF budget in bytes for the variant being learned / captured / replayed (0 = off)."""
+    return _mb("DSV41_L2_PREFETCH_SHPF_MB", "0") if enabled() else 0
+
+
+def _shpf_el():
+    """v5 SHPF window policy for the variant: evict_last through l2pf_el (default) or the plain bulk prefetch."""
+    return _env("DSV41_L2_PREFETCH_SHPF_EL", "1").strip() not in ("0", "off", "false", "no")
+
+
 def _wob2():
     """v6 W2 budget in bytes for the variant being learned / captured / replayed (0 = off)."""
     return _mb("DSV41_L2_PREFETCH_WOB2_MB", "0") if _sub("WOA") else 0
@@ -218,6 +249,7 @@ def _begin_forward(sig):
     observation wins, and a shape is frozen once captured."""
     _state["sig"], _state["idx"], _state["lin"], _state["eng"], _state["moe"] = sig, 0, 0, 0, 0
     _state["woa"], _state["woa_forks"] = 0, 0
+    _state["hc"], _state["hc_forks"] = 0, 0
     _state["stats"][1] = 0
     if _sub("WOA"):
         _ensure_wo_a()
@@ -248,7 +280,9 @@ def _side_stream(second=False):
 
 
 def _counts():
-    return (_state["idx"], _state["lin"], _state["eng"], _state["moe"], _state["woa"])
+    # (idx, lin, eng, moe, woa, hc): the v6 W2 wo_a-call count stays at [4] (v2.7.3), the v5 SHPF hc-entry count is
+    # appended at [5]; a learned plan matches a capture only if all six agree
+    return (_state["idx"], _state["lin"], _state["eng"], _state["moe"], _state["woa"], _state["hc"])
 
 
 def _end_forward():
@@ -275,13 +309,17 @@ def _end_forward():
             _side_stream(True)
             nbytes = sum(int(it[0][1::2].sum()) for it in plan.values())
             extra = sum(1 for k in plan if k[0] != "c")
+            hk = [k for k in plan if k[0] == "h"]
+            shpf = (f" shpf={len(hk)}/{sum(int(plan[k][0][1::2].sum()) for k in hk) / 2**20:.1f} MB"
+                    if _shpf() > 0 else "")
             wk = [k for k in plan if k[0] == "W"]
             wob2 = (f" wob2={len(wk)}/{sum(int(plan[k][0][1::2].sum()) for k in wk) / 2**20:.1f} MB"
                     if _wob2() > 0 else "")
             logger.warning("DSV41_L2_PREFETCH plan tokens=%d mode=%s collectives=%d windows=%d "
-                           "prefetch=%.1f MB/forward%s%s%s", sig[1], sig[2], n, len(plan), nbytes / 2**20,
+                           "prefetch=%.1f MB/forward%s%s%s%s", sig[1], sig[2], n, len(plan), nbytes / 2**20,
                            f" (of which {extra} linear/engram windows)" if extra else "",
-                           "" if old is None else f" (relearned; was {old[0]} collectives)", wob2)
+                           # receipt order: " shpf=" (v5), then " wob2=" (v6)
+                           "" if old is None else f" (relearned; was {old[0]} collectives)", shpf, wob2)
     elif sig is not None and capturing:
         _state["frozen"].add(sig)
         key = ("capture",) + sig[1:]
@@ -292,7 +330,8 @@ def _end_forward():
             ok = (entry is not None and learned == _state["idx"] and entry[3] == _counts()
                   and _state["stats"][1] > 0)
             logger.warning("DSV41_L2_PREFETCH captured tokens=%d mode=%s branches=%d collectives=%d "
-                           "(learned %d)%s%s", sig[1], sig[2], _state["stats"][1], _state["idx"], learned,
+                           "(learned %d)%s%s%s", sig[1], sig[2], _state["stats"][1], _state["idx"], learned,
+                           f" shpf={_state['hc_forks']}" if _shpf() > 0 else "",
                            f" wob2={_state['woa_forks']}" if _wob2() > 0 else "",
                            "" if ok else " MISMATCH: this graph runs without prefetch")
     _state["sig"] = None
@@ -330,6 +369,8 @@ def _windows(events):
     windows, cur, last_lin = [], None, None
     for ev in events:
         kind = ev[0]
+        if kind in ("h", "S", "s"):  # v5 SHPF markers: planned in _shpf_plan, never a window or a weight
+            continue
         if kind == "W":  # v6 W2 fork point: attaches to the current wo_a window, never a window of its own
             if cur is not None and cur[0][0] == "l" and len(cur) == 4:
                 cur.append(("W", ev[1]))
@@ -439,7 +480,74 @@ def _make_plan(events):
     for i, (key, t, n) in enumerate(moe_items):
         _, pt, pn = moe_items[i - 1]  # demote the previous MOE window's lines (wraps to the last)
         plan[key] = (t, n, "el", pt if len(moe_items) > 1 else t, pn if len(moe_items) > 1 else 0)
+    shpf = _shpf()
+    if shpf > 0:
+        # v5 SHPF last: the shared-expert bytes no other window (c / l / W / m / e) already holds
+        covered = [(int(v[0]), int(v[1])) for item in plan.values()
+                   for v in item[0].view(-1, 2).tolist()]
+        items = []
+        for key, segs in _shpf_plan(events, covered, shpf).items():
+            t = torch.tensor([v for sg in segs for v in sg], dtype=torch.int64, device="cuda")
+            _state["keepalive"].append(t)
+            items.append((key, t, len(segs)))
+        el = _shpf_el()
+        for i, (key, t, n) in enumerate(items):
+            if el:  # evict_last; demote the previous SHPF window's lines first (wraps to the last, as MOE)
+                _, pt, pn = items[i - 1]
+                plan[key] = (t, n, "el", pt if len(items) > 1 else t, pn if len(items) > 1 else 0)
+            else:
+                plan[key] = (t, n)
     return plan
+
+
+def _subtract(pieces, covered):
+    """[(ptr, nbytes)] minus the byte ranges in covered, order kept, every piece trimmed to 16-byte bounds."""
+    for c0, cn in sorted(covered):
+        c1, out = c0 + cn, []
+        for p0, pn in pieces:
+            p1 = p0 + pn
+            if c1 <= p0 or c0 >= p1:
+                out.append((p0, pn))
+                continue
+            if c0 > p0:
+                out.append((p0, c0 - p0))
+            if c1 < p1:
+                out.append((c1, p1 - c1))
+        pieces = out
+    res = []
+    for p0, pn in pieces:
+        a = (p0 + 15) & ~15
+        n = (p0 + pn - a) & ~15
+        if n > 0:
+            res.append((a, n))
+    return res
+
+
+def _shpf_plan(events, covered, budget):
+    """v5 SHPF: every ("h", n) marker -> the bytes of the next shared-expert call (the weights recorded between
+    the next ("S",) / ("s",) pair) that no other window covers, in consumption order, cut at budget."""
+    out, i, n_ev = {}, 0, len(events)
+    while i < n_ev:
+        ev = events[i]
+        i += 1
+        if ev[0] != "h":
+            continue
+        j = i
+        while j < n_ev and events[j][0] not in ("S", "h"):
+            j += 1
+        if j >= n_ev or events[j][0] != "S":
+            continue
+        k, queue = j + 1, []
+        while k < n_ev and events[k][0] != "s":
+            if events[k][0] == "r":
+                queue.append((events[k][1], events[k][2]))
+            k += 1
+        if not queue:
+            continue
+        segs, _ = _take(_subtract(queue, covered), (0, 0), budget)
+        if segs:
+            out[("h", ev[1])] = segs
+    return out
 
 
 def _plan_w2(plan, w2key, items, start, budget):
@@ -566,6 +674,30 @@ def _after_router():
         _fork(item, second=True)
 
 
+def _before_hc_stats():
+    """v5 SHPF: the attention-side mix statistics (the FFN-side hyper-connection entry) are about to be recorded;
+    fork the shared-expert prefetch planned for this boundary. No-op (and no event) while SHPF_MB is 0."""
+    sig = _state["sig"]
+    if sig is None or _shpf() <= 0:
+        return
+    _state["hc"] += 1
+    n = _state["hc"]
+    _rec(("h", n))
+    entry = _state["plans"].get(sig)
+    if entry is None or len(entry[3]) < 6 or n > entry[3][5] or _state["idx"] > entry[0]:
+        return
+    item = entry[1].get(("h", n))
+    if item is not None:
+        _fork(item, second=True)
+        _state["hc_forks"] += 1
+
+
+def _shared_mark(kind):
+    """v5 SHPF: ("S",) / ("s",) bracket the shared expert's weight reads in the learned event sequence."""
+    if _state["sig"] is not None and _shpf() > 0:
+        _rec((kind,))
+
+
 def _before_engram():
     sig = _state["sig"]
     if sig is None or not _sub("ENGRAM"):
@@ -655,9 +787,12 @@ def install_fp8_utils(module):
 def install_router(module):
     """Record the bf16 router weight (tiny_gemm_bf16 in deepseek_v2, 3.9 MB, read after the
     post-attention all-reduce at ~140 GB/s)."""
-    if not _installed() or not hasattr(module, "tiny_gemm_bf16") or ("router", id(module)) in _state["installed"]:
+    if not _installed() or ("router", id(module)) in _state["installed"]:
         return
     _state["installed"].add(("router", id(module)))
+    _install_shared_marks(module)
+    if not hasattr(module, "tiny_gemm_bf16"):
+        return
     original = module.tiny_gemm_bf16
 
     def tiny_gemm_bf16(hidden_states, weight, *args, **kwargs):
@@ -669,6 +804,28 @@ def install_router(module):
 
     tiny_gemm_bf16.__wrapped__ = original
     module.tiny_gemm_bf16 = tiny_gemm_bf16
+
+
+def _install_shared_marks(module):
+    """v5 SHPF: DeepseekV2MoE._forward_shared_experts brackets the shared expert's weight reads with ("S",) /
+    ("s",) (recorded only while the variant's SHPF budget is > 0)."""
+    moe = getattr(module, "DeepseekV2MoE", None)
+    fse = getattr(moe, "_forward_shared_experts", None) if moe is not None else None
+    if fse is None or getattr(fse, "_dsv41_l2_prefetch", False):
+        return
+
+    def _forward_shared_experts(self, *args, **kwargs):
+        _shared_mark("S")
+        try:
+            return fse(self, *args, **kwargs)
+        finally:
+            _shared_mark("s")
+
+    # inspect.unwrap() reaches the engine's own function: the adapters that hash-pin it (prefill_sp's
+    # _EXPECTED_FP8_MOE, checked at its install on deepseek_v4, after this deepseek_v2 hook) see the stock source.
+    _forward_shared_experts.__wrapped__ = fse
+    _forward_shared_experts._dsv41_l2_prefetch = True
+    moe._forward_shared_experts = _forward_shared_experts
 
 
 def install_roce(module):
@@ -723,6 +880,27 @@ def _bracket(cls, lm_head=False, gate=None):
     cls.forward = forward
 
 
+def _install_hc_entry(module):
+    """v5 SHPF: DeepseekV4DecoderLayer._hc_mix_stats(hc_attn_fn) is the FFN-side hyper-connection entry; the wrapper
+    forks the planned shared-expert window there (no-op unless SHPF_MB > 0). True when it installed."""
+    layer = getattr(module, "DeepseekV4DecoderLayer", None)
+    stats = getattr(layer, "_hc_mix_stats", None) if layer is not None else None
+    if stats is None or getattr(stats, "_dsv41_l2_prefetch", False):
+        return False
+
+    def _hc_mix_stats(self, x, hc_fn, *args, **kwargs):
+        if hc_fn is getattr(self, "hc_attn_fn", None):
+            _before_hc_stats()
+        return stats(self, x, hc_fn, *args, **kwargs)
+
+    # inspect.unwrap() reaches the engine's own function (prefill_sp's _EXPECTED pins it; prefill_sp's own
+    # wrappers keep __wrapped__ the same way)
+    _hc_mix_stats.__wrapped__ = stats
+    _hc_mix_stats._dsv41_l2_prefetch = True
+    layer._hc_mix_stats = _hc_mix_stats
+    return True
+
+
 def install_model(module):
     """Bracket DeepseekV4Model.forward (decode / target-verify only; prefill is compute-bound)."""
     if not _installed():
@@ -737,6 +915,8 @@ def install_model(module):
     lm_head = _installed("LMHEAD")
     _bracket(cls, lm_head=lm_head)
     extras = []
+    if _install_hc_entry(module):
+        extras.append("shared-expert hc windows (SHPF, per variant)")
     if _installed("WOA"):
         _ensure_wo_a([module])
         extras.append(f"wo_a windows ({_mb('DSV41_L2_PREFETCH_WOA_MB', '6') / 2**20:.1f} MB)")

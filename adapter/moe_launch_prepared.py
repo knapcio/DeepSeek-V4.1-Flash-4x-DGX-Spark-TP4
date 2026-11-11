@@ -13,8 +13,11 @@ step is a CUDA graph and never runs this Python.
 * ``plan``: ``_impl._launch_dynamic_flat`` (the custom op's body) is replaced by a version that runs the stock
   host decisions (quant-mode / routing / materialization / MAC / tile policy and the ``_get_dynamic_kernel`` lookup)
   ONCE per launch contract and keeps the result as a plan. The contract key is every scalar argument of the call,
-  the materialized-scratch size, the device, the pre-quantized-input state and the two programmatic overrides
-  (``_DYNAMIC_TILE_MN_OVERRIDE`` / ``_DYNAMIC_SWAP_AB_OVERRIDE``). The ``B12X_NEXT_*`` environment is tracked
+  the materialized-scratch size, the device, the coded-scale format of both sfb slots (ds41 scale codes), the
+  pre-quantized-input state, the evict-first state (b12x_next
+  ``evict_first_weights()``, DSV41_MOE_EVICT_FIRST: its kernels have their own cache key, so a plan built with the
+  flag off must never serve a call with it on, e.g. the load-time warm of the flag-on kernels) and the two
+  programmatic overrides (``_DYNAMIC_TILE_MN_OVERRIDE`` / ``_DYNAMIC_SWAP_AB_OVERRIDE``). The ``B12X_NEXT_*`` environment is tracked
   exactly: at install ``os.environ`` becomes a subclass of its own class that counts every write / delete of a
   ``B12X_NEXT_*`` key (b12x reads the environment only through ``os.environ``), and every eager launch compares that
   generation and the identity of ``os.environ`` before using a plan, so a change drops every plan on the very next
@@ -492,6 +495,12 @@ def _eligible(kw):
     return (kw["w13_sfb_rp"].dtype is not torch.float16 and not _capturing() and _plain_context(_I))
 
 
+def _evict_first(I):
+    """b12x_next evict_first_weights() state (False on a runtime without the evict-first patch)."""
+    fn = getattr(I, "_evict_first_weights_requested", None)
+    return bool(fn()) if fn is not None else False
+
+
 def _key(kw):
     I = _I
     mi = kw["materialized_intermediate"]
@@ -502,7 +511,7 @@ def _key(kw):
     return tuple(kw[s] for s in SCALARS) + (
         mi.numel() * mi.element_size(), dev,
         kw["w13_sfb_rp"].dtype == torch.uint8, kw["down_sfb_rp"].dtype == torch.uint8,    # ds41 scale codes
-        I._prequantized_input_requested(),
+        I._prequantized_input_requested(), _evict_first(I),                                # ds41 evict-first
         I._DYNAMIC_TILE_MN_OVERRIDE, I._DYNAMIC_SWAP_AB_OVERRIDE)
 
 

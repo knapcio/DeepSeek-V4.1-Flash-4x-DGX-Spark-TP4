@@ -216,7 +216,8 @@ def same_as_stock(name, kw, calls=3, expect_error=False):
                     if a != b:
                         if a[0] == b[0] == "compiled" and len(a[2]) == len(b[2]):
                             pos = [x for x in range(len(a[2])) if a[2][x] != b[2][x]]
-                            detail += f"; compiled args differ at {pos}: {a[2][pos[0]]} vs {b[2][pos[0]]}"
+                            detail += (f"; compiled args differ at {pos}: {a[2][pos[0]]} vs {b[2][pos[0]]}" if pos
+                                       else f"; compiled kernel differs: {a[1]} vs {b[1]}")
                         else:
                             detail += f"; first event diff #{j}: {str(a)[:200]} vs {str(b)[:200]}"
                         break
@@ -390,6 +391,22 @@ if callable(getattr(I, "prequantized_input", None)):
     with I.prequantized_input():
         check("invalidation: pre-quantized input context -> its own plan, equal to stock",
               same_as_stock("prequant", contract(m=4096, tile=64), calls=2))
+if callable(getattr(I, "evict_first_weights", None)):
+    # DSV41_MOE_EVICT_FIRST: an off plan of the same contract exists; inside evict_first_weights() the prepared body
+    # must build its own plan whose kernel is the flag-on one (cache key suffix), and off again reuses the off plan.
+    ef_kw = contract(m=6, tile=16)
+    same_as_stock("ef: off plan first", ef_kw, calls=1)
+    off_ref, _ = run(STOCK_BODY, per_call(ef_kw))
+    with I.evict_first_weights():
+        on_ref, _ = run(STOCK_BODY, per_call(ef_kw))
+        ok_on = same_as_stock("evict-first", ef_kw, calls=2)
+    tagged = [k for k in I._DYNAMIC_KERNEL_CACHE if k and k[-1] == "evict_first_weights"]
+    key_of = [e[1] for e in off_ref if e[0] == "compiled"], [e[1] for e in on_ref if e[0] == "compiled"]
+    check("invalidation: evict-first context -> its own plan (flag-on kernel), equal to stock",
+          ok_on and len(tagged) >= 1 and key_of[0] and key_of[1] and key_of[0] != key_of[1],
+          f"tagged keys {len(tagged)} compiled {key_of}")
+    check("evict-first: off again -> the off plan, equal to stock", same_as_stock("ef off again", ef_kw, calls=2))
+    check("evict-first: the prepared key carries the state", P._evict_first(I) is False)
 
 # fallbacks
 before = P._STATE["stock"]

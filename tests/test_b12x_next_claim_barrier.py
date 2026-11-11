@@ -174,6 +174,10 @@ class ClaimBarrierSourceTests(unittest.TestCase):
         # the build's own patch list, in its order (a later patch, e.g. scale-codes, extends the hash)
         names = re.findall(r'"\$HERE/b12x_next-([a-z0-9-]+)\.patch"', read("scripts", "build_b12x_next.sh"))
         self.assertIn("claim-barrier", names)
+        # the chain is pinned: the five base patches, v2.7.4's topk-sum-accumulate, then scale-codes, then evict-first
+        # (rebased on the coded tree)
+        self.assertEqual(names, ["compact-n64-m64", "prequant-input", "barrier-zero", "det-triton-planner",
+                                 "claim-barrier", "topk-sum-accumulate", "scale-codes", "evict-first"])
         blob = b"".join(read("scripts", f"b12x_next-{n}.patch", mode="rb") for n in names)
         with open(os.path.join(PKG, "SOURCE_PATCH")) as f:
             source_patch = f.read().strip()
