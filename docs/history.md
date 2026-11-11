@@ -4,6 +4,56 @@ Every dated table, note and rejected experiment that used to live in the README,
 
 The rows from before the sparkDash 1.8.8 sections were taken with sparkDash up to 1.8.6. sparkDash 1.8.7 replaced the code prompts (c1 and the concurrent waves), so those code columns are not comparable with the 1.8.8 tables; the prose, structured and prefill prompts are unchanged. From v2.6 (2026-10-27) the README reports speedbench only.
 
+## v2.7.3 release, 2026-11-10, speedbench (the README's current results until v2.7.4)
+
+The README's v2.7.3 results and release gate, moved here (headings demoted, links adjusted, text unchanged) when v2.7.4 was released on 2026-11-11. The v2.7.4 numbers are in the [README](../README.md#current-results).
+
+**v2.7.3** (2026-11-10, in production on the four Sparks since 2026-11-10 18:00) is v2.7.2 plus two lossless prefill changes and one lossless decode change in the production profile. The two prefill changes are checked bit for bit on every rank before use: the prefill MoE input is all-gathered as the MXFP8 bytes and scales b12x would compute itself instead of bf16 rows (`DSV41_PREFILL_SP_FP8_MOE=1`, checked per chunk row count), and eight measured prefill dense GEMM shapes run FlashInfer's CUTLASS SM120 MXFP8 GEMM (tactic 5) instead of the b12x call (`DSV41_PREFILL_GEMM_TACTIC=1`, checked per shape at boot). The decode change moves the attention-core L2 windows: the window after `wq_b` warms 6 MB of `wo_a` again and a second window forked at the `wo_a` call warms 10 MB of `wo_b` while `wo_a` runs from L2, with evict-first loads on `wo_a`'s single-use twin (`DSV41_L2_PREFETCH_WOA_MB=6 DSV41_L2_PREFETCH_WOB_MB=0 DSV41_L2_PREFETCH_WOB2_MB=10 DSV41_WO_A_W8_EVICT_FIRST=1`; cache hints only, outputs bit-identical). In its release gate against two v2.7.2 control boots on the official checkpoint: cold prefill **+3.9 %** at 64K, **+4.3 %** at 131K and **+3.8 %** at 1M (against the mean of the controls), and a cold 388K prompt's first token in 57.3 s instead of 59.8-60.0 s (**+4.4 to +4.8 %**); decode greedy c1 x1.007, c4 x1.006, c8 x1.003, c16 x0.990 (the decode step time at c8 and c16 at parity), sampled c1 x0.990 and c4 x1.009, speedbench load at c16 x0.995. Outputs: qeval 71 / 71 / 71, all 75 T = 0 qeval prompts inside the controls' own spread, KLD 0.005 short / 0.004 long (limit 0.035), draft acceptance on qeval identical on the three boots, reasoning length identical. The gate's new exactness check fired on the 64-token greedy continuation of one 131K document; on review that is the engine's own T = 0 run-to-run variation at 131K, which the two control boots happened not to show in this gate, not a change in the numerics (see [the release gate](#v273-release-gate)). The image stack, the KV pool (8,541,952 tokens at fraction 0.85), the launch line and every other v2.7.2 key are unchanged.
+
+#### speedbench
+
+[speedbench](https://github.com/knapcio/speedbench) 0.3 (`6733653`), full mode: 73 frozen prompts in six categories (prompt set speedbench-v1), 256 output tokens, thinking off, run on the head. v2.7.3 release-gate boot (2026-11-10, official 1017 checkpoint, KV pool pinned at 8,541,952 tokens as in the production profile), mean of two full runs per greedy cell and one run per sampled cell; c1 is the decode tok/s geometric mean over the prompts, c4 to c16 the aggregate tok/s:
+
+| tok/s | all 73 prompts, c1 | prose, c1 | c4 aggregate | c8 aggregate | c16 aggregate |
+|---|---:|---:|---:|---:|---:|
+| greedy (temperature 0) | **90.4** | 67.2 | **136.7** | 172.2 | **213.6** |
+| sampled (temperature 0.7, top-p 0.95, seed 1) | 87.0 | 64.7 | 134.7 | – | – |
+
+The two v2.7.2 control boots of the same gate gave greedy c1 89.6 / 90.0, c4 136.0 / 135.7, c8 171.4 / 172.0, c16 215.1 / 216.3 and sampled c1 87.2 / 88.4, c4 133.2 / 133.9 tok/s. Speedbench load at c16 gave 226.8 aggregate tok/s, median TTFT 466 ms, per-stream median 17.2 tok/s (controls 228.3 / 227.6 tok/s, 473 / 464 ms). The two prefill changes do not touch decode; the decode L2 layout shortens the c1 step (paired per prompt -0.27 ms, CI95 -0.29 to -0.25) and leaves the c8 / c16 step time at parity (127.2 ms against 127.0 / 127.4 at c8, 195.1 against 194.3 / 194.7 at c16); c16 tok/s moves with the draft acceptance of the T = 0 text at concurrency, which differs by ~1.3 % between identical controls.
+
+Per category, greedy c1 (same boots, mean of two full runs):
+
+| tok/s | prose | code | structured | agentic | multilingual | long context | all 73 prompts |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| v2.7.3 | **67.2** | 113.8 | 112.7 | 99.1 | 72.4 | 92.0 | **90.4** |
+| v2.7.2 (two control boots) | 66.7 / 66.7 | 113.1 / 113.0 | 111.7 / 111.9 | 99.5 / 99.7 | 71.5 / 71.8 | 89.1 / 91.6 | 89.6 / 90.0 |
+
+v2.7.3 runs: all 89.84 / 90.98, prose 66.72 / 67.71, code 113.22 / 114.42, structured 112.09 / 113.30, agentic 98.79 / 99.36, multilingual 71.83 / 72.94, long context 90.99 / 92.91. Median time to first token 166.3 / 164.9 ms (controls 166.2-167.7 ms); 73 of 73 prompts valid in both runs, none failed. Agentic and long context vary most from run to run.
+
+**Under load** (v2.6, one fresh boot of the v2.6 image and profile, the last full load sweep; speedbench load: closed loop, 90 s per level, 256 output tokens, thinking off)
+
+| concurrency | block tok/s | per stream, median tok/s | TTFT, median |
+|---|---:|---:|---:|
+| c1 | 77.3 | 83.3 | 207 ms |
+| c4 | 131.7 | 38.7 | 310 ms |
+| c16 | **211.0** | 16.0 | 539 ms |
+
+Block tok/s is all completion tokens over the wall time of the level, including request start and prefill, so the c1 value sits below the decode geomean above. The v2.7.3 release gate ran load at c16 only: 226.8 aggregate tok/s, median TTFT 466 ms, per-stream median 17.2 tok/s.
+
+**Prefill, cold** (v2.7.3 release gate, the gate's own probes, not speedbench: 64K, 131K and 1M are the median of three flushed prompts of 62K, 127K and 969K tokens; 388K is the first token of a cold 388,000-token prompt, median of three)
+
+| tok/s | 64K | 131K | 388K | 1M (969K tokens) |
+|---|---:|---:|---:|---:|
+| v2.7.3 | **6,726** | **6,851** | **6,774** (57.3 s) | **5,697** |
+| v2.7.2 (two control boots) | 6,469 / 6,481 | 6,554 / 6,584 | 6,467 / 6,487 (60.0 / 59.8 s) | 5,431 / 5,545 |
+
+The needle tests at 248K and 969K tokens passed (36.2 s and 168.6 s). The four Sparks serve the abliterated variant in production ([`mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated) `517efab`); its edit touches only `attn.wo_b` and `shared_experts.w2` of the main layers (the DSpark draft layers are identical), so the two run within a few percent of each other. The v2.7.2, v2.7.1 and v2.7 tables are in [docs/history.md](history.md).
+
+#### v2.7.3 release gate
+
+v2.7.2 / v2.7.3 / v2.7.2, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU clock capped at 2200 MHz, 2026-11-10 (run `run-20261110-114511-236731`, 362 min including the restore of production). The controls are production v2.7.2's image and profile; the v2.7.3 boot ran a gate image of `9413b93` (production v2.7.2's image with this release's changed files added) and the production profile, whose only differences are the six keys above; KV pool 8,541,952 tokens on all three. Every speed, prefill, memory, qeval, idle and latency rule passed (decode, sampled, load, decode step time, c1 step, cold prefill, memory, idle CPU, idle first token, inter-token gaps, long-prompt decode, 32K exactness), 0 safety, 0 invalid. qeval 71 / 71 / 71 with the same four failed tasks on every boot, all 75 T = 0 prompts inside the controls' bracket, KLD 0.0054 short / 0.0039 long against the controls (limit 0.035), the sampled-token distribution test p 0.949, the 16 thinking-on reasoning prompts the same length on all three boots. Draft acceptance pooled over the speedbench prompts x1.001 / x1.004 of the lower control at c1 / c4 (c8 x1.004 and c16 x0.998, reported only from this gate on: at concurrency the T = 0 text, and with it the acceptance, varies ~1.3 % between identical controls), and on qeval identical on the three boots (3.979). Long-prompt decode (flushed 32K and 131K documents, each followed by a 512-token greedy continuation) 101.8 tok/s (controls 98.9 / 100.8) at 4.00 tokens per step (3.92 / 4.00). Head memory low-water 8.43 GiB (controls 8.50 / 8.46), during the cold 1M prompts 8.68 GiB (8.71 / 8.65); idle first token 191 ms median (193 / 194); load c16 p99 inter-token gap 286 ms (286 / 290); a short prompt beside a cold 131K prefill got its first token in 0.29 s (0.33 / 0.33); the issue-16 soak 308 / 308 requests ok and its companion load 230 requests, 0 failed; no Xid on any boot. Every rank logged the GEMM tactic's boot check 8 / 8 shapes bit-identical and agreed, the MoE-input gather switched on for every chunk size with every self-check passing, and the same W2 windows on the four nodes. A deliberately cold boot of v2.7.3 (tuning caches off) was ready in 182 s with no Xid, core dump or fault line.
+
+The verdict text was **FAIL on one rule, exactness at 131K** (new in this gate: flushed 32K, 131K and 1M documents, the first token's top-20 logprobs and a 64-token greedy continuation compared with the controls). The six control samples of the 131K document all gave the same continuation and the three v2.7.3 samples gave two other texts, so the rule read the controls as stable. Across this gate and three earlier test windows on the same code base, checkpoint and document, the v2.7.2 code alone gave five different 131K continuations in 16 samples (the DSA indexer's top-k returns its indices in a different order from call to call, which moves near-tied logits); six equal control samples happen by chance about 6 % of the time. One v2.7.3 text is one of those stock texts, leaving the commonest one at token 62 of 64 on a 0.13-nat near tie that the stock code also flips; the other is new, as about 3 in 16 stock samples are. Two of the three v2.7.3 first-token top-20 vectors are bit-identical to vectors the v2.7.2 code produced; the 32K first token was identical in every run on all three boots, and 1M stayed inside the controls' spread. Accepted on review as release-equivalent; the next gate judges the 131K continuation against the accumulated set of stock states and stores the full tokens.
 ## v2.7.2 release, 2026-11-10, speedbench (the README's current results until v2.7.3)
 
 The README's v2.7.2 results and release gate, moved here (headings demoted, links adjusted, text unchanged) when v2.7.3 was released on 2026-11-10. The v2.7.3 numbers are in the [README](../README.md#current-results).
