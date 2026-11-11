@@ -20,6 +20,7 @@ import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
+from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_cp_async_16b, coded_expand_16b
 from b12x_next._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
@@ -75,8 +76,13 @@ class W4A8MaterializedPhase1Kernel:
         trellis_direct_lut: bool = False,
         n64_repacked: bool = False,
         n64_tail: bool = False,
+        coded_scales: bool = False,
     ):
         self.fast_math = bool(fast_math)
+        # ds41 scale-codes: w13_sfb_rp holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
+        self.coded_scales = bool(coded_scales)
+        if self.coded_scales and not n64_repacked:
+            raise ValueError("coded W4A8 scales require the N64 repack")
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.n64_repacked = bool(n64_repacked)
@@ -125,6 +131,8 @@ class W4A8MaterializedPhase1Kernel:
                 f"trellis_bits must be 2, 3, or 4, got {trellis_bits!r}"
             )
         self.w4a8_trellis = trellis_bits is not None
+        if self.coded_scales and self.w4a8_trellis:
+            raise ValueError("coded W4A8 scales are not defined for trellis weights")
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
         if trellis_intermediate_hadamard and not self.w4a8_trellis:
             raise ValueError("trellis_intermediate_hadamard requires trellis_bits")
@@ -336,22 +344,61 @@ class W4A8MaterializedPhase1Kernel:
             if transfer < Int32(transfers):
                 dst_addr = dst_base + (transfer << Int32(4))
                 if transfer < valid_transfers:
-                    source_word = (
-                        Int64(expert_idx) * Int64(expert_words)
-                        + Int64(projection) * Int64(projection_words)
-                        + Int64(tile_base)
-                        + Int64(k128_slice * n_rows)
-                        + Int64(transfer * Int32(4))
-                    )
-                    cp_async4_shared_global(
-                        dst_addr,
-                        get_ptr_as_int64(scales, source_word),
-                    )
+                    if cutlass.const_expr(self.coded_scales):
+                        # ds41 scale codes: header word + 8 code bytes, async, into this slot; expanded in place by
+                        # _expand_n64_sfb after this thread's cp_async_wait_group
+                        coded_cp_async_16b(
+                            scales,
+                            dst_addr,
+                            expert_idx,
+                            Int64(expert_words),
+                            Int64(projection) * Int64(projection_words)
+                            + Int64(tile_base)
+                            + Int64(k128_slice * n_rows)
+                            + Int64(transfer * Int32(4)),
+                        )
+                    else:
+                        source_word = (
+                            Int64(expert_idx) * Int64(expert_words)
+                            + Int64(projection) * Int64(projection_words)
+                            + Int64(tile_base)
+                            + Int64(k128_slice * n_rows)
+                            + Int64(transfer * Int32(4))
+                        )
+                        cp_async4_shared_global(
+                            dst_addr,
+                            get_ptr_as_int64(scales, source_word),
+                        )
                 else:
                     st_shared_u32(dst_addr, Uint32(0))
                     st_shared_u32(dst_addr + Int32(4), Uint32(0))
                     st_shared_u32(dst_addr + Int32(8), Uint32(0))
                     st_shared_u32(dst_addr + Int32(12), Uint32(0))
+
+    @cute.jit
+    def _expand_n64_sfb(
+        self,
+        dst_base: Int32,
+        output_tile: Int32,
+        intermediate_tiles: Int32,
+        tid: Int32,
+    ):
+        """ds41 scale codes: rewrite this thread's coded slots of one N64 SFB stage tile in place with the native
+        bytes. Same transfer -> thread mapping and validity as _stage_n64_sfb, so a thread expands exactly the slots
+        its own cp.async filled; call after cp_async_wait_group (own copies landed), before the stage barrier."""
+        n_rows = Int32(128)
+        if cutlass.const_expr(self.n64_tail):
+            if output_tile == intermediate_tiles - Int32(1):
+                n_rows = Int32(64)
+        transfers = 512 // 16
+        valid_transfers = n_rows // Int32(4)
+        for i in cutlass.range_constexpr(
+            (transfers + self.threads_per_cta - 1) // self.threads_per_cta
+        ):
+            transfer = tid + Int32(i * self.threads_per_cta)
+            if transfer < Int32(transfers):
+                if transfer < valid_transfers:
+                    coded_expand_16b(dst_base + (transfer << Int32(4)))
 
     @cute.jit
     def _stage_slice(
@@ -705,6 +752,11 @@ class W4A8MaterializedPhase1Kernel:
                 )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(self.stages - 1)
+            if cutlass.const_expr(self.coded_scales):
+                # ds41 scale codes: this thread's copies of the CURRENT stage have landed (wait_group covers its own
+                # groups); it expands the slots it filled, and the barrier below publishes them with the stage
+                self._expand_n64_sfb(gate_sfb_base, output_tile, intermediate_tiles, tid)
+                self._expand_n64_sfb(up_sfb_base, output_tile, intermediate_tiles, tid)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
 

@@ -16,6 +16,7 @@ import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 
+from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_block_base, coded_row2_u32, coded_row4_u32
 from b12x_next._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
@@ -78,9 +79,14 @@ class W4A8MaterializedPhase2Kernel:
         n64_repacked: bool = False,
         n64_tail: bool = False,
         direct_routes: bool = False,
+        coded_scales: bool = False,
     ):
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
+        # ds41 scale-codes: down_sfb_rp holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
+        self.coded_scales = bool(coded_scales)
+        if self.coded_scales and not self.n64_repacked:
+            raise ValueError("coded W4A8 scales require the N64 repack")
         self.direct_routes = bool(direct_routes)
         if self.direct_routes:
             if source_tile_m != 1:
@@ -248,23 +254,41 @@ class W4A8MaterializedPhase2Kernel:
         if cutlass.const_expr(self.n64_tail):
             if k128_slice == Int32(total_k32 // 4):
                 tile_cols = Int32(2)
-        for i in cutlass.range_constexpr(
-            (copies + self.threads_per_cta - 1) // self.threads_per_cta
-        ):
-            idx = tid + Int32(i * self.threads_per_cta)
-            if idx < Int32(copies):
-                row = idx & Int32(127)
-                kb = idx >> Int32(7)
-                value = Uint8(0)
-                if kb < tile_cols:
-                    source_byte = (
-                        Int64(expert_idx) * Int64(expert_bytes)
-                        + Int64(output_base)
-                        + Int64(k128_slice * Int32(512))
-                        + Int64(row * tile_cols + kb)
-                    )
-                    value = scales_u8[source_byte]
-                st_shared_u8(dst_base + row * Int32(4) + kb, value)
+        if cutlass.const_expr(self.coded_scales):
+            # ds41 scale codes, parallel row expansion: one thread per N row writes the row's four bytes as one u32
+            # (native: four byte stores of the same bytes, kb >= tile_cols zero), from one 16-bit code load (8-bit on
+            # the K tail) and the expert's base, loaded once per tile
+            block, base = coded_block_base(scales_u8, expert_idx, Int64(expert_bytes))
+            for i in cutlass.range_constexpr(
+                (128 + self.threads_per_cta - 1) // self.threads_per_cta
+            ):
+                row = tid + Int32(i * self.threads_per_cta)
+                if row < Int32(128):
+                    local = Int64(output_base) + Int64(k128_slice * Int32(512)) + Int64(row * tile_cols)
+                    word = Uint32(0)
+                    if tile_cols == Int32(4):
+                        word = coded_row4_u32(scales_u8, block, base, local)
+                    else:
+                        word = coded_row2_u32(scales_u8, block, base, local)
+                    st_shared_u32(dst_base + row * Int32(4), word)
+        else:
+            for i in cutlass.range_constexpr(
+                (copies + self.threads_per_cta - 1) // self.threads_per_cta
+            ):
+                idx = tid + Int32(i * self.threads_per_cta)
+                if idx < Int32(copies):
+                    row = idx & Int32(127)
+                    kb = idx >> Int32(7)
+                    value = Uint8(0)
+                    if kb < tile_cols:
+                        source_byte = (
+                            Int64(expert_idx) * Int64(expert_bytes)
+                            + Int64(output_base)
+                            + Int64(k128_slice * Int32(512))
+                            + Int64(row * tile_cols + kb)
+                        )
+                        value = scales_u8[source_byte]
+                    st_shared_u8(dst_base + row * Int32(4) + kb, value)
 
     @cute.jit
     def _stage_slice(

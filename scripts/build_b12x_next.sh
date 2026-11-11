@@ -46,15 +46,20 @@ echo "$COMMIT" > "$OUT/b12x_next/SOURCE_COMMIT"
 #                    routed sum into the caller's bf16 output (out = bf16(float(out) + float(bf16(sum))), torch's
 #                    add_ bit for bit) instead of overwriting it; other launch paths refuse under it
 #                    (adapter/prefill_moe_fold.py, DSV41_PREFILL_MOE_FOLD; off unless that context is entered)
+#   scale-codes:     N64 W4A8 block scales may be 4-bit codes + a per-expert base (uint8 buffers in the sfb
+#                    slots, w4a8_scale_codes.py); the four N64 staging sites expand them into the same shared-
+#                    memory bytes behind const_expr(coded). Native launches (int32 sfb) compile as before.
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PATCHES=("$HERE/b12x_next-compact-n64-m64.patch" "$HERE/b12x_next-prequant-input.patch"
          "$HERE/b12x_next-barrier-zero.patch" "$HERE/b12x_next-det-triton-planner.patch"
-         "$HERE/b12x_next-claim-barrier.patch" "$HERE/b12x_next-topk-sum-accumulate.patch")
+         "$HERE/b12x_next-claim-barrier.patch" "$HERE/b12x_next-topk-sum-accumulate.patch"
+         "$HERE/b12x_next-scale-codes.patch")
 for PATCH in "${PATCHES[@]}"; do
   (cd "$OUT" && patch -p0 --forward --quiet < "$PATCH")
 done
 grep -q "_compact_n64_tiles" "$OUT/b12x_next/moe/fused_moe/_tuning.py" || { echo "compact-n64-m64 patch did not apply" >&2; exit 1; }
 grep -q "def prequantized_input" "$OUT/b12x_next/moe/fused_moe/_impl.py" || { echo "prequant-input patch did not apply" >&2; exit 1; }
+grep -q "def coded_stage_16b" "$OUT/b12x_next/moe/_shared/kernels/w4a8_scale_codes.py" || { echo "scale-codes patch did not apply" >&2; exit 1; }
 grep -q "def _zero_barrier_state" "$OUT/b12x_next/moe/fused_moe/_impl.py" || { echo "barrier-zero patch did not apply" >&2; exit 1; }
 grep -q "_compact_w4a8_query(query) and not query.deterministic_output" "$OUT/b12x_next/moe/fused_moe/_tuning.py" \
   && { echo "det-triton-planner patch did not apply" >&2; exit 1; }

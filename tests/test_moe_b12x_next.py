@@ -25,7 +25,8 @@ capacity ladder. Also:
 
 usage (inside `docker run --rm --gpus all` of the image, see RESULTS / report):
   PYTHONPATH=/ds41/adapter:/b12x_next python3 /ds41/tests/test_moe_b12x_next.py [--quick]
-env: MODEL_DIR (default /model), TEST_MAX_GB (2.0), CKPT_EXPERTS (32), DSV41_MOE_B12X_NEXT_TUNE.
+env: MODEL_DIR (default /model), TEST_MAX_GB (2.0), CKPT_EXPERTS (32), CKPT_EXPERT_BASE (0: the first global expert
+loaded, read per make_layer call), DSV41_MOE_B12X_NEXT_TUNE.
 """
 import json
 import os
@@ -152,7 +153,7 @@ def make_layer(prefix, *, n_global, topk, ep_size, ep_rank, moe_tp_size, moe_tp_
     method.create_moe_runner(layer, cfg)
     src = {}
     for le in range(e_local):
-        g = ep_rank * e_local + le
+        g = int(os.environ.get("CKPT_EXPERT_BASE", "0")) + ep_rank * e_local + le   # base: the layers sweep
         t = expert_tensors(prefix, g)
         src[le] = t
         for w, shard in (("w1", "w1"), ("w3", "w3"), ("w2", "w2")):

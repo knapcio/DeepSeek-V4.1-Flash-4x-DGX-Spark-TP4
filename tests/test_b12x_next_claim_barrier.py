@@ -170,8 +170,10 @@ class ClaimBarrierSourceTests(unittest.TestCase):
         self.assertIn("Martin Vit", patch)
         self.assertIn("b12x_next-claim-barrier.patch", read("scripts", "build_b12x_next.sh"))
         import hashlib
-        names = ["compact-n64-m64", "prequant-input", "barrier-zero", "det-triton-planner", "claim-barrier",
-                 "topk-sum-accumulate"]
+        import re
+        # the build's own patch list, in its order (a later patch, e.g. scale-codes, extends the hash)
+        names = re.findall(r'"\$HERE/b12x_next-([a-z0-9-]+)\.patch"', read("scripts", "build_b12x_next.sh"))
+        self.assertIn("claim-barrier", names)
         blob = b"".join(read("scripts", f"b12x_next-{n}.patch", mode="rb") for n in names)
         with open(os.path.join(PKG, "SOURCE_PATCH")) as f:
             source_patch = f.read().strip()

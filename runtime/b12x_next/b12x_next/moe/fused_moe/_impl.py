@@ -10751,6 +10751,7 @@ def _get_dynamic_kernel(
     quant_mode: str = "nvfp4",
     w4a8_repacked: bool = False,
     w4a8_n64_repacked: bool = False,
+    w4a8_coded_scales: bool = False,
     nvfp4_materialize_intermediate: bool = False,
     direct_routing: bool = False,
     external_route_plan: bool = False,
@@ -10819,6 +10820,8 @@ def _get_dynamic_kernel(
     ) or (quant_mode == "nvfp4" and nvfp4_materialize_intermediate)
     if w4a8_n64_repacked and not w4a8_repacked:
         raise ValueError("w4a8_n64_repacked requires repacked W4A8 weights")
+    if w4a8_coded_scales and not w4a8_n64_repacked:
+        raise ValueError("w4a8_coded_scales (ds41 scale codes) requires the N64 repack")
     if w4a8_n64_repacked and n % 64 != 0:
         raise ValueError("w4a8_n64_repacked requires N divisible by 64")
     if w4a8_n64_repacked:
@@ -10870,6 +10873,8 @@ def _get_dynamic_kernel(
         str(work_source),
         bool(w4a8_repacked),
         bool(w4a8_n64_repacked),
+        # ds41 scale codes: appended only when on, so the native key (and compile cache entry) is unchanged
+        *(("w4a8_coded_scales",) if w4a8_coded_scales else ()),
         bool(direct_routing),
         bool(external_route_plan),
         bool(materialize_intermediate),
@@ -10945,11 +10950,18 @@ def _get_dynamic_kernel(
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
         kernel_kwargs["w4a8_n64_repacked"] = w4a8_n64_repacked
         kernel_kwargs["w4a8_n64_tail"] = bool(w4a8_n64_repacked and n % 128)
+        if w4a8_coded_scales:
+            kernel_kwargs["w4a8_coded_scales"] = True
     elif is_w6a8:
         # mxfp6_fmt_a/mxfp6_fmt_b stay at the ctor defaults ("e4m3" MXFP8
         # activations against "e2m3" FP6 weights).
         kernel_kwargs["quant_recipe"] = quant_mode
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
+    if w4a8_coded_scales and not (getattr(kernel, "external_materialized_fc1", False)
+                                  and getattr(kernel, "external_materialized_fc2", False)):
+        # ds41 scale codes are qualified on the split-materialized phase kernels only (REVIEW_sol_scalecodes R4)
+        raise ValueError("ds41 scale codes: this dynamic plan would stage coded scales in the monolithic kernel; "
+                         "refused (only split-materialized FC1/FC2 are qualified)")
     if prequantized:
         if not (kernel.w4a8_split_materialized and not kernel.w4a8_m1_materialized
                 and not kernel.w4a8_trellis and kernel.share_input_across_experts):
@@ -11346,6 +11358,13 @@ def _launch_dynamic_flat(
     # the sfb slot (the QMMA repack stores int32 scale words there); the
     # trellis geometry is recovered from the operand extents.
     w4a8_trellis = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
+    # ds41 scale codes: a coded binding carries uint8 code buffers (4-bit codes + per-expert base) in the
+    # sfb slots; the native one int32 words. Both slots must agree.
+    w4a8_coded_scales = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.uint8
+    if w4a8_coded_scales != (_is_w4a8_quant_mode(quant_mode) and down_sfb_rp.dtype == torch.uint8):
+        raise ValueError("ds41 scale codes: w13 and down scale slots disagree on the coded format")
+    if w4a8_coded_scales and not w4a8_n64_repacked:
+        raise ValueError("ds41 scale codes: coded scales reached a non-N64 W4A8 launch")
     trellis_bits = 0
     trellis_intermediate_hadamard = False
     trellis_lut_tensor = None
@@ -11530,6 +11549,7 @@ def _launch_dynamic_flat(
         quant_mode=quant_mode,
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
+        w4a8_coded_scales=w4a8_coded_scales,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,

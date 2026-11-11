@@ -131,6 +131,7 @@ from b12x_next.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_trellis_pair_words,
     _w4a8_trellis_permute_k32,
 )
+from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_byte
 from b12x_next.moe._shared.kernels.w4a8_phase1 import (
     W4A8MaterializedPhase1Kernel,
 )
@@ -407,8 +408,12 @@ def _w4a8_stage_n64_sfb_tile(
     total_k32: cutlass.Constexpr,
     tidx: Int32,
     tcnt: cutlass.Constexpr,
+    coded: cutlass.Constexpr = False,
 ):
-    """Stage exact N64-packed E8M0 bytes into the N128/K128 SFB tile."""
+    """Stage exact N64-packed E8M0 bytes into the N128/K128 SFB tile.
+
+    ds41 scale-codes: with ``coded`` the tensor holds 4-bit codes + a per-expert base and every byte is
+    expanded at the same expert-local offset (w4a8_scale_codes.coded_byte)."""
 
     sfb_u8 = cute.recast_tensor(sfb_rp_u32, Uint8)
     copies = 2 * 4 * 64
@@ -432,13 +437,23 @@ def _w4a8_stage_n64_sfb_tile(
                 if source_kt == Int32(full_k_tiles):
                     tile_cols = Int32(total_k32 - full_k_tiles * 4)
                     tile_base = Int32(full_k_tiles * 256)
-                source_byte = (
-                    Int64(expert_idx) * Int64(expert_bytes)
-                    + Int64(source_n64) * Int64(total_k32 * 64)
-                    + Int64(tile_base)
-                    + Int64(row * tile_cols + source_kb)
-                )
-                value = sfb_u8[source_byte]
+                if cutlass.const_expr(coded):
+                    value = coded_byte(
+                        sfb_u8,
+                        expert_idx,
+                        Int64(expert_bytes),
+                        Int64(source_n64) * Int64(total_k32 * 64)
+                        + Int64(tile_base)
+                        + Int64(row * tile_cols + source_kb),
+                    )
+                else:
+                    source_byte = (
+                        Int64(expert_idx) * Int64(expert_bytes)
+                        + Int64(source_n64) * Int64(total_k32 * 64)
+                        + Int64(tile_base)
+                        + Int64(row * tile_cols + source_kb)
+                    )
+                    value = sfb_u8[source_byte]
             st_shared_u8(
                 smem_base
                 + (n64_half * Int32(64) + row) * Int32(4)
@@ -804,6 +819,7 @@ class MoEDynamicKernelBackend:
         w4a8_repacked: bool = False,
         w4a8_n64_repacked: bool = False,
         w4a8_n64_tail: bool = False,
+        w4a8_coded_scales: bool = False,
         direct_routing: bool = False,
         external_route_plan: bool = False,
         materialize_intermediate: bool = False,
@@ -949,6 +965,10 @@ class MoEDynamicKernelBackend:
         self.w4a8_repacked = bool(w4a8_repacked)
         self.w4a8_n64_repacked = bool(w4a8_n64_repacked)
         self.w4a8_n64_tail = bool(w4a8_n64_tail)
+        # ds41 scale-codes (w4a8_scale_codes.py): N64 block scales as 4-bit codes + a per-expert base
+        self.w4a8_coded_scales = bool(w4a8_coded_scales)
+        if self.w4a8_coded_scales and not self.w4a8_n64_repacked:
+            raise ValueError("w4a8_coded_scales requires w4a8_n64_repacked")
         if self.w4a8_n64_repacked and not self.w4a8_repacked:
             raise ValueError("w4a8_n64_repacked requires w4a8_repacked")
         if self.w4a8_n64_tail and not self.w4a8_n64_repacked:
@@ -1055,6 +1075,7 @@ class MoEDynamicKernelBackend:
                 num_topk=self.num_topk,
                 n64_repacked=self.w4a8_n64_repacked,
                 n64_tail=self.w4a8_n64_tail,
+                coded_scales=self.w4a8_coded_scales,
                 trellis_bits=(
                     trellis_bits
                     if self.w4a8_trellis and self.w4a8_split_materialized
@@ -1080,6 +1101,7 @@ class MoEDynamicKernelBackend:
                 deterministic_output=bool(deterministic_output),
                 n64_repacked=self.w4a8_n64_repacked,
                 n64_tail=self.w4a8_n64_tail,
+                coded_scales=self.w4a8_coded_scales,
                 trellis_bits=(
                     trellis_bits
                     if self.w4a8_trellis and self.w4a8_split_materialized
@@ -8935,6 +8957,7 @@ class MoEDynamicKernelBackend:
                                             total_w13_k32,
                                             Int32(lane_id),
                                             32,
+                                            coded=self.w4a8_coded_scales,
                                         )
                                         if cutlass.const_expr(self.w4a8_fused):
                                             _w4a8_stage_n64_sfb_tile(
@@ -8947,6 +8970,7 @@ class MoEDynamicKernelBackend:
                                                 total_w13_k32,
                                                 Int32(lane_id),
                                                 32,
+                                                coded=self.w4a8_coded_scales,
                                             )
                                     elif cutlass.const_expr(
                                         self.w4a8_repacked
@@ -9408,6 +9432,7 @@ class MoEDynamicKernelBackend:
                                         total_down_k32,
                                         Int32(lane_id),
                                         32,
+                                        coded=self.w4a8_coded_scales,
                                     )
                                     if cutlass.const_expr(self.w4a8_fc2_pair):
                                         _w4a8_stage_n64_sfb_tile(
@@ -9420,6 +9445,7 @@ class MoEDynamicKernelBackend:
                                             total_down_k32,
                                             Int32(lane_id),
                                             32,
+                                            coded=self.w4a8_coded_scales,
                                         )
                                 elif cutlass.const_expr(
                                     self.w4a8_repacked and not self.w4a8_trellis

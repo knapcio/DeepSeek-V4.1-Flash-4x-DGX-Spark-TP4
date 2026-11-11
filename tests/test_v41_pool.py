@@ -50,6 +50,10 @@ FILES = {} if T.SG is None else {
 }
 
 
+# v2.7.5's production-line tail (scale codes, then the evict-first experts + SHPF window)
+V275_TAIL = ["DSV41_MOE_SCALE_CODES=1", "DSV41_MOE_SCALE_CODES_MIN_ROWS=2"]
+
+
 class FakeTorch:
     """torch stub for the stock selector: no CUDA (so the stock function answers from its env alone)."""
     cuda = types.SimpleNamespace(is_available=lambda: False, get_device_capability=lambda: (12, 1))
@@ -426,6 +430,9 @@ class Profile(unittest.TestCase):
 
     def test_production_line(self):
         items = self._production_line().split('"')[1].split()
+        # v2.7.5's keys come last (V275_TAIL): checked here, then the v2.7.4 line's checks below run on the rest
+        self.assertEqual(items[-len(V275_TAIL):], V275_TAIL)
+        items = items[:-len(V275_TAIL)]
         # v2.6.6's SWA prompt tail follows the v2.7 keys and trim2; v2.7.1's seven new keys follow them, then v2.7.2's CED
         # skip, then v2.7.3's stage 2b, GEMM tactic and W2 / evict-first decode keys (WOA_MB / WOB_MB flipped in place)
         self.assertEqual(items[-19:-15], ["DSV41_KV_LAYOUT=v41", "SGLANG_SM120_V41_PRECISION=bf16",

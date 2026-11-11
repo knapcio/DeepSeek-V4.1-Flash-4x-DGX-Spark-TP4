@@ -78,7 +78,11 @@ UNION_BOOL = ("DSV41_L2_PREFETCH", "DSV41_L2_PREFETCH_WOA", "DSV41_L2_PREFETCH_D
               "DSV41_DENSE_TILE_TABLE",
               # adapter/wo_a_cfg_table.py: the load self-check runs when any variant enables it; the gate read per call
               # (per capture: a variant that changes it needs its own graph set)
-              "DSV41_WO_A_CFG_TABLE")
+              "DSV41_WO_A_CFG_TABLE",
+              # adapter/moe_b12x_next.py scale codes, A/B retain mode: every layer's coded experts are built at load
+              # BESIDE the native ones when any variant enables it (native storage kept, nothing released); read per
+              # capture: only CUDA-graph captures of a variant with it on run the coded experts, eager always native
+              "DSV41_MOE_SCALE_CODES")
 UNION_PARTS = {"DSV41_FUSE_QUANT": ("qnorm", "wo_a", "hcpad"),
                # adapter/spec_sync_free.py: per-step rank-0 broadcasts kept / dropped per variant
                "DSV41_SPEC_SYNC_FREE": ("draft", "accept", "vcap", "merge"),
@@ -115,7 +119,10 @@ RUNTIME = ("DSV41_L2_PREFETCH_AHEAD", "DSV41_L2_PREFETCH_MB", "DSV41_L2_PREFETCH
            # adapter/prefill_moe_fold.py: shared-expert add folded into the top-k sum (eager prefill, per MoE call; the
            # per-capacity bitwise self-check state is shared by the variants; hooks + accumulate warm-up installed when
            # any variant names it)
-           "DSV41_PREFILL_MOE_FOLD")
+           "DSV41_PREFILL_MOE_FOLD",
+           # adapter/moe_b12x_next.py scale codes (A/B retain mode): captured MoE calls of fewer rows keep the native
+           # experts (default 2: M=1 graphs stay native); read per capture
+           "DSV41_MOE_SCALE_CODES_MIN_ROWS")
 KNOWN = frozenset(UNION_BOOL) | frozenset(UNION_PARTS) | frozenset(RUNTIME)
 # numeric knobs with their defaults (the name is historical: SKIP_N is a row count, not MB)
 _MB_DEFAULTS = {"DSV41_L2_PREFETCH_MB": 6.0, "DSV41_L2_PREFETCH_WOA_MB": 6.0, "DSV41_L2_PREFETCH_ENGRAM_MB": 12.0,
@@ -125,7 +132,7 @@ HASHED_SOURCES = ("ab_variant", "l2_prefetch", "wo_a_w8", "mxfp8_b12x", "fuse_qu
                   "indexer_chunked_v3", "moe_launch_prepared", "block_verify", "block_verify_fold", "extend_nosync",
                   "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache", "sampled_commit_reuse", "sampled_draft_probs_early",
                   "prefill_ced_skip", "prefill_gemm_tactic", "prefill_sp", "moe_b12x_next",
-                  "dense_tile_table", "prefill_moe_fold", "wo_a_cfg_table")
+                  "dense_tile_table", "prefill_moe_fold", "wo_a_cfg_table", "scale_codes")
 
 MODULES = ("sglang.srt.model_executor.runner_backend.full_cuda_graph_backend",
            "sglang.srt.managers.scheduler_components.request_receiver")
@@ -224,6 +231,20 @@ def _mask_cap(value):
     return min(v, 128)
 
 
+def _min_rows(value):
+    """DSV41_MOE_SCALE_CODES_MIN_ROWS as adapter/moe_b12x_next.parse_min_rows reads it (unset = 2)."""
+    raw = (value or "").strip()
+    if not raw:
+        return 2
+    try:
+        v = int(raw)
+    except ValueError:
+        raise RuntimeError(f"DSV41_MOE_SCALE_CODES_MIN_ROWS={value!r}: expected an integer row count; refused") from None
+    if v < 1:
+        raise RuntimeError(f"DSV41_MOE_SCALE_CODES_MIN_ROWS={value!r}: must be >= 1; refused")
+    return v
+
+
 def _norm(cfg):
     """Effective behaviour of one variant's registry values (defaults applied; L2 knobs are moot
     while the L2 main gate is off)."""
@@ -253,6 +274,8 @@ def _norm(cfg):
             out[key] = _cert_rows(value)
         elif key == "DSV41_CERT_HEAD_MASK_MAX_M":  # a row cap; unset = no cap = 128
             out[key] = _mask_cap(value)
+        elif key == "DSV41_MOE_SCALE_CODES_MIN_ROWS":   # a row floor; unset = 2
+            out[key] = _min_rows(value)
         elif key in ("DSV41_SAMPLED_COMMIT_REUSE", "DSV41_SAMPLED_DRAFT_PROBS_EARLY"):  # off / on / check
             out[key] = _fold_value(value, key)
         else:
@@ -346,6 +369,12 @@ def describe():
 
 def current():
     return _capture if _capture is not None else _runtime
+
+
+def capture_variant():
+    """The variant whose graph set FullCudaGraphBackend.capture_one is building (its warm-ups and its capture), else
+    None (eager forwards, graph replays)."""
+    return _capture
 
 
 def env_for(variant, name, default=None):

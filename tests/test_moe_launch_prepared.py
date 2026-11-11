@@ -265,6 +265,42 @@ check("equivalence: a too-small materialized scratch raises the same error", n_e
 check("equivalence: an unsupported planned direct routing raises the same error (production plans are grouped)",
       same_as_stock("direct m=96", contract(m=96, direct=True, tile=16), calls=2, expect_error=True))
 
+# ds41 scale codes: a coded binding (uint8 code buffers in both sfb slots) plans the coded kernel, never reuses a
+# native plan of the same scalars, and a mixed or non-N64 coded binding raises the stock error
+CODED = {}
+
+
+def coded(kw, w13=True, down=True):
+    d = dict(kw)
+    key = (kw["E"], kw["k"], kw["n"])
+    if key not in CODED:
+        CODED[key] = (torch.empty(64, dtype=U8), torch.empty(64, dtype=U8))
+    if w13:
+        d["w13_sfb_rp"] = CODED[key][0]
+    if down:
+        d["down_sfb_rp"] = CODED[key][1]
+    return d
+
+
+cgrid = [dict(m=1), dict(m=6), dict(m=34), dict(m=136, tile=64), dict(m=8, det=False, ext=True)]
+n_ok = sum(same_as_stock(f"coded {g}", coded(contract(**g))) for g in cgrid)
+check(f"scale codes: stock == prepared on {len(cgrid)} coded contracts", n_ok == len(cgrid),
+      f"{len(cgrid) - n_ok} failed")
+kc, kn = P._key(coded(contract(m=34))), P._key(contract(m=34))
+check("scale codes: coded and native bindings of the same scalars key different plans", kc != kn)
+pc, pn = P._PLANS.get(kc), P._PLANS.get(kn)
+check("scale codes: the coded plan holds the coded kernel, the native plan the native one",
+      pc is not None and pn is not None and pc.kernel_key is not None and pn.kernel_key is not None
+      and "w4a8_coded_scales" in pc.kernel_key and "w4a8_coded_scales" not in pn.kernel_key,
+      f"{getattr(pc, 'kernel_key', None)} / {getattr(pn, 'kernel_key', None)}")
+check("scale codes: w13 coded, down native raises the stock error",
+      same_as_stock("coded w13 only", coded(contract(m=34), down=False), calls=2, expect_error=True))
+check("scale codes: down coded, w13 native raises the stock error",
+      same_as_stock("coded down only", coded(contract(m=34), w13=False), calls=2, expect_error=True))
+check("scale codes: a coded non-N64 binding raises the stock error",
+      same_as_stock("coded non-N64", coded(contract(m=2048, tile=128, n64=False, n=1152)), calls=2,
+                    expect_error=True))
+
 # negative controls: the comparison catches a stale per-call pointer and a skipped barrier reset
 real_ptr, stale = P._ptr, {}
 

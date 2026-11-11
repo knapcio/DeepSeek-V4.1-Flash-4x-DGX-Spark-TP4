@@ -352,7 +352,7 @@ def test_config_hash_inputs():
                                   "prefill_gemm_split", "prefill_keep_cache", "prefill_empty_cache",
                                   "sampled_commit_reuse", "sampled_draft_probs_early", "prefill_ced_skip",
                                   "prefill_gemm_tactic", "prefill_sp", "moe_b12x_next",
-                                  "dense_tile_table", "prefill_moe_fold", "wo_a_cfg_table"}
+                                  "dense_tile_table", "prefill_moe_fold", "wo_a_cfg_table", "scale_codes"}
         assert a.SOURCES["ab_variant"] != "missing" and a.SOURCES["l2_prefetch"] != "missing"
         # a different adapter file on one node changes that node's hash
         saved = sys.modules.get("fuse_quant")
@@ -430,6 +430,53 @@ def test_short_prefill_knobs():
             raise AssertionError("plan vs 1 accepted as an A/B")
         except RuntimeError:
             pass
+    finally:
+        clean_meta_path()
+
+
+def test_scale_codes_keys():
+    """Scale codes A/B retain mode (2026-11-10): DSV41_MOE_SCALE_CODES is a union gate (moe_b12x_next builds the coded
+    experts beside the native ones when any variant enables it; the base value stays per variant), the row floor
+    DSV41_MOE_SCALE_CODES_MIN_ROWS is per capture with its own numeric normalization (unset == 2; 1 vs 2 is an A/B),
+    malformed floors refuse, and capture_variant() is the variant capture_one builds (None
+    outside it, unlike current())."""
+    ab = fresh("ab_sc")
+    env = {"DSV41_AB_VARIANTS": "3", "DSV41_AB_V0": "DSV41_MOE_SCALE_CODES=0",
+           "DSV41_AB_V1": "DSV41_MOE_SCALE_CODES=1",
+           "DSV41_AB_V2": "DSV41_MOE_SCALE_CODES=1;DSV41_MOE_SCALE_CODES_MIN_ROWS=1"}
+    try:
+        assert "DSV41_MOE_SCALE_CODES" in ab.UNION_BOOL and "DSV41_MOE_SCALE_CODES_MIN_ROWS" in ab.RUNTIME
+        e = dict(env)
+        assert ab.configure(e) and e["DSV41_MOE_SCALE_CODES"] == "1"           # unioned: the coded experts get built
+        assert "DSV41_MOE_SCALE_CODES_MIN_ROWS" not in e                      # per capture only
+        assert json.loads(e["DSV41_AB_BASE"])["DSV41_MOE_SCALE_CODES"] is None
+        assert ab.capture_variant() is None and ab.current() == 0
+        got = []
+        for v in range(3):
+            with ab.capturing(v):
+                got.append((ab.capture_variant(), ab.env("DSV41_MOE_SCALE_CODES", "0"),
+                            ab.env("DSV41_MOE_SCALE_CODES_MIN_ROWS", "")))
+        assert got == [(0, "0", ""), (1, "1", ""), (2, "1", "1")], got
+        ab.set_runtime(1)
+        assert ab.capture_variant() is None and ab.env("DSV41_MOE_SCALE_CODES") == "1"   # replay: no capture
+        ab.set_runtime(0)
+        norm = [ab._norm({"DSV41_MOE_SCALE_CODES_MIN_ROWS": v})["DSV41_MOE_SCALE_CODES_MIN_ROWS"]
+                for v in (None, "", "2", " 6 ", "1")]
+        assert norm == [2, 2, 2, 6, 1], norm
+        for bad in ("0", "-3", "x", "2.5"):
+            try:
+                fresh("ab_sc_bad").configure({"DSV41_AB_VARIANTS": "2", "DSV41_AB_V0": "DSV41_MOE_SCALE_CODES=0",
+                                              "DSV41_AB_V1": f"DSV41_MOE_SCALE_CODES=1;DSV41_MOE_SCALE_CODES_MIN_ROWS={bad}"})
+                raise AssertionError(f"MIN_ROWS={bad!r} accepted")
+            except RuntimeError as exc:
+                assert "refused" in str(exc), exc
+        try:   # unset and 2 are the same floor: an A/A
+            fresh("ab_sc_aa").configure({"DSV41_AB_VARIANTS": "2",
+                                         "DSV41_AB_V0": "DSV41_MOE_SCALE_CODES=1",
+                                         "DSV41_AB_V1": "DSV41_MOE_SCALE_CODES=1;DSV41_MOE_SCALE_CODES_MIN_ROWS=2"})
+            raise AssertionError("MIN_ROWS 2 vs unset accepted as an A/B")
+        except RuntimeError as exc:
+            assert "A/A" in str(exc)
     finally:
         clean_meta_path()
 

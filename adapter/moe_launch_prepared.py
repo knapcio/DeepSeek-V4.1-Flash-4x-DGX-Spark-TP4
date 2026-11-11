@@ -61,9 +61,9 @@ _TAG = "[moe_launch_prepared]"
 _OFF = ("", "0", "off", "false", "no")
 
 # sha256 of inspect.getsource() of the stock functions this module mirrors or wraps (runtime/b12x_next at
-# a7d7d29b + the four ds41 patches; scripts/build_b12x_next.sh). A drifted runtime refuses to arm.
+# a7d7d29b + the five ds41 patches; scripts/build_b12x_next.sh). A drifted runtime refuses to arm.
 PINNED_SOURCES = {
-    "_launch_dynamic_flat": "3e160eff6e8348d32867db3d9af7db221ee23be82779d44cab0b63d0db2ce6a1",
+    "_launch_dynamic_flat": "a9c375d26cd5bc1f505388391fcf4028d77c4cfe01697a580a5c4a8e907514fb",
     "_tp_moe_dynamic_launch_op": "bb840645a86092558eafb1b5381bc1429b184cf1445568583fb009f73fec5ba7",
     "_launch_dynamic": "10f3393562a76692a7861e4eea041647a0a33559c13e756ff19ea612fed620b3",
 }
@@ -196,6 +196,12 @@ def _decide(kw):
     # ---- mirrors _launch_dynamic_flat (pinned) from the quant-mode normalization to _get_dynamic_kernel ----
     quant_mode = I._normalize_quant_mode(quant_mode)
     scatter_rows = routed_rows if deterministic_output else m
+    # ds41 scale codes: a coded binding carries uint8 code buffers in both sfb slots (mirrors the stock guards)
+    w4a8_coded_scales = I._is_w4a8_quant_mode(quant_mode) and kw["w13_sfb_rp"].dtype == torch.uint8
+    if w4a8_coded_scales != (I._is_w4a8_quant_mode(quant_mode) and kw["down_sfb_rp"].dtype == torch.uint8):
+        raise ValueError("ds41 scale codes: w13 and down scale slots disagree on the coded format")
+    if w4a8_coded_scales and not w4a8_n64_repacked:
+        raise ValueError("ds41 scale codes: coded scales reached a non-N64 W4A8 launch")
     trellis_bits = 0                      # trellis weights never reach a plan (_eligible)
     trellis_intermediate_hadamard = False
     if w4a8_repacked and int(n) % 128 != 0 and not w4a8_n64_repacked:
@@ -337,6 +343,7 @@ def _decide(kw):
         quant_mode=quant_mode,
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
+        w4a8_coded_scales=w4a8_coded_scales,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
@@ -493,7 +500,9 @@ def _key(kw):
     except Exception:  # noqa: BLE001
         dev = -1
     return tuple(kw[s] for s in SCALARS) + (
-        mi.numel() * mi.element_size(), dev, I._prequantized_input_requested(),
+        mi.numel() * mi.element_size(), dev,
+        kw["w13_sfb_rp"].dtype == torch.uint8, kw["down_sfb_rp"].dtype == torch.uint8,    # ds41 scale codes
+        I._prequantized_input_requested(),
         I._DYNAMIC_TILE_MN_OVERRIDE, I._DYNAMIC_SWAP_AB_OVERRIDE)
 
 
