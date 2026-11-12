@@ -230,6 +230,14 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_DRAFT_TAU', '1').strip() not in ('', '1', '1.0'):
                 from draft_tau import install as install_draft_tau
                 install_draft_tau(module)
+            # Gated on DSV41_GREEDY_NOGATHER (adapter/greedy_nogather.py): all-greedy steps replay a draft graph
+            # flavour with the sharded greedy Markov step (no full-vocab gathers). After spec_sync_free (it checks the
+            # engine's own __call__ source at install) and BEFORE eager_glue: eager_glue's vcap wrapper must stay
+            # outside the flavour body, so the verify_cap live-length update is captured into the greedy flavour too.
+            # Gate checked BEFORE the import.
+            if os.environ.get('DSV41_GREEDY_NOGATHER', '').strip().lower() not in ('', '0', 'off', 'false', 'no'):
+                from greedy_nogather import install_sampler as install_greedy_nogather_sampler
+                install_greedy_nogather_sampler(module)
             # Gated on DSV41_EAGER_GLUE (adapter/eager_glue.py): stage / vcap. After draft_tau and
             # spec_sync_free: its stage cache must be the outermost stage_sampling_params.
             if os.environ.get('DSV41_EAGER_GLUE', '').strip() not in ('', '0', 'off', 'false'):
@@ -240,6 +248,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_BLOCK_VERIFY', '0').strip() not in ('0', 'off', 'false', ''):
                 from block_verify import install as install_block_verify
                 install_block_verify(module)
+            # Gated on DSV41_GREEDY_NOGATHER (target part): the in-graph greedy accept of the target flavour takes
+            # the pair-gathered argmax ids (adapter/greedy_nogather.py).
+            if os.environ.get('DSV41_GREEDY_NOGATHER', '').strip().lower() not in ('', '0', 'off', 'false', 'no'):
+                from greedy_nogather import install_accept as install_greedy_nogather_accept
+                install_greedy_nogather_accept(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_verify':
             # Gated on DSV41_SPEC_SYNC_FREE (adapter/spec_sync_free.py). First in this branch: its
             # merge mode checks the engine's own DsparkVerifyEpilogue._accept source.
@@ -273,6 +286,10 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
                 from sampled_draft_probs_early import install_verify as install_sampled_draft_probs_early_verify
                 install_sampled_draft_probs_early_verify(module)
+            # Gated on DSV41_GREEDY_NOGATHER (target part): which verify steps replay the target greedy flavour.
+            if os.environ.get('DSV41_GREEDY_NOGATHER', '').strip().lower() not in ('', '0', 'off', 'false', 'no'):
+                from greedy_nogather import install_verify as install_greedy_nogather_verify
+                install_greedy_nogather_verify(module)
         elif module.__name__ == 'sglang.kernels.ops.moe.moe_fused_gate':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_gate as install_verify_cap_gate
@@ -289,6 +306,11 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_SAMPLED_DRAFT_PROBS_EARLY', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
                 from sampled_draft_probs_early import install_draft as install_sampled_draft_probs_early_draft
                 install_sampled_draft_probs_early_draft(module)
+            # Gated on DSV41_GREEDY_NOGATHER: marks all-greedy steps for the draft graph flavour and wraps
+            # FullCudaGraphBackend (adapter/greedy_nogather.py).
+            if os.environ.get('DSV41_GREEDY_NOGATHER', '').strip().lower() not in ('', '0', 'off', 'false', 'no'):
+                from greedy_nogather import install_proposer as install_greedy_nogather_proposer
+                install_greedy_nogather_proposer(module)
         elif module.__name__ == 'sglang.srt.speculative.dspark_components.dspark_planner':
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_planner as install_verify_cap_planner
@@ -360,6 +382,12 @@ class EngramLoader(importlib.abc.Loader):
                 from roce_idle_park import install_runtime as install_roce_idle_park
                 install_roce_idle_park(module)
         elif module.__name__ == 'sglang.srt.layers.logits_processor':
+            # Gated on DSV41_GREEDY_NOGATHER (target part): the target verify head's greedy flavour gathers (max,
+            # argmax) pairs instead of the logits (adapter/greedy_nogather.py). BEFORE cert_head, whose
+            # _get_logits wrapper must stay outside it.
+            if os.environ.get('DSV41_GREEDY_NOGATHER', '').strip().lower() not in ('', '0', 'off', 'false', 'no'):
+                from greedy_nogather import install_logits as install_greedy_nogather_logits
+                install_greedy_nogather_logits(module)
             # Gated on DSV41_CERT_HEAD: the target-verify LM head through the certified path.
             if os.environ.get('DSV41_CERT_HEAD', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
                 from cert_head import install_logits as install_cert_head_logits

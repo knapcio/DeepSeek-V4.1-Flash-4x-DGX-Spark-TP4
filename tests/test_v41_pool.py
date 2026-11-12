@@ -50,6 +50,8 @@ FILES = {} if T.SG is None else {
 }
 
 
+# v2.7.6's production-line tail (greedy no-gather), after v2.7.5's
+V276_TAIL = ["DSV41_GREEDY_NOGATHER=1"]
 # v2.7.5's production-line tail (scale codes, then the evict-first experts + SHPF window)
 V275_TAIL = ["DSV41_MOE_SCALE_CODES=1", "DSV41_MOE_SCALE_CODES_MIN_ROWS=2", "DSV41_MOE_EVICT_FIRST=1",
              "DSV41_L2_PREFETCH_SHPF_MB=6", "DSV41_L2_PREFETCH_SHPF_EL=0"]
@@ -373,6 +375,19 @@ V273_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
 V274_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
     r"            # Gated on DSV41_PREFILL_MOE_FOLD \(off by default.*?DSV41_PREFILL_MOE_FOLD not installed: \{exc!r\}', flush=True\)\n",
 ))
+# v2.7.6's greedy no-gather hooks (gated on DSV41_GREEDY_NOGATHER, off by default in code; tests/test_greedy_nogather.py):
+# the sampler, the accept, the verify, the proposer and the logits wraps.
+V276_SITE_BLOCKS = tuple(re.compile(p, re.S) for p in (
+    r"            # Gated on DSV41_GREEDY_NOGATHER \(adapter/greedy_nogather\.py\): all-greedy steps replay a draft graph.*?"
+    r"install_greedy_nogather_sampler\(module\)\n",
+    r"            # Gated on DSV41_GREEDY_NOGATHER \(target part\): the in-graph greedy accept.*?"
+    r"install_greedy_nogather_accept\(module\)\n",
+    r"            # Gated on DSV41_GREEDY_NOGATHER \(target part\): which verify steps.*?"
+    r"install_greedy_nogather_verify\(module\)\n",
+    r"            # Gated on DSV41_GREEDY_NOGATHER: marks all-greedy steps.*?install_greedy_nogather_proposer\(module\)\n",
+    r"            # Gated on DSV41_GREEDY_NOGATHER \(target part\): the target verify head's greedy flavour.*?"
+    r"install_greedy_nogather_logits\(module\)\n",
+))
 
 
 class DefaultOff(unittest.TestCase):
@@ -387,7 +402,7 @@ class DefaultOff(unittest.TestCase):
         self.assertEqual(n, 1, "trim2 block")
         s, n = T.PROMPT_TAIL_SITE_BLOCK.subn("", s)        # v2.6.6's prompt-tail hook
         self.assertEqual(n, 1, "prompt-tail block")
-        for rx in V271_SITE_BLOCKS + V272_SITE_BLOCKS + V273_SITE_BLOCKS + V274_SITE_BLOCKS:   # v2.7.1 .. v2.7.4 hooks
+        for rx in V271_SITE_BLOCKS + V272_SITE_BLOCKS + V273_SITE_BLOCKS + V274_SITE_BLOCKS + V276_SITE_BLOCKS:   # v2.7.1 .. v2.7.4, v2.7.6 hooks
             s, n = rx.subn("", s)
             self.assertEqual(n, 1, rx.pattern[:60])
         self.assertEqual(hashlib.sha256(s.encode()).hexdigest(), T.SITE_F744D83_SHA)
@@ -431,7 +446,10 @@ class Profile(unittest.TestCase):
 
     def test_production_line(self):
         items = self._production_line().split('"')[1].split()
-        # v2.7.5's keys come last (V275_TAIL): checked here, then the v2.7.4 line's checks below run on the rest
+        # v2.7.6's key comes last (V276_TAIL), then v2.7.5's
+        self.assertEqual(items[-len(V276_TAIL):], V276_TAIL)
+        items = items[:-len(V276_TAIL)]
+        # v2.7.5's keys come next (V275_TAIL): checked here, then the v2.7.4 line's checks below run on the rest
         self.assertEqual(items[-len(V275_TAIL):], V275_TAIL)
         items = items[:-len(V275_TAIL)]
         # v2.6.6's SWA prompt tail follows the v2.7 keys and trim2; v2.7.1's seven new keys follow them, then v2.7.2's CED
