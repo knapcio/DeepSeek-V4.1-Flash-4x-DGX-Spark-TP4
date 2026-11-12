@@ -39,6 +39,8 @@ HAVE_TORCH = importlib.util.find_spec("torch") is not None
 HAVE_SGLANG = importlib.util.find_spec("sglang") is not None
 
 
+# v2.7.6's production-line tail (greedy no-gather), after v2.7.5's
+V276_TAIL = ["DSV41_GREEDY_NOGATHER=1"]
 # v2.7.5's production-line tail (scale codes, then the evict-first experts + SHPF window)
 V275_TAIL = ["DSV41_MOE_SCALE_CODES=1", "DSV41_MOE_SCALE_CODES_MIN_ROWS=2", "DSV41_MOE_EVICT_FIRST=1",
              "DSV41_L2_PREFETCH_SHPF_MB=6", "DSV41_L2_PREFETCH_SHPF_EL=0"]
@@ -764,7 +766,10 @@ class Profile(unittest.TestCase):
 
     def test_production_line_ends_with_the_cone(self):
         items = self._production_line().split('"')[1].split()
-        # v2.7.5's keys come last (V275_TAIL): checked here, then the v2.7.4 line's checks below run on the rest
+        # v2.7.6's key comes last (V276_TAIL), then v2.7.5's
+        self.assertEqual(items[-len(V276_TAIL):], V276_TAIL)
+        items = items[:-len(V276_TAIL)]
+        # v2.7.5's keys come next (V275_TAIL): checked here, then the v2.7.4 line's checks below run on the rest
         self.assertEqual(items[-len(V275_TAIL):], V275_TAIL)
         items = items[:-len(V275_TAIL)]
         self.assertEqual([x for x in items if x.startswith("DSV41_SWA_CONE")],
