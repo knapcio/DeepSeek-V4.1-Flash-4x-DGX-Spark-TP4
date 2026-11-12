@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.7.7 (candidate, release gate pending)
+
+v2.7.6 plus one lossless decode change in the production profile (`DSV41_DRAFT_HEAD_FP4=1` appended to
+`EXTRA_CONTAINER_ENV`). The image stack, the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
+`--swa-prefix-tails 384` and every v2.7.6 key are unchanged; no kernel library changes (one adapter extended, its tests,
+one bench script). Measured on the four Sparks against the v2.7.6 profile in the same boot (in-boot A/B with two control
+arms, the official 1017 checkpoint, 2026-11-12). Release gate: TBD.
+
+- **Decode: the c1 draft LM head from an MXFP4 copy (`DSV41_DRAFT_HEAD_FP4=1`, `adapter/draft_head_fp8.py`).** The
+  DSpark draft borrows the target's vocab-parallel LM head (32320 x 5120 per rank) and, since 2026-09-23, reads an fp8
+  twin of it (165.5 MB per rank) for its five block rows every step. Beside that twin the draft now keeps an MXFP4 copy
+  (OCP MX: e2m1 values, one e8m0 scale per 1 x 32 run along K; e = floor(log2 amax) - 2, nearest e2m1 with ties to
+  even, saturating at 6): 82.7 + 5.2 MB per rank. Draft calls of at most `DSV41_DRAFT_HEAD_FP4_MAX_M` rows (default 5:
+  one request's block, i.e. decode at c1) read it through a CUDA-core GEMV that streams the codes once (128-bit loads,
+  three integer ops per weight to its exact fp32 value, one fp32 FMA chain per row and run, no shared memory in the K
+  loop; default launch `DSV41_DRAFT_HEAD_FP4_TILE=32,512,8,1`); batched drafts keep the fp8 twin, above 64 rows the
+  stock head as before. Only the draft reads it: the target's logits and every accepted token are untouched, so the
+  outputs are exact and only the draft acceptance can move. One GB10 (2026-11-12, M = 5, CUDA events after a read-only
+  flush, paired ABBA quads): MXFP4 399 us against the fp8 twin's 733 us per call, gain +340 us [+331, +351] on an
+  independent repeat. Offline on the 1017 drafter: owner thinking prose 3.1214 -> 3.1118 accepted tokens per step
+  (-0.31 %), fenced code -0.28 %. In-boot A/B against v2.7.6 (7 rounds, A / X / A', official 1017): paired c1 step
+  **-0.328 ms** [-0.450, -0.206] (A - A' -0.08 ms [-0.18, +0.02]), c1 per-token time **-1.30 %** [-2.22, -0.38], c1
+  tokens per step unchanged (+0.32 % [-0.33, +0.97]); c4 flat by design (-0.02 % [-0.71, +0.68] per token).
+  Exactness: c1 and c4 greedy texts within the controls' novelty, qeval 75 / 75 inside the T = 0 bracket; the qeval
+  draft histogram moves as a changed draft must (correct drafts per verify 2.964 against 2.979 on both controls).
+  Memory: +84 MiB (88 MB) per rank by construction; the in-boot A/B built the copy in every arm (its gate was a union
+  key there), so it could not measure that cost: the release gate reports the head's memory with and without it.
+- **Not taken from the test branch:** the in-boot A/B plumbing (`DSV41_AB_GRAPH_SETS`, `graph_set()`, per-variant
+  receipts) and the A/B key registration of the three `DSV41_DRAFT_HEAD_FP4*` keys; every key is read from the process
+  environment.
+- **Credits:** the idea of an MXFP4 drafter head for single-session drafts, with the fp8 copy kept for batched drafts,
+  is lever 1 of pico-dgx-ds4's `docs/stack4.md` (Picom-code), whose flag comes from blaesus/dsgx10. The quantizer, the
+  GEMV and its integration in the fp8 twin's dispatch are ours.
+
+Rollback, config only: unset `DSV41_DRAFT_HEAD_FP4` (= the v2.7.6 profile, same image).
+
 ## 2026-11-12 v2.7.6
 
 v2.7.5 plus one lossless decode change in the production profile (`DSV41_GREEDY_NOGATHER=1` appended to
