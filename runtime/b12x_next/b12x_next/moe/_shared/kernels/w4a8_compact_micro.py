@@ -21,6 +21,7 @@ from b12x_next.moe._shared.kernels.w4a8_compact_activation import (
     W4A8CompactMicroActivationKernel,
 )
 from b12x_next.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
+from b12x_next.moe._shared.kernels.w4a8_scale_codes import scale_codes_enabled
 
 
 _ALIGN = 256
@@ -92,6 +93,7 @@ class _DirectW4A8CompactLaunch:
         down_scale_count: int,
         swiglu_limit: float | None,
         fast_math: bool,
+        coded_scales: bool = False,
     ):
         self.capacity = max_tokens
         self.topk = num_topk
@@ -100,7 +102,9 @@ class _DirectW4A8CompactLaunch:
         self.experts = experts
         self.input_scale_count = input_scale_count
         self.down_scale_count = down_scale_count
-        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk)
+        # ds41 scale codes (w4a8_scale_codes.py): both scale slots hold coded buffers
+        self.coded_scales = bool(coded_scales)
+        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk, coded_scales=self.coded_scales)
         self.activation = W4A8CompactMicroActivationKernel(
             n,
             experts,
@@ -113,6 +117,7 @@ class _DirectW4A8CompactLaunch:
             direct_routes=True,
             n64_repacked=self.n % 128 == 64,
             n64_tail=self.n % 128 == 64,
+            coded_scales=self.coded_scales,
         )
 
     @cute.jit
@@ -242,6 +247,7 @@ def _compiled_direct_w4a8_compact(
     down_scale_count: int,
     swiglu_limit: float | None,
     fast_math: bool,
+    coded_scales: bool = False,
 ):
     launch = _DirectW4A8CompactLaunch(
         max_tokens=max_tokens,
@@ -253,7 +259,10 @@ def _compiled_direct_w4a8_compact(
         down_scale_count=down_scale_count,
         swiglu_limit=swiglu_limit,
         fast_math=fast_math,
+        coded_scales=coded_scales,
     )
+    # ds41 scale codes: appended only when on, so the native keys are unchanged
+    coded_key = ("w4a8_coded_scales",) if coded_scales else ()
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
     def dummy(dtype, align=16):
@@ -274,7 +283,7 @@ def _compiled_direct_w4a8_compact(
             down_scale_count,
             swiglu_limit,
             fast_math,
-        ),
+        ) + coded_key,
     )
     return b12x_compile(
         launch,
@@ -311,9 +320,28 @@ def _compiled_direct_w4a8_compact(
                 down_scale_count,
                 swiglu_limit,
                 fast_math,
-            ),
+            ) + coded_key,
         ),
     )
+
+
+# ds41 scale codes: the scale format each PREPARED compact kernel was compiled for (_preparation._compact_launches
+# records it). One process may hold both formats (the ds41 A/B retain mode keeps native and coded experts): a call is
+# keyed on its tensors' dtype, and a prepared kernel of the other format is refused instead of reading the wrong bytes.
+_PREPARED_FORMATS: dict = {}
+
+
+def note_prepared_format(kernels, coded: bool) -> None:
+    for kernel in kernels.values():
+        _PREPARED_FORMATS[id(kernel)] = (kernel, bool(coded))
+
+
+def prepared_kernel_coded(kernel) -> bool:
+    """The format a prepared compact kernel was compiled for; unrecorded ones follow the process-wide switch."""
+    entry = _PREPARED_FORMATS.get(id(kernel))
+    if entry is not None and entry[0] is kernel:
+        return entry[1]
+    return scale_codes_enabled()
 
 
 def _as_bytes(scratch: torch.Tensor) -> torch.Tensor:
@@ -391,6 +419,20 @@ def launch_w4a8_compact_micro(
     else:
         _prepared_quantize(a, values, scale_rows, scale_mma)
 
+    # ds41 scale codes: the format is the tensors' (uint8 codes or int32 native words); both slots must agree, and a
+    # prepared kernel must have been compiled for that format
+    coded = w13_scales.dtype == torch.uint8
+    if coded != (w2_scales.dtype == torch.uint8):
+        raise ValueError(
+            "ds41 scale codes: w13/w2 scale formats disagree "
+            f"(w13 {w13_scales.dtype}, w2 {w2_scales.dtype}); refused"
+        )
+    if _prepared_kernel is not None and prepared_kernel_coded(_prepared_kernel) != coded:
+        raise ValueError(
+            "ds41 scale codes: the prepared compact kernel was compiled for "
+            f"{'coded' if prepared_kernel_coded(_prepared_kernel) else 'native'} scales, the call carries "
+            f"{'coded' if coded else 'native'} (w13 {w13_scales.dtype}); refused"
+        )
     compiled = _prepared_kernel or _compiled_direct_w4a8_compact(
         int(a.device.index or 0),
         cap,
@@ -403,6 +445,7 @@ def launch_w4a8_compact_micro(
         down_scale.numel(),
         swiglu_limit,
         fast_math,
+        coded,
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)

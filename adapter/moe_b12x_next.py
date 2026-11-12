@@ -65,6 +65,38 @@ caller writes the rows (an all-gather of per-shard MXFP8 rows), and a dispatch c
 that skips its own quantization. Same bytes -> same FC1/FC2 inputs; whether the caller's quantizer
 gives b12x's bytes is prefill_sp's runtime check, not assumed here. The variant is compiled at load
 for the prefill capacities of the top-k _PREQUANT_TOPK (6) geometry when prefill SP FP8-MoE is on.
+
+Routed-expert scale codes (DSV41_MOE_SCALE_CODES, default off, adapter/scale_codes.py; idea: Christopher Owen,
+spark-ds41f). DSV41_MOE_SCALE_CODES=1 is RETAIN mode (the mode the tier-12o window Q measured): codes are built beside
+the native scales (both kept, ~+2.03 GiB per rank at TP4/EP1), plans stay native, and only CUDA-graph captures (decode /
+verify / draft) run the coded experts, at >= DSV41_MOE_SCALE_CODES_MIN_ROWS (2) rows and on a capacity prepared for
+codes; eager forwards (prefill, the pre-quantized stage-2b path, eager decode) run native. Without the in-boot A/B a
+call is "captured" when the current stream is capturing (the coded kernels are compiled and loaded at load time,
+prepare_coded, so a capture never compiles); under the in-boot A/B (DSV41_AB_VARIANTS >= 2, TEST ONLY) it is the
+capture of a variant that enables the gate (ab_variant's capture_one incl. its warm-ups).
+DSV41_MOE_SCALE_CODES=release (TEST ONLY, not fleet-qualified): each layer's scales become codes and the native storage
+is released (_code_scales; refused with the pre-quantized prefill input).
+Receipts: "[moe_b12x_next] scale codes: retain: <L> layers, native <x> GiB kept + codes <y> GiB, min rows <m>, max
+expert span <s>" ("A/B retain:" under the in-boot A/B) and, once per (variant, M, top-k), "scale codes: capture
+variant=<v> M=<m> coded|native (...)" (variant 0 without the A/B).
+
+Evict-first expert loads (default off; production profile on since v2.7.5; needs the runtime patch
+scripts/b12x_next-evict-first.patch):
+``DSV41_MOE_EVICT_FIRST=1`` marks the routed-expert weight copies (FC1 w13 and FC2 down packed B; not their
+scale words) of b12x's split-materialized W4A8 phase kernels L2 evict_first (cp.async ...L2::cache_hint with
+createpolicy.fractional.L2::evict_first). A decode step streams each routed expert's ~4.4 MB once (TP4 N=576),
+which otherwise flushes GB10's 24 MB L2 of lines that are reused: the shared expert / wo weights l2_prefetch
+put there, the gathered input, the materialized intermediate. Applied only while a CUDA graph is captured and
+only to launches of <= ``DSV41_MOE_EVICT_FIRST_MAX_ROWS`` (128) rows: decode / verify / draft steps, never
+eager prefill (whose larger tiles of one expert re-read the same weight slice, the case Owen keeps on the
+normal policy as well). Under the in-boot A/B both gates are keys read per capture (ab_variant RUNTIME); the flag-on
+kernels (their own b12x cache key) are compiled at load for the capacities <= the largest row cap when any
+variant enables the gate, and kept referenced so later preparations cannot evict them before capture.
+Bit-identical by construction (same bytes copied, same arithmetic; only L2 replacement priority changes).
+Receipts (every rank): ``evict-first expert loads: armed (max rows <n>, sites <list>)`` at boot,
+``evict-first: capture variant=<v> M=<m> on|off`` once per (variant, M) captured (variant 0 without the A/B);
+refusals say ``refused``.
+Idea: Christopher Owen, spark-ds41f #966 (Apache-2.0), there on TileLang TMA weight loads.
 """
 import bisect
 import dataclasses
@@ -121,6 +153,111 @@ except ImportError:  # CPU tests without the module
 FOLD_WARM = bool(_fold is not None and _fold.wanted_at_install())
 FOLD_MIN_ROWS = _fold.min_rows() if _fold is not None else 2048
 FOLD_STATE = {"warm": None, "geoms": set()}      # geometries whose accumulate top-k sum compiled + zero-checked
+
+try:  # DSV41_AB_VARIANTS in-boot A/B (test only): the evict-first gates are read per capture through it
+    import ab_variant as _ab
+except ImportError:
+    _ab = None
+EF_GATE = "DSV41_MOE_EVICT_FIRST"
+EF_MAX_ROWS = "DSV41_MOE_EVICT_FIRST_MAX_ROWS"
+EF_MAX_ROWS_DEFAULT = 128
+# the copies the b12x_next evict-first patch hints (W4A8MaterializedPhase{1,2}Kernel, N64 and N256 repacked B)
+EF_SITES = ("w4a8_phase1.fc1_w13_b", "w4a8_phase2.fc2_down_b")
+EF_KEY_TAG = "evict_first_weights"     # b12x_next _impl._EVICT_FIRST_KEY, the cache-key suffix of flag-on kernels
+_EF = {"armed": False, "impl": None, "kernels": {}, "seen": set(), "restored": 0, "captures_on": 0,
+       "captures_off": 0, "max_rows": EF_MAX_ROWS_DEFAULT}
+
+
+def _truthy(value):
+    return str(value or "").strip().lower() not in ("", "0", "off", "false", "no")
+
+
+def parse_ef_max_rows(value):
+    """DSV41_MOE_EVICT_FIRST_MAX_ROWS: a positive row count; unset / empty = 128."""
+    raw = str(value or "").strip()
+    if not raw:
+        return EF_MAX_ROWS_DEFAULT
+    try:
+        rows = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{EF_MAX_ROWS}={value!r}: expected a row count -- refused") from None
+    if rows < 1:
+        raise RuntimeError(f"{EF_MAX_ROWS}={value!r}: must be >= 1 -- refused")
+    return rows
+
+
+def _ab_active():
+    return _ab is not None and getattr(_ab, "ACTIVE", False)
+
+
+def ef_settings(environ=None):
+    """[(variant, gate on, max rows)] of every in-boot A/B variant, or [(0, ...)] of the process env."""
+    if _ab_active():
+        return [(i, _truthy(_ab.env_for(i, EF_GATE, "0")), parse_ef_max_rows(_ab.env_for(i, EF_MAX_ROWS, "")))
+                for i in range(_ab.N)]
+    environ = os.environ if environ is None else environ
+    return [(0, _truthy(environ.get(EF_GATE, "0")), parse_ef_max_rows(environ.get(EF_MAX_ROWS, "")))]
+
+
+def _ef_current():
+    """(variant, gate on, max rows) of the variant being captured (or the process env without the A/B)."""
+    if _ab_active():
+        return (_ab.current(), _truthy(_ab.env(EF_GATE, "0")), parse_ef_max_rows(_ab.env(EF_MAX_ROWS, "")))
+    return (0, _truthy(os.environ.get(EF_GATE, "0")), parse_ef_max_rows(os.environ.get(EF_MAX_ROWS, "")))
+
+
+def _capturing():
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:  # noqa: BLE001  (no CUDA: CPU tests)
+        return False
+
+
+def install_evict_first(fimpl, settings=None):
+    """Arm DSV41_MOE_EVICT_FIRST when any variant enables it (boot, after the pin checks). Refuses to boot when the
+    runtime lacks the evict-first patch: an in-boot A/B would otherwise silently run as an A/A."""
+    settings = ef_settings() if settings is None else settings
+    on = [(v, rows) for v, gate, rows in settings if gate]
+    if not on:
+        return False
+    if fimpl is None or not callable(getattr(fimpl, "evict_first_weights", None)) \
+            or not isinstance(getattr(fimpl, "_DYNAMIC_KERNEL_CACHE", None), dict):
+        print(f"{_TAG} evict-first expert loads: refused (b12x_next lacks the evict-first patch, "
+              f"scripts/b12x_next-evict-first.patch)", flush=True)
+        _die(f"{EF_GATE}=1 needs the b12x_next evict-first patch")
+    rows = sorted({r for _, r in on})
+    _EF.update(armed=True, impl=fimpl, max_rows=max(rows))
+    shown = str(rows[0]) if len(rows) == 1 else ",".join(f"v{v}:{r}" for v, r in on)
+    print(f"{_TAG} evict-first expert loads: armed (max rows {shown}, sites {','.join(EF_SITES)})", flush=True)
+    return True
+
+
+def ef_decide(m, refused=False):
+    """True when this launch runs the flag-on kernels: armed, inside CUDA-graph capture, the captured variant's
+    gate on and m <= its row cap (and the capacity's plan admits the hint). Logs once per (variant, M)."""
+    if not _EF["armed"] or not _capturing():
+        return False
+    variant, gate, rows = _ef_current()
+    on = bool(gate and m <= rows and not refused)
+    key = (variant, int(m))
+    if key not in _EF["seen"]:
+        _EF["seen"].add(key)
+        why = ""
+        if gate and m <= rows and refused:
+            why = " (refused: this capacity's plan does not run the split-materialized W4A8 phase kernels)"
+        print(f"{_TAG} evict-first: capture variant={variant} M={int(m)} {'on' if on else 'off'}{why}", flush=True)
+        _EF["captures_on" if on else "captures_off"] += 1
+    return on
+
+
+def _ef_restore():
+    """Put back the flag-on kernels a later preparation's eviction dropped from b12x's kernel memo (the adapter
+    holds them since the load-time warm), so a capture never compiles."""
+    cache = _EF["impl"]._DYNAMIC_KERNEL_CACHE
+    for key, compiled in _EF["kernels"].items():
+        if cache.get(key) is None:
+            cache[key] = compiled
+            _EF["restored"] += 1
 
 
 def _peak_begin(dev):
@@ -235,6 +372,458 @@ _LAYERS = {}        # w13_weight.data_ptr() -> _LayerState
 _GEOMS = {}         # geometry key -> _Geometry
 _SESSION = [None]
 _PREP_PEAK_MB = []    # per-layer peak transient of prepare_weights
+# DSV41_MOE_SCALE_CODES (adapter/scale_codes.py): routed-expert scales as 4-bit codes, default OFF. The b12x_next
+# switch is set here, before any plan compiles its compact launches (the dynamic path keys on the tensors' dtype).
+SCALE_CODES_VALUE = _env("DSV41_MOE_SCALE_CODES", "0").lower()
+SCALE_CODES = SCALE_CODES_VALUE not in ("0", "off", "false", "", "no")
+
+
+def _ab_variants():
+    raw = os.environ.get("DSV41_AB_VARIANTS", "").strip()
+    try:
+        return int(raw) if raw else 1
+    except ValueError:
+        return 1
+
+
+# Retain mode (DSV41_MOE_SCALE_CODES=1, any value but "release"; under the in-boot A/B, DSV41_AB_VARIANTS >= 2 where
+# ab_variant unions the gate on when any variant enables it, always). Each layer's coded experts are built at load BESIDE
+# the native ones; nothing is released (no resize, no ownership walk), so memory is native + codes. The plans and their
+# compact launches stay native (the process-wide B12X_NEXT_W4A8_SCALE_CODES is not set); per MoE call _retain_impl picks
+# the coded experts only inside a CUDA-graph capture (of a variant that enables the gate under the A/B), at M >=
+# DSV41_MOE_SCALE_CODES_MIN_ROWS rows and on a capacity whose plan is not compact micro. Eager forwards (prefill, the
+# pre-quantized stage-2b path, eager decode) always run native.
+# Release mode (DSV41_MOE_SCALE_CODES=release, TEST ONLY, without the A/B): codes only, the native storage released.
+RELEASE = SCALE_CODES and SCALE_CODES_VALUE == "release" and _ab_variants() < 2
+RETAIN = SCALE_CODES and not RELEASE
+RETAIN_AB = RETAIN and _ab_variants() >= 2
+_AB = None
+if RETAIN_AB:
+    import ab_variant as _AB
+if RELEASE:
+    os.environ["B12X_NEXT_W4A8_SCALE_CODES"] = "1"
+MIN_ROWS_DEFAULT = 2
+_RETAIN = {"layers": 0, "native": 0, "coded": 0, "max_span": 0, "printed": -1, "seen": set(), "decisions": {}}
+_CODED_IMPLS = {}   # id -> the retain mode's coded experts._impl (held by its _LayerState too)
+_CODES = {"layers": 0, "native": 0, "coded": 0, "freed": 0, "aliases": 0, "max_span": 0, "conv_peak": 0,
+          "per_layer": []}
+# allocator readers; tests substitute a live-tensor account (REVIEW_sol_scalecodes R1)
+_ALLOCATED = lambda dev: torch.cuda.memory_allocated(dev)         # noqa: E731
+_SYNC = lambda dev: torch.cuda.synchronize(dev)                   # noqa: E731
+_RESET_PEAK = lambda dev: torch.cuda.reset_peak_memory_stats(dev)   # noqa: E731
+_MAX_ALLOCATED = lambda dev: torch.cuda.max_memory_allocated(dev)  # noqa: E731
+_EMPTY_CACHE = lambda dev: torch.cuda.empty_cache()                # noqa: E731
+# The caching allocator counts whole blocks: a code tensor can land in a cached block up to 1 MiB larger than its
+# request (large blocks are not split below 1 MiB), two code tensors per layer -> at most 2 MiB over the true size.
+_ROUND_SLACK = 2 << 20
+
+
+def _on_gpu(dev):
+    return getattr(dev, "type", "cuda") == "cuda"
+
+
+def _check_raw_scales(layer):
+    """Codes are lossless relative to the post-repack operands of 1059dfe, whose repack clamps bytes > 247 (incl. the
+    E8M0 NaN encoding 0xff). Refuse such checkpoint bytes up front, so the contract is the original checkpoint's."""
+    for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        t = getattr(layer, name).data.view(torch.uint8)
+        if t.numel() and int(t.max()) > 247:
+            _die(f"DSV41_MOE_SCALE_CODES: {name} holds byte {int(t.max())} > 247 (the repack would clamp it); refused")
+
+
+def _code_scales(experts, layer, dev):
+    """Build the coded prepared experts (scale_codes.py), prove the coded tree no longer names the native storage, and
+    release that storage itself (single-storage ownership, 2026-10-30).
+
+    Release by storage, not by reference. b12x_next repacks the E8M0 scales in place, so the native bytes are ONE
+    StorageImpl per scale tensor: the checkpoint-layout parameter's. Until 10-27 the codes "freed" it by dropping the
+    adapter's references and then demanded that no reference survived (a weakref receipt). That depended on code we do
+    not own: SGLang's post-load snapshots held it on every real boot (4009423 / d1d09b8 rewrote SGLang's state), and
+    under compute-sanitizer views of it passed to b12x_next's Triton repack launches stayed referenced (frames, an
+    argument tuple / dict) on every tool. Here the storage's bytes are returned to the allocator by
+    ``untyped_storage().resize_(0)`` after the codes are verified, so every alias of it, wherever it lives, names an
+    empty storage. Preconditions (refused otherwise): the storage is exactly the parameter (offset 0, nbytes =
+    the parameter's bytes), is resizable, and no traversable tensor or storage reachable from the coded experts or
+    the layer still names or overlaps its device-address range. Opaque pointers and unrelated global objects are not
+    covered by this structural walk.
+
+    Returns (new_experts, meta); the caller rebinds its experts and then takes _codes_receipt(meta)."""
+    import dataclasses
+    import scale_codes as sc
+    impl = experts._impl
+    rep = impl.representation
+    val = rep.value
+    if not getattr(val, "n64_repack", False):
+        _die("DSV41_MOE_SCALE_CODES needs b12x_next's N64 repack (N % 128 == 64, EP_SIZE=1 at TP4)")
+    if PREQUANT_WARM:
+        _die("DSV41_MOE_SCALE_CODES is not qualified with DSV41_PREFILL_SP_FP8_MOE=1; refused")
+    params = [getattr(layer, name) for name in ("w13_weight_scale_inv", "w2_weight_scale_inv")]
+    storages = []
+    for p, t, name in zip(params, (val.w13_sfb, val.w2_sfb), ("w13", "w2")):
+        st = p.data.untyped_storage()
+        nbytes = p.data.numel() * p.data.element_size()
+        if t.untyped_storage().data_ptr() != st.data_ptr() or p.data.storage_offset() != 0 \
+                or st.nbytes() != nbytes or t.numel() * t.element_size() != nbytes:
+            _die(f"DSV41_MOE_SCALE_CODES: {name} scales are not exactly one parameter-owned storage (prepared "
+                 f"{t.untyped_storage().data_ptr():#x} vs parameter {st.data_ptr():#x}, offset "
+                 f"{p.data.storage_offset()}, storage {st.nbytes()} B, parameter {nbytes} B); refused")
+        if not st.resizable():
+            _die(f"DSV41_MOE_SCALE_CODES: the {name} scale storage is not resizable (not allocator-owned); refused")
+        storages.append(st)
+    on_gpu = _on_gpu(dev)
+    if on_gpu:
+        _SYNC(dev)
+        _RESET_PEAK(dev)
+    before = _ALLOCATED(dev) if on_gpu else 0
+    native = sum(st.nbytes() for st in storages)
+    try:
+        c13, s13 = sc.convert(val.w13_sfb, "w13")
+        c2, s2 = sc.convert(val.w2_sfb, "w2")
+    except sc.CodeError as exc:
+        _die(f"DSV41_MOE_SCALE_CODES: {exc} (layer refused; nothing is approximated)")
+    conv_peak = 0
+    if on_gpu:
+        _SYNC(dev)
+        conv_peak = _MAX_ALLOCATED(dev) - before      # codes + chunk scratch, native still live
+    new_val = dataclasses.replace(val, w13_sfb=c13, w2_sfb=c2)
+    new_rep = dataclasses.replace(rep, value=new_val)
+    new_impl = dataclasses.replace(impl, w1_blockscale=c13, w2_blockscale=c2, representation=new_rep)
+    out = dataclasses.replace(experts, _impl=new_impl)
+    keys = {_storage_key(st) for st in storages}
+    ranges = [(st.device, st.data_ptr(), st.data_ptr() + st.nbytes()) for st in storages]
+    original_data = [p.data for p in params]
+    try:
+        for p in params:
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+        # Check storage identity and address overlap: DLPack and other wrappers can create a distinct StorageImpl over
+        # the same allocation. Opaque pointers and non-reachable objects are outside this Python walk's coverage.
+        stale = _aliases_in(out, keys, ranges=ranges) + _aliases_in(layer, keys, ranges=ranges)
+        if stale:
+            _die("DSV41_MOE_SCALE_CODES: the coded experts still reference the native scale storage "
+                 f"({'; '.join(stale[:4])}); refused")
+        if on_gpu:
+            _SYNC(dev)                            # every reader of the native bytes (the round trip) has finished
+    except BaseException:
+        # No storage has been resized yet; restore the parameter bindings when validation or sync refuses.
+        for p, data in zip(params, original_data):
+            p.data = data
+        raise
+    del original_data
+    for st in storages:
+        st.resize_(0)                             # the bytes go back to the allocator; every alias is now empty
+    from torch.multiprocessing.reductions import StorageWeakRef
+    meta = {"before": before, "native": native, "coded": c13.numel() + c2.numel(), "span": max(s13, s2),
+            "conv_peak": conv_peak, "dev": dev, "native_storages": storages,
+            "native_refs": [StorageWeakRef(st) for st in storages], "native_keys": keys}
+    return out, meta
+
+
+def _storage_key(st):
+    """Identity of a StorageImpl (not of its bytes: a resized storage keeps its identity, data_ptr becomes 0)."""
+    return int(getattr(st, "_cdata", 0)) or id(st)
+
+
+def _aliases_in(root, keys, max_nodes=100_000, ranges=()):
+    """Find old-storage or overlapping tensors in the traversable Python graph; refuse on budget exhaustion."""
+    from collections import deque
+    import functools
+    import types
+    import weakref
+
+    found, seen, pending = [], {}, deque()
+
+    def enqueue(o, path):
+        if isinstance(o, (str, bytes, int, float, bool, type(None), torch.device, torch.dtype)) or id(o) in seen:
+            return
+        if len(seen) >= max_nodes:
+            _die(f"DSV41_MOE_SCALE_CODES: ownership walk exceeds {max_nodes} objects; refused")
+        seen[id(o)] = o                       # keep objects alive so Python cannot reuse an inspected id
+        pending.append((o, path[:1024]))
+
+    def enqueue_slots(o, path):
+        # Modules and Tensor subclasses can have slots too, not only ordinary Python holders.
+        for cls in type(o).__mro__:
+            slots = cls.__dict__.get("__slots__", ()) or ()
+            if isinstance(slots, str):
+                slots = (slots,)
+            for k in slots:
+                if not isinstance(k, str):
+                    continue
+                owner = cls.__name__.lstrip("_")
+                attr = f"_{owner}{k}" if owner and k.startswith("__") and not k.endswith("__") else k
+                if hasattr(o, attr):
+                    enqueue(getattr(o, attr), f"{path}.{attr}")
+
+    enqueue(root, type(root).__name__)
+    while pending:
+        o, path = pending.popleft()
+        if isinstance(o, (torch.Tensor, torch.UntypedStorage)):
+            try:
+                st = o.untyped_storage() if isinstance(o, torch.Tensor) else o
+                start = st.data_ptr()
+                end = start + st.nbytes()
+                overlap = start != 0 and end > start and any(
+                    st.device == device and start < native_end and native_start < end
+                    for device, native_start, native_end in ranges
+                )
+                if _storage_key(st) in keys or overlap:
+                    detail = f"{tuple(o.shape)} {o.dtype}" if isinstance(o, torch.Tensor) else "storage"
+                    found.append(f"{path} {detail}")
+            except (RuntimeError, NotImplementedError) as exc:
+                _die(f"DSV41_MOE_SCALE_CODES: cannot inspect tensor storage at {path}: {exc}; refused")
+            for k, v in getattr(o, "__dict__", {}).items():
+                enqueue(v, f"{path}.{k}")
+            enqueue_slots(o, path)
+            continue
+        if isinstance(o, torch.nn.Module):
+            for group in (o._parameters, o._buffers, o._modules):
+                for k, v in group.items():
+                    enqueue(v, f"{path}.{k}")
+            items = ((k, v) for k, v in vars(o).items() if k not in ("_parameters", "_buffers", "_modules"))
+            enqueue_slots(o, path)
+        elif isinstance(o, dict):
+            for k in o:
+                enqueue(k, f"{path}.<key>")
+            items = ((repr(k)[:24], v) for k, v in o.items())
+        elif isinstance(o, (list, tuple, set, frozenset, deque)):
+            items = ((str(i), v) for i, v in enumerate(o))
+        elif isinstance(o, (type, types.ModuleType)):
+            continue
+        elif isinstance(o, types.FunctionType):
+            enqueue(o.__defaults__, f"{path}.__defaults__")
+            enqueue(o.__kwdefaults__, f"{path}.__kwdefaults__")
+            enqueue(o.__dict__, f"{path}.__dict__")
+            for i, cell in enumerate(o.__closure__ or ()):
+                try:
+                    enqueue(cell.cell_contents, f"{path}.__closure__.{i}")
+                except ValueError:  # an empty closure cell has no referent
+                    pass
+            continue                       # do not traverse the function's entire global module
+        elif isinstance(o, types.MethodType):
+            enqueue(o.__self__, f"{path}.__self__")
+            enqueue(o.__func__, f"{path}.__func__")
+            continue
+        elif isinstance(o, weakref.ReferenceType):
+            enqueue(o(), f"{path}.referent")
+            continue
+        elif isinstance(o, functools.partial):
+            enqueue(o.func, f"{path}.func")
+            enqueue(o.args, f"{path}.args")
+            enqueue(o.keywords, f"{path}.keywords")
+            items = o.__dict__.items()
+        else:
+            if hasattr(o, "__dataclass_fields__"):
+                for k in o.__dataclass_fields__:
+                    enqueue(getattr(o, k, None), f"{path}.{k}")
+            items = getattr(o, "__dict__", {}).items()
+            enqueue_slots(o, path)
+        for k, v in items:
+            enqueue(v, f"{path}.{k}")
+    return found
+
+
+_HOLDERS = _env("DSV41_MOE_SCALE_CODES_HOLDERS", "0") not in ("0", "off", "false", "")
+
+
+def _alive_aliases(meta):
+    """How many of the native StorageImpls some Python/C++ owner still names (each now 0 bytes; information only)."""
+    return sum(1 for r in meta.get("native_refs") or [] if not r.expired())
+
+
+def _holders(meta):
+    """Diagnosis of who still names an emptied native storage (opt-in, DSV41_MOE_SCALE_CODES_HOLDERS=1: a full gc
+    scan per layer). Each alias with its referrer chain: frames by code name, file and line; this function's own
+    frame and the scan list are excluded."""
+    import gc
+    import sys as _sys
+    import warnings
+    keys = meta.get("native_keys") or set()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")          # isinstance() on deprecated module attributes during the scan
+        return _holders_scan(gc.get_objects(), keys, _sys._getframe())
+
+
+def _holders_scan(objs, keys, me):
+    import gc
+    skip = {id(objs), id(me)}
+
+    def name(r, depth=0):
+        if isinstance(r, type(me)):
+            return f"frame {r.f_code.co_name} ({os.path.basename(r.f_code.co_filename)}:{r.f_lineno})"
+        label = type(r).__name__
+        if depth < 2 and isinstance(r, (dict, list, tuple)):
+            ups = [name(u, depth + 1) for u in gc.get_referrers(r) if id(u) not in skip and u is not r][:2]
+            if ups:
+                label += " <- " + " | ".join(ups)
+        return label
+
+    out = []
+    for o in objs:
+        try:
+            if not isinstance(o, torch.Tensor) or _storage_key(o.untyped_storage()) not in keys:
+                continue
+        except Exception:  # noqa: BLE001 - diagnosis only
+            continue
+        refs = [name(r) for r in gc.get_referrers(o) if id(r) not in skip
+                and getattr(r, "f_code", None) not in (_holders.__code__, _holders_scan.__code__)][:4]
+        out.append(f"{tuple(o.shape)} {o.dtype} <- {', '.join(refs) or 'no Python referrer (a C++ owner)'}")
+        if len(out) >= 8:
+            break
+    return "; ".join(out) or "no Python tensor names it (a C++ owner)"
+
+
+def _codes_receipt(meta):
+    """Called by _convert_layer AFTER it rebound its experts. One receipt line per converted layer (the window counts
+    them). The receipt proves the release instead of inferring it from references:
+      released   every native StorageImpl holds 0 bytes (resized by _code_scales; checked here, on the objects)
+      ownership  no tensor reachable from the coded experts or the layer names a native storage (_code_scales, before
+                 the resize: a failure there refuses the layer)
+      allocator  allocated bytes dropped by >= 90 % of native - codes (2 MiB block-rounding slack), after the
+                 allocator processed its deferred frees
+    Aliases of the emptied storages that something else still holds (SGLang's post-load snapshots on a real boot, the
+    Triton launch records under compute-sanitizer) are counted and printed, never refused: they hold no bytes."""
+    dev = meta["dev"]
+    on_gpu = _on_gpu(dev)
+    storages = meta.get("native_storages") or []
+    held = [i for i, st in enumerate(storages) if st.nbytes() != 0]
+    if not storages or held:
+        _die(f"DSV41_MOE_SCALE_CODES: native scale storage {held or 'record'} not released; refused")
+    meta["native_storages"] = None               # the (empty) storage objects are not kept past the receipt
+    del storages
+    if on_gpu:
+        _SYNC(dev)
+        _EMPTY_CACHE(dev)             # processes the allocator's deferred (stream-event) frees before the reading
+        _SYNC(dev)
+    freed = (meta["before"] - _ALLOCATED(dev)) if on_gpu else 0
+    aliases = _alive_aliases(meta)
+    holders = _holders(meta) if (_HOLDERS and aliases) else None
+    _CODES["layers"] += 1
+    _CODES["native"] += meta["native"]
+    _CODES["coded"] += meta["coded"]
+    _CODES["freed"] += freed
+    _CODES["aliases"] += aliases
+    _CODES["max_span"] = max(_CODES["max_span"], meta["span"])
+    _CODES["conv_peak"] = max(_CODES["conv_peak"], meta["conv_peak"])
+    _CODES["per_layer"].append({"native": meta["native"], "coded": meta["coded"], "freed": freed, "released": 2,
+                                "aliases": aliases, "span": meta["span"], "conv_peak": meta["conv_peak"],
+                                **({"holders": holders} if holders is not None else {})})
+    if on_gpu and freed < 0.9 * (meta["native"] - meta["coded"]) - _ROUND_SLACK:
+        _die(f"DSV41_MOE_SCALE_CODES: the native storage is empty but the allocator freed only {freed} B of "
+             f"{meta['native'] - meta['coded']} B (native - codes, 2 MiB block-rounding slack); refused")
+    print(f"{_TAG} scale codes: {_CODES['layers']} layers, native {_CODES['native'] / 2**30:.3f} GiB -> codes "
+          f"{_CODES['coded'] / 2**30:.3f} GiB, allocator freed {_CODES['freed'] / 2**30:.3f} GiB, native storages "
+          f"released {2 * _CODES['layers']}/{2 * _CODES['layers']} (empty aliases {_CODES['aliases']}), max expert "
+          f"span {_CODES['max_span']}, conversion peak {_CODES['conv_peak'] / 2**20:.1f} MiB", flush=True)
+    if holders is not None:
+        print(f"{_TAG} scale codes: layer {_CODES['layers']} empty-storage aliases: {holders}", flush=True)
+    return freed
+
+
+def parse_min_rows(value):
+    """DSV41_MOE_SCALE_CODES_MIN_ROWS: captured calls with fewer rows keep the native experts (unset = 2)."""
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        return MIN_ROWS_DEFAULT
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 0
+    if v < 1:
+        _die(f"DSV41_MOE_SCALE_CODES_MIN_ROWS={value!r}: expected an integer row count >= 1; refused")
+    return v
+
+
+def _code_scales_retain(experts, dev):
+    """Retain mode: the coded prepared experts BESIDE the native ones. Same conversion and on-device round trip as
+    _code_scales; the native storage is kept (no resize, no ownership walk: both trees stay valid), so the PREQUANT
+    refusal does not apply (eager forwards, the pre-quantized stage-2b path included, run native)."""
+    import dataclasses
+    import scale_codes as sc
+    if RETAIN_AB and (_AB is None or not getattr(_AB, "ACTIVE", False)):
+        _die("DSV41_MOE_SCALE_CODES with DSV41_AB_VARIANTS >= 2 needs the armed in-boot A/B (ab_variant.configure() "
+             "before this import); refused")
+    if not RETAIN_AB:
+        _retain_min_rows()            # a malformed DSV41_MOE_SCALE_CODES_MIN_ROWS refuses the boot at load
+    impl = experts._impl
+    rep = impl.representation
+    val = rep.value
+    if not getattr(val, "n64_repack", False):
+        _die("DSV41_MOE_SCALE_CODES (retain) needs b12x_next's N64 repack (N % 128 == 64, EP_SIZE=1 at TP4); "
+             "refused")
+    try:
+        c13, s13 = sc.convert(val.w13_sfb, "w13")
+        c2, s2 = sc.convert(val.w2_sfb, "w2")
+    except sc.CodeError as exc:
+        _die(f"DSV41_MOE_SCALE_CODES (retain): {exc} (layer refused; nothing is approximated)")
+    new_val = dataclasses.replace(val, w13_sfb=c13, w2_sfb=c2)
+    new_rep = dataclasses.replace(rep, value=new_val)
+    new_impl = dataclasses.replace(impl, w1_blockscale=c13, w2_blockscale=c2, representation=new_rep)
+    coded = dataclasses.replace(experts, _impl=new_impl)
+    _CODED_IMPLS[id(new_impl)] = new_impl      # evict-first: _Geometry._run tells coded experts apart (own refusals)
+    _RETAIN["layers"] += 1
+    _RETAIN["native"] += sum(t.numel() * t.element_size() for t in (val.w13_sfb, val.w2_sfb))
+    _RETAIN["coded"] += c13.numel() + c2.numel()
+    _RETAIN["max_span"] = max(_RETAIN["max_span"], s13, s2)
+    return coded
+
+
+def _retain_receipt():
+    """The boot line, printed at the first captured MoE call after the converted-layer count changed (the target's
+    graphs, then the draft's once its layers loaded): every rank, flush."""
+    if _RETAIN["printed"] == _RETAIN["layers"]:
+        return
+    _RETAIN["printed"] = _RETAIN["layers"]
+    print(f"{_TAG} scale codes: {_retain_label()}: {_RETAIN['layers']} layers, native {_RETAIN['native'] / 2**30:.3f} GiB "
+          f"kept + codes {_RETAIN['coded'] / 2**30:.3f} GiB, min rows {_retain_min_rows()}, max expert span "
+          f"{_RETAIN['max_span']}", flush=True)
+
+
+def _retain_label():
+    return "A/B retain" if RETAIN_AB else "retain"
+
+
+def _retain_min_rows():
+    """The row floor of the variants that enable the codes: one number when they agree, else v<i>=<rows>/...
+    (without the A/B: DSV41_MOE_SCALE_CODES_MIN_ROWS of the process env)."""
+    if not RETAIN_AB:
+        return parse_min_rows(os.environ.get("DSV41_MOE_SCALE_CODES_MIN_ROWS", ""))
+    rows = {i: parse_min_rows(_AB.env_for(i, "DSV41_MOE_SCALE_CODES_MIN_ROWS", ""))
+            for i in range(_AB.N) if _AB.truthy(_AB.env_for(i, "DSV41_MOE_SCALE_CODES", "0"))}
+    if len(set(rows.values())) == 1:
+        return next(iter(rows.values()))
+    return "/".join(f"v{i}={r}" for i, r in sorted(rows.items())) or "none"
+
+
+def _retain_impl(st, m):
+    """Which prepared experts a call of m rows runs in retain mode: coded only inside a CUDA-graph capture (under the
+    in-boot A/B: a capture of a variant whose DSV41_MOE_SCALE_CODES is on, ab_variant.env, per capture), at m >= the
+    DSV41_MOE_SCALE_CODES_MIN_ROWS in force, on a capacity prepared for codes (no compact micro plan). Everything else,
+    eager forwards first, runs native."""
+    if RETAIN_AB:
+        v = _AB.capture_variant()
+        if v is None:
+            return st.impl
+        on = _AB.truthy(_AB.env("DSV41_MOE_SCALE_CODES", "0"))
+        min_rows = parse_min_rows(_AB.env("DSV41_MOE_SCALE_CODES_MIN_ROWS", ""))
+    else:
+        if not _capturing():
+            return st.impl
+        v, on, min_rows = 0, True, _retain_min_rows()
+    geom = st.geom
+    cap = geom.cap_for(m) if m <= geom.chunk else None
+    coded = bool(on and m >= min_rows and cap in geom.coded_caps)
+    key = (v, m, geom.topk)
+    _retain_receipt()
+    if key not in _RETAIN["seen"]:
+        _RETAIN["seen"].add(key)
+        _RETAIN["decisions"][key] = coded
+        why = ("" if coded else "gate off" if not on else f"M < min rows {min_rows}" if m < min_rows
+               else f"capacity {cap} not prepared for codes")
+        print(f"{_TAG} scale codes: capture variant={v} M={m} {'coded' if coded else 'native'} (top-k {geom.topk}, "
+              f"capacity {cap}{', ' + why if why else ''})", flush=True)
+    return st.coded_impl if coded else st.impl
+
+
 _B = {}             # b12x_next modules, filled only by _b12x() after the pin/drift checks
 _ENG = {}           # engine helpers of the fused function (install_runner)
 
@@ -297,6 +886,7 @@ def _b12x():
               # the topk-sum-accumulate runtime patch (optional: without it DSV41_PREFILL_MOE_FOLD keeps the add)
               acc=getattr(fimpl, "topk_sum_accumulate", None)
               if callable(getattr(fimpl, "topk_sum_accumulate", None)) else None)
+    install_evict_first(fimpl)
     # TEST ONLY, both gates checked before the import: prepared eager dynamic launch and launcher timing
     # (adapter/moe_launch_prepared.py; refuses to arm on drifted b12x_next sources)
     if any(_env(g, "0").lower() not in ("0", "", "off", "false", "no")
@@ -432,6 +1022,11 @@ class _Geometry:
         self.report = {}
         self.impl0 = None           # any layer's prepared experts (binding views do not depend on it)
         self.pq_views = {}          # capacity -> (packed_input [rows, K] u8, packed_input_scale flat u8)
+        self.coded_caps = frozenset()   # retain mode: capacities whose captured calls may run coded experts
+        self.ef_caps = []           # capacities whose flag-on kernels were compiled at load (DSV41_MOE_EVICT_FIRST)
+        self.ef_refused = set()     # capacities <= the row cap whose plan does not admit the hint
+        self.ef_caps_coded = []     # the same for the coded experts (retain mode, prepare_coded)
+        self.ef_refused_coded = set()
 
     def capacities(self):
         rows = sorted({r * b for r in (BLOCK, BLOCK + 1) for b in GRAPH_BS})
@@ -527,6 +1122,8 @@ class _Geometry:
         t_prep = time.time() - t0
         if WARM:
             self._warm(experts)
+        if _EF["armed"]:
+            self._warm_evict_first(experts)
         if PREQUANT_WARM and self.topk == PREQUANT_TOPK:
             self._warm_prequant(experts)
         if FOLD_WARM:
@@ -542,6 +1139,8 @@ class _Geometry:
             "prepare_s": round(t_prep, 1), "total_s": round(time.time() - t0, 1),
             "peak_transient_mb": peak, "persistent_mb": round(persistent / 2**20, 1),
         }
+        if _EF["armed"]:
+            self.report["evict_first_caps"] = list(self.ef_caps)
         print(f"{_TAG} geometry ready {self.report}", flush=True)
 
     def _race_call(self, cap):
@@ -581,6 +1180,69 @@ class _Geometry:
             ep_remap(ids[:m], w[:m], self.ids_buf[:m], self.w_buf[:m], 0, self.E)
         torch.cuda.synchronize(self.device)
         del x, out, ids, w
+
+    def prepare_coded(self, coded):
+        """Retain mode, once per geometry (on its first layer's coded experts): the capacities a graph row count
+        (1 .. EXACT_MAX) lands on, minus compact micro plans (their prepared launches are compiled for the process
+        format, native here); each is run once with coded experts so its coded kernels are compiled and loaded
+        before any capture (graph capture never compiles). Under the in-boot A/B the capture warm-ups run them again
+        eagerly; without it the warm-ups run native and the capture itself is the first coded call of the graph, so
+        this load warm is required (DSV41_MOE_B12X_NEXT_WARM off refuses)."""
+        t0 = time.time()
+        if not WARM and not RETAIN_AB:
+            _die("DSV41_MOE_SCALE_CODES (retain) needs the load warm-up (DSV41_MOE_B12X_NEXT_WARM=0 would compile "
+                 "the coded kernels inside a graph capture)")
+        caps = sorted({self.cap_for(m) for m in range(1, EXACT_MAX + 1)})
+        micro = [c for c in caps if getattr(self.plans[c].state, "compact_launches", None) is not None]
+        ok = [c for c in caps if c not in micro]
+        if WARM and ok:
+            x = torch.zeros(max(ok), self.K, dtype=torch.bfloat16, device=self.device)
+            out = torch.empty_like(x)
+            ids = torch.zeros(max(ok), self.topk, dtype=torch.int32, device=self.device)
+            w = torch.zeros(max(ok), self.topk, dtype=torch.float32, device=self.device)
+            for c in ok:
+                self._run(c, x[:c], ids[:c], w[:c], out[:c], coded._impl)
+            torch.cuda.synchronize(self.device)
+            del x, out, ids, w
+        self.coded_caps = frozenset(ok)
+        print(f"{_TAG} scale codes: {_retain_label()}: E={self.E} K={self.K} N={self.N} top-k {self.topk}: coded capacities "
+              f"{ok}, native only (compact micro plans) {micro}, warm {'on' if WARM else 'off'} "
+              f"{time.time() - t0:.1f} s", flush=True)
+        if _EF["armed"]:
+            # DSV41_MOE_EVICT_FIRST + scale codes in one variant: the coded flag-on kernels (their own key: coded and
+            # evict-first suffixes) are compiled here too, so a capture that picks both never compiles
+            self._warm_evict_first(coded, caps=ok, coded=True)
+
+    def _warm_evict_first(self, experts, caps=None, coded=False):
+        """Compile the flag-on kernels of every capacity <= the largest row cap (DSV41_MOE_EVICT_FIRST) and keep
+        them referenced; a capacity whose plan does not run the split-materialized phase kernels is refused.
+        ``coded``: the retain mode's coded experts, over its coded capacities (prepare_coded)."""
+        fimpl = _EF["impl"]
+        stats = getattr(fimpl, "EVICT_FIRST_STATS", {})
+        t0 = time.time()
+        top = self.cap_for(min(_EF["max_rows"], self.chunk))    # every M <= the row cap lands on a cap <= top
+        caps = [c for c in (self.caps if caps is None else caps) if c <= top]
+        done, refused = (self.ef_caps_coded, self.ef_refused_coded) if coded else (self.ef_caps, self.ef_refused)
+        x = torch.zeros(max(caps, default=1), self.K, dtype=torch.bfloat16, device=self.device)
+        out = torch.empty_like(x)
+        ids = torch.zeros(x.shape[0], self.topk, dtype=torch.int32, device=self.device)
+        w = torch.zeros(x.shape[0], self.topk, dtype=torch.float32, device=self.device)
+        for c in caps:
+            before = int(stats.get("ineligible", 0))
+            self._run(c, x[:c], ids[:c], w[:c], out[:c], experts._impl, ef=True)
+            if int(stats.get("ineligible", 0)) != before:
+                refused.add(c)
+            else:
+                done.append(c)
+        torch.cuda.synchronize(self.device)
+        got = {k: v for k, v in fimpl._DYNAMIC_KERNEL_CACHE.items()
+               if isinstance(k, tuple) and k and k[-1] == EF_KEY_TAG}
+        _EF["kernels"].update(got)
+        del x, out, ids, w
+        print(f"{_TAG} evict-first: warmed{' coded' if coded else ''} E={self.E} N={self.N} top-k {self.topk} "
+              f"capacities {done} ({len(got)} flag-on kernels held, {time.time() - t0:.1f} s)"
+              + (f"; refused at capacities {sorted(refused)} (plan not split-materialized W4A8)"
+                 if refused else ""), flush=True)
 
     # ---------------------------------------------------------------------------------------
     # pre-quantized input (prefill SP)
@@ -715,7 +1377,7 @@ class _Geometry:
         print(f"{_TAG} pre-quantized prefill input ready at capacities {done} "
               f"({time.time() - t0:.1f} s, E={self.E} top-k {self.topk})", flush=True)
 
-    def _run(self, cap, x, ids, w, out, impl):
+    def _run(self, cap, x, ids, w, out, impl, ef=None):
         if x.shape[0] > cap:
             raise RuntimeError(f"DSV41_MOE_B12X_NEXT: {x.shape[0]} rows on the capacity-{cap} plan "
                                f"(chunk {self.chunk}, capacities {self.caps})")
@@ -726,7 +1388,16 @@ class _Geometry:
         if st.w4a16_launches is not None:
             kw["_w4a16_launches"] = st.w4a16_launches
         b = dataclasses.replace(st.scratch.bind(**kw), compact_launches=st.compact_launches, plan=e.plan)
-        _B["fm"].run(binding=b)
+        if ef is None:      # DSV41_MOE_EVICT_FIRST: graph captures of <= MAX_ROWS rows only (ef=True: load warm)
+            # retain mode's coded experts have their own flag-on kernels (prepare_coded) -> their own refusals
+            refused = cap in (self.ef_refused_coded if id(impl) in _CODED_IMPLS else self.ef_refused)
+            ef = ef_decide(x.shape[0], refused=refused)
+        if ef:
+            _ef_restore()
+            with _EF["impl"].evict_first_weights():
+                _B["fm"].run(binding=b)
+        else:
+            _B["fm"].run(binding=b)
 
     def forward(self, impl, x, topk_ids, topk_weights, out):
         m_all = x.shape[0]
@@ -792,6 +1463,8 @@ class _LayerState:
     experts: object          # PreparedExperts (owns the repacked checkpoint storage)
     impl: object             # experts._impl, what the binding consumes
     hidden: int
+    coded: object = None     # retain mode: the coded PreparedExperts beside the native ones (None otherwise)
+    coded_impl: object = None
 
 
 # --------------------------------------------------------------------------------------------
@@ -921,6 +1594,8 @@ def _convert_layer(method, layer):
         print(f"{_TAG} INFO: routed MoE at EP_SIZE={ep_size} (this rank: EP rank {ep_rank}, {E} experts x "
               f"N={n}){'' if ep_size == 1 else '; the production profile is EP_SIZE=1, EP>1 is an A/B setup'}",
               flush=True)
+    if SCALE_CODES:
+        _check_raw_scales(layer)
     base = _peak_begin(dev)
     ones = torch.ones(E, dtype=torch.float32, device=dev)
     ptrs = tuple(t.untyped_storage().data_ptr() for t in (w13, w2, s13, s2))
@@ -939,9 +1614,20 @@ def _convert_layer(method, layer):
         _die(f"b12x_next did not repack E={E} K={k} N={n} in place")
     if peak is not None:
         _PREP_PEAK_MB.append(peak)
+    coded = None
+    if RETAIN:
+        del rep
+        coded = _code_scales_retain(experts, dev)
+    elif SCALE_CODES:
+        del rep                       # the pointer check's view of the native representation (R1)
+        experts, codes_meta = _code_scales(experts, layer, dev)
+        _codes_receipt(codes_meta)    # after the rebind; the native storage is already empty (_code_scales)
     if new_geom:
         geom.build(experts)
-    st = _LayerState(geom=geom, experts=experts, impl=experts._impl, hidden=k)
+        if coded is not None:
+            geom.prepare_coded(coded)
+    st = _LayerState(geom=geom, experts=experts, impl=experts._impl, hidden=k, coded=coded,
+                     coded_impl=None if coded is None else coded._impl)
     _LAYERS[w13.data_ptr()] = st
     layer._dsv4_mxfp4_backend = "b12x_next"
     layer._dsv41_b12x_next = st
@@ -1020,7 +1706,8 @@ def _fused_b12x_next(dispatch_output, quant_info, runner_config):
         st.geom.forward_prequant(st.impl, m, topk.topk_ids, topk.topk_weights, out)
         return _ENG["StandardCombineInput"](hidden_states=out)
     if x.shape[0]:
-        st.geom.forward(st.impl, x, topk.topk_ids, topk.topk_weights, out)
+        impl = st.impl if st.coded_impl is None else _retain_impl(st, x.shape[0])
+        st.geom.forward(impl, x, topk.topk_ids, topk.topk_weights, out)
     return _ENG["StandardCombineInput"](hidden_states=out)
 
 
@@ -1067,4 +1754,6 @@ def prequant_target(layer, m):
 
 def geometry_reports():
     return {"geometries": [g.report for g in _GEOMS.values()], "layers": len(_LAYERS),
-            "prepare_weights_peak_mb_max": max(_PREP_PEAK_MB, default=0.0)}
+            "prepare_weights_peak_mb_max": max(_PREP_PEAK_MB, default=0.0),
+            "evict_first": {k: (sorted(v) if isinstance(v, set) else v) for k, v in _EF.items()
+                            if k in ("armed", "max_rows", "restored", "captures_on", "captures_off")}}

@@ -39,6 +39,11 @@ HAVE_TORCH = importlib.util.find_spec("torch") is not None
 HAVE_SGLANG = importlib.util.find_spec("sglang") is not None
 
 
+# v2.7.5's production-line tail (scale codes, then the evict-first experts + SHPF window)
+V275_TAIL = ["DSV41_MOE_SCALE_CODES=1", "DSV41_MOE_SCALE_CODES_MIN_ROWS=2", "DSV41_MOE_EVICT_FIRST=1",
+             "DSV41_L2_PREFETCH_SHPF_MB=6", "DSV41_L2_PREFETCH_SHPF_EL=0"]
+
+
 # ---------------------------------------------------------------- toy model (pure Python)
 class Toy:
     """Layers 0..E-1 run every row: per-layer window-W attention over their own KV plus dense
@@ -759,6 +764,9 @@ class Profile(unittest.TestCase):
 
     def test_production_line_ends_with_the_cone(self):
         items = self._production_line().split('"')[1].split()
+        # v2.7.5's keys come last (V275_TAIL): checked here, then the v2.7.4 line's checks below run on the rest
+        self.assertEqual(items[-len(V275_TAIL):], V275_TAIL)
+        items = items[:-len(V275_TAIL)]
         self.assertEqual([x for x in items if x.startswith("DSV41_SWA_CONE")],
                          ["DSV41_SWA_CONE_REPLAY=1", "DSV41_SWA_CONE_TOKENS=8192"])
         i = items.index("DSV41_SWA_THIN=1")

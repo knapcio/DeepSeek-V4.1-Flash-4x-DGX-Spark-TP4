@@ -24,10 +24,15 @@ ROOT = Path(__file__).resolve().parents[1]
 # DSV41_PREFILL_GEMM_TACTIC (off by default) wraps ModelRunner.load_model for its boot check; its wrapper must unwrap to
 # the engine function. The probe also re-runs prefill_sp's drift guard after every install (the l2_prefetch bracket wraps
 # the pinned DeepseekV4Model.forward; with the production line's W2 keys its wo_a recorder carries the W2 fork).
-# DSV41_PREFILL_MOE_FOLD (production profile since the v2.7.4 candidate) wraps pinned engine functions (forward_normal,
+# DSV41_PREFILL_MOE_FOLD (production profile since v2.7.4) wraps pinned engine functions (forward_normal,
 # _forward_shared_experts, maybe_fuse_routed_scale_and_shared_add): installed, and every wrapper unwraps to the engine.
+# DSV41_L2_PREFETCH_SHPF_MB (l2_prefetch v5; production profile since v2.7.5, 6 MB) wraps DeepseekV2MoE._forward_shared_experts (the fold wraps it
+# too: both wrappers must coexist and unwrap to the engine) and DeepseekV4DecoderLayer._hc_mix_stats, both hash-pinned by
+# prefill_sp through inspect.unwrap (the 2026-11-10 tier-6 window failed this probe when they did not keep __wrapped__).
+# DSV41_MOE_SCALE_CODES / DSV41_MOE_EVICT_FIRST (production profile since v2.7.5) are read by moe_b12x_next at import; the
+# production line's values are on through .env.tp4.example.
 EXTRA_FLAGS = {"DSV41_PREFILL_SP_FP8_MOE": "1", "DSV41_WO_A_INPUT_FP8": "1", "DSV41_EXTEND_NOSYNC": "1",
-               "DSV41_PREFILL_GEMM_TACTIC": "1", "DSV41_PREFILL_MOE_FOLD": "1"}
+               "DSV41_PREFILL_GEMM_TACTIC": "1", "DSV41_PREFILL_MOE_FOLD": "1", "DSV41_L2_PREFETCH_SHPF_MB": "6"}
 
 PROBE = """
 import inspect
@@ -40,6 +45,19 @@ mr = mrm.ModelRunner
 assert getattr(mr.load_model, "_dsv41_prefill_gemm_tactic", False), "GEMM tactic boot check not installed"
 assert inspect.unwrap(mr.load_model).__qualname__ == "ModelRunner.load_model", "load_model does not unwrap to the engine"
 import os
+
+
+def _flagged(fn, attr):
+    # True when a wrapper along fn's __wrapped__ chain carries attr (two adapters may wrap one engine function)
+    for _ in range(16):
+        if fn is None:
+            return False
+        if getattr(fn, attr, False):
+            return True
+        fn = getattr(fn, "__wrapped__", None)
+    return False
+
+
 if os.environ.get("DSV41_L2_PREFETCH") == "1":
     # l2_prefetch brackets DeepseekV4Model.forward (pinned by prefill_sp) and, with _WOA, wraps the wo_a dispatch that
     # carries the W2 fork: both installed, both unwrap to the engine (every l2_prefetch wrapper keeps __wrapped__)
@@ -50,6 +68,15 @@ if os.environ.get("DSV41_L2_PREFETCH") == "1":
         # the inner dispatch is wo_a_w8's / wo_a_input_fp8's own wrapper (no source pin on it): one level is enough
         inner = getattr(v4._apply_wo_a_bf16_matmul, "__wrapped__", None)
         assert inner is not None and not getattr(inner, "_dsv41_l2_prefetch", False), "wo_a recorder without __wrapped__"
+    # v5 SHPF: the hc-entry and shared-expert wrappers are installed whenever DSV41_L2_PREFETCH=1 (SHPF on or off)
+    import sys
+    v2 = sys.modules["sglang.srt.models.deepseek_v2"]
+    for owner, name in ((v4.DeepseekV4DecoderLayer, "_hc_mix_stats"), (v2.DeepseekV2MoE, "_forward_shared_experts")):
+        fn = getattr(owner, name)
+        # the fold (v2.7.4, installed after it on deepseek_v2) wraps _forward_shared_experts OUTSIDE the SHPF wrapper:
+        # look for the flag along the __wrapped__ chain, not only on the outermost function
+        assert _flagged(fn, "_dsv41_l2_prefetch"), f"SHPF wrapper of {name} not installed"
+        assert inspect.unwrap(fn).__qualname__ == f"{owner.__name__}.{name}", f"SHPF wrapper of {name} does not unwrap"
 if os.environ.get("DSV41_PREFILL_MOE_FOLD") == "1":
     import sglang.srt.models.deepseek_v2 as v2
     import prefill_moe_fold
@@ -57,7 +84,7 @@ if os.environ.get("DSV41_PREFILL_MOE_FOLD") == "1":
     for fn, name in ((v2.DeepseekV2MoE.forward_normal, "DeepseekV2MoE.forward_normal"),
                      (v2.DeepseekV2MoE._forward_shared_experts, "DeepseekV2MoE._forward_shared_experts"),
                      (v2.maybe_fuse_routed_scale_and_shared_add, "maybe_fuse_routed_scale_and_shared_add")):
-        assert getattr(fn, "_dsv41_moe_fold", False), f"MoE fold wrapper missing on {name}"
+        assert _flagged(fn, "_dsv41_moe_fold"), f"MoE fold wrapper missing on {name}"
         assert inspect.unwrap(fn).__qualname__ == name, f"MoE fold wrapper on {name} does not unwrap to the engine"
 # prefill_sp's drift guard again AFTER every adapter installed: each pinned engine source still unwraps to the stock one
 prefill_sp.check_engine()

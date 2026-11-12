@@ -1,0 +1,784 @@
+--- b12x_next/moe/_shared/kernels/dynamic.py
++++ b12x_next/moe/_shared/kernels/dynamic.py
+@@ -131,6 +131,7 @@
+     _w4a8_trellis_pair_words,
+     _w4a8_trellis_permute_k32,
+ )
++from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_byte
+ from b12x_next.moe._shared.kernels.w4a8_phase1 import (
+     W4A8MaterializedPhase1Kernel,
+ )
+@@ -407,9 +408,13 @@
+     total_k32: cutlass.Constexpr,
+     tidx: Int32,
+     tcnt: cutlass.Constexpr,
++    coded: cutlass.Constexpr = False,
+ ):
+-    """Stage exact N64-packed E8M0 bytes into the N128/K128 SFB tile."""
++    """Stage exact N64-packed E8M0 bytes into the N128/K128 SFB tile.
+ 
++    ds41 scale-codes: with ``coded`` the tensor holds 4-bit codes + a per-expert base and every byte is
++    expanded at the same expert-local offset (w4a8_scale_codes.coded_byte)."""
++
+     sfb_u8 = cute.recast_tensor(sfb_rp_u32, Uint8)
+     copies = 2 * 4 * 64
+     expert_bytes = total_n64 * total_k32 * 64
+@@ -432,13 +437,23 @@
+                 if source_kt == Int32(full_k_tiles):
+                     tile_cols = Int32(total_k32 - full_k_tiles * 4)
+                     tile_base = Int32(full_k_tiles * 256)
+-                source_byte = (
+-                    Int64(expert_idx) * Int64(expert_bytes)
+-                    + Int64(source_n64) * Int64(total_k32 * 64)
+-                    + Int64(tile_base)
+-                    + Int64(row * tile_cols + source_kb)
+-                )
+-                value = sfb_u8[source_byte]
++                if cutlass.const_expr(coded):
++                    value = coded_byte(
++                        sfb_u8,
++                        expert_idx,
++                        Int64(expert_bytes),
++                        Int64(source_n64) * Int64(total_k32 * 64)
++                        + Int64(tile_base)
++                        + Int64(row * tile_cols + source_kb),
++                    )
++                else:
++                    source_byte = (
++                        Int64(expert_idx) * Int64(expert_bytes)
++                        + Int64(source_n64) * Int64(total_k32 * 64)
++                        + Int64(tile_base)
++                        + Int64(row * tile_cols + source_kb)
++                    )
++                    value = sfb_u8[source_byte]
+             st_shared_u8(
+                 smem_base
+                 + (n64_half * Int32(64) + row) * Int32(4)
+@@ -804,6 +819,7 @@
+         w4a8_repacked: bool = False,
+         w4a8_n64_repacked: bool = False,
+         w4a8_n64_tail: bool = False,
++        w4a8_coded_scales: bool = False,
+         direct_routing: bool = False,
+         external_route_plan: bool = False,
+         materialize_intermediate: bool = False,
+@@ -949,6 +965,10 @@
+         self.w4a8_repacked = bool(w4a8_repacked)
+         self.w4a8_n64_repacked = bool(w4a8_n64_repacked)
+         self.w4a8_n64_tail = bool(w4a8_n64_tail)
++        # ds41 scale-codes (w4a8_scale_codes.py): N64 block scales as 4-bit codes + a per-expert base
++        self.w4a8_coded_scales = bool(w4a8_coded_scales)
++        if self.w4a8_coded_scales and not self.w4a8_n64_repacked:
++            raise ValueError("w4a8_coded_scales requires w4a8_n64_repacked")
+         if self.w4a8_n64_repacked and not self.w4a8_repacked:
+             raise ValueError("w4a8_n64_repacked requires w4a8_repacked")
+         if self.w4a8_n64_tail and not self.w4a8_n64_repacked:
+@@ -1055,6 +1075,7 @@
+                 num_topk=self.num_topk,
+                 n64_repacked=self.w4a8_n64_repacked,
+                 n64_tail=self.w4a8_n64_tail,
++                coded_scales=self.w4a8_coded_scales,
+                 trellis_bits=(
+                     trellis_bits
+                     if self.w4a8_trellis and self.w4a8_split_materialized
+@@ -1080,6 +1101,7 @@
+                 deterministic_output=bool(deterministic_output),
+                 n64_repacked=self.w4a8_n64_repacked,
+                 n64_tail=self.w4a8_n64_tail,
++                coded_scales=self.w4a8_coded_scales,
+                 trellis_bits=(
+                     trellis_bits
+                     if self.w4a8_trellis and self.w4a8_split_materialized
+@@ -8935,6 +8957,7 @@
+                                             total_w13_k32,
+                                             Int32(lane_id),
+                                             32,
++                                            coded=self.w4a8_coded_scales,
+                                         )
+                                         if cutlass.const_expr(self.w4a8_fused):
+                                             _w4a8_stage_n64_sfb_tile(
+@@ -8947,6 +8970,7 @@
+                                                 total_w13_k32,
+                                                 Int32(lane_id),
+                                                 32,
++                                                coded=self.w4a8_coded_scales,
+                                             )
+                                     elif cutlass.const_expr(
+                                         self.w4a8_repacked
+@@ -9408,6 +9432,7 @@
+                                         total_down_k32,
+                                         Int32(lane_id),
+                                         32,
++                                        coded=self.w4a8_coded_scales,
+                                     )
+                                     if cutlass.const_expr(self.w4a8_fc2_pair):
+                                         _w4a8_stage_n64_sfb_tile(
+@@ -9420,6 +9445,7 @@
+                                             total_down_k32,
+                                             Int32(lane_id),
+                                             32,
++                                            coded=self.w4a8_coded_scales,
+                                         )
+                                 elif cutlass.const_expr(
+                                     self.w4a8_repacked and not self.w4a8_trellis
+--- b12x_next/moe/_shared/kernels/silu.py
++++ b12x_next/moe/_shared/kernels/silu.py
+@@ -86,6 +86,7 @@
+         w4a8_repacked: bool = False,
+         w4a8_n64_repacked: bool = False,
+         w4a8_n64_tail: bool = False,
++        w4a8_coded_scales: bool = False,
+         trellis_bits: int | None = None,
+         trellis_intermediate_hadamard: bool = False,
+         direct_routing: bool = False,
+@@ -113,6 +114,7 @@
+             w4a8_repacked=w4a8_repacked,
+             w4a8_n64_repacked=w4a8_n64_repacked,
+             w4a8_n64_tail=w4a8_n64_tail,
++            w4a8_coded_scales=w4a8_coded_scales,
+             trellis_bits=trellis_bits,
+             trellis_intermediate_hadamard=trellis_intermediate_hadamard,
+             direct_routing=direct_routing,
+--- b12x_next/moe/_shared/kernels/w4a8_compact_micro.py
++++ b12x_next/moe/_shared/kernels/w4a8_compact_micro.py
+@@ -21,6 +21,7 @@
+     W4A8CompactMicroActivationKernel,
+ )
+ from b12x_next.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
++from b12x_next.moe._shared.kernels.w4a8_scale_codes import scale_codes_enabled
+ 
+ 
+ _ALIGN = 256
+@@ -92,6 +93,7 @@
+         down_scale_count: int,
+         swiglu_limit: float | None,
+         fast_math: bool,
++        coded_scales: bool = False,
+     ):
+         self.capacity = max_tokens
+         self.topk = num_topk
+@@ -100,7 +102,9 @@
+         self.experts = experts
+         self.input_scale_count = input_scale_count
+         self.down_scale_count = down_scale_count
+-        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk)
++        # ds41 scale codes (w4a8_scale_codes.py): both scale slots hold coded buffers
++        self.coded_scales = bool(coded_scales)
++        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk, coded_scales=self.coded_scales)
+         self.activation = W4A8CompactMicroActivationKernel(
+             n,
+             experts,
+@@ -113,6 +117,7 @@
+             direct_routes=True,
+             n64_repacked=self.n % 128 == 64,
+             n64_tail=self.n % 128 == 64,
++            coded_scales=self.coded_scales,
+         )
+ 
+     @cute.jit
+@@ -242,6 +247,7 @@
+     down_scale_count: int,
+     swiglu_limit: float | None,
+     fast_math: bool,
++    coded_scales: bool = False,
+ ):
+     launch = _DirectW4A8CompactLaunch(
+         max_tokens=max_tokens,
+@@ -253,7 +259,10 @@
+         down_scale_count=down_scale_count,
+         swiglu_limit=swiglu_limit,
+         fast_math=fast_math,
++        coded_scales=coded_scales,
+     )
++    # ds41 scale codes: appended only when on, so the native keys are unchanged
++    coded_key = ("w4a8_coded_scales",) if coded_scales else ()
+     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
+ 
+     def dummy(dtype, align=16):
+@@ -274,7 +283,7 @@
+             down_scale_count,
+             swiglu_limit,
+             fast_math,
+-        ),
++        ) + coded_key,
+     )
+     return b12x_compile(
+         launch,
+@@ -311,11 +320,30 @@
+                 down_scale_count,
+                 swiglu_limit,
+                 fast_math,
+-            ),
++            ) + coded_key,
+         ),
+     )
+ 
+ 
++# ds41 scale codes: the scale format each PREPARED compact kernel was compiled for (_preparation._compact_launches
++# records it). One process may hold both formats (the ds41 A/B retain mode keeps native and coded experts): a call is
++# keyed on its tensors' dtype, and a prepared kernel of the other format is refused instead of reading the wrong bytes.
++_PREPARED_FORMATS: dict = {}
++
++
++def note_prepared_format(kernels, coded: bool) -> None:
++    for kernel in kernels.values():
++        _PREPARED_FORMATS[id(kernel)] = (kernel, bool(coded))
++
++
++def prepared_kernel_coded(kernel) -> bool:
++    """The format a prepared compact kernel was compiled for; unrecorded ones follow the process-wide switch."""
++    entry = _PREPARED_FORMATS.get(id(kernel))
++    if entry is not None and entry[0] is kernel:
++        return entry[1]
++    return scale_codes_enabled()
++
++
+ def _as_bytes(scratch: torch.Tensor) -> torch.Tensor:
+     if scratch.device.type != "cuda" or not scratch.is_contiguous():
+         raise ValueError("scratch must be a contiguous CUDA tensor")
+@@ -391,6 +419,20 @@
+     else:
+         _prepared_quantize(a, values, scale_rows, scale_mma)
+ 
++    # ds41 scale codes: the format is the tensors' (uint8 codes or int32 native words); both slots must agree, and a
++    # prepared kernel must have been compiled for that format
++    coded = w13_scales.dtype == torch.uint8
++    if coded != (w2_scales.dtype == torch.uint8):
++        raise ValueError(
++            "ds41 scale codes: w13/w2 scale formats disagree "
++            f"(w13 {w13_scales.dtype}, w2 {w2_scales.dtype}); refused"
++        )
++    if _prepared_kernel is not None and prepared_kernel_coded(_prepared_kernel) != coded:
++        raise ValueError(
++            "ds41 scale codes: the prepared compact kernel was compiled for "
++            f"{'coded' if prepared_kernel_coded(_prepared_kernel) else 'native'} scales, the call carries "
++            f"{'coded' if coded else 'native'} (w13 {w13_scales.dtype}); refused"
++        )
+     compiled = _prepared_kernel or _compiled_direct_w4a8_compact(
+         int(a.device.index or 0),
+         cap,
+@@ -403,6 +445,7 @@
+         down_scale.numel(),
+         swiglu_limit,
+         fast_math,
++        coded,
+     )
+     ids = topk_ids.reshape(-1)
+     weights = topk_weights.reshape(-1)
+--- b12x_next/moe/_shared/kernels/w4a8_compact_projection.py
++++ b12x_next/moe/_shared/kernels/w4a8_compact_projection.py
+@@ -7,6 +7,7 @@
+ import cutlass.cute as cute
+ from cutlass.cutlass_dsl import Int32, Int64, Uint32
+ 
++from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_stage_16b
+ from b12x_next._lib.intrinsics import (
+     cp_async4_shared_global,
+     cp_async_u32_shared_global,
+@@ -31,7 +32,7 @@
+     num_warps = 4
+     threads_per_cta = 128
+ 
+-    def __init__(self, k: int, n: int, num_topk: int):
++    def __init__(self, k: int, n: int, num_topk: int, coded_scales: bool = False):
+         if k <= 0 or n < 64 or k % 128 or n % 64:
+             raise ValueError(
+                 "compact W4A8 projection requires K divisible by 128 and "
+@@ -44,6 +45,10 @@
+         self.num_topk = int(num_topk)
+         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
+         self.n64_tail = self.n % self.tile_n == 64
++        # ds41 scale-codes: w13_scales holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
++        self.coded_scales = bool(coded_scales)
++        if self.coded_scales and self.n % 128 != 64:
++            raise ValueError("coded W4A8 scales require the N64 repack (N % 128 == 64)")
+         self.b_payload_bytes = self.tile_n * self.tile_k // 2
+         self.sfb_bytes = (self.tile_n // 8) * 8 * 4
+         self.a_offset = 0
+@@ -197,16 +202,27 @@
+         if tid < Int32(32):
+             dst_addr = dst_base + (tid << Int32(4))
+             if tid < n_rows // Int32(4):
+-                source_word = (
+-                    Int64(expert_idx) * Int64(self.n * (self.k // 32) // 2)
+-                    + Int64(projection) * Int64(self.n * (self.k // 32) // 4)
+-                    + Int64(output_tile) * Int64(128 * (self.k // 32) // 4)
+-                    + Int64(k128_slice * n_rows + tid * Int32(4))
+-                )
+-                cp_async4_shared_global(
+-                    dst_addr,
+-                    get_ptr_as_int64(scales, source_word),
+-                )
++                if cutlass.const_expr(self.coded_scales):
++                    coded_stage_16b(
++                        scales,
++                        dst_addr,
++                        expert_idx,
++                        Int64(self.n * (self.k // 32) // 2),
++                        Int64(projection) * Int64(self.n * (self.k // 32) // 4)
++                        + Int64(output_tile) * Int64(128 * (self.k // 32) // 4)
++                        + Int64(k128_slice * n_rows + tid * Int32(4)),
++                    )
++                else:
++                    source_word = (
++                        Int64(expert_idx) * Int64(self.n * (self.k // 32) // 2)
++                        + Int64(projection) * Int64(self.n * (self.k // 32) // 4)
++                        + Int64(output_tile) * Int64(128 * (self.k // 32) // 4)
++                        + Int64(k128_slice * n_rows + tid * Int32(4))
++                    )
++                    cp_async4_shared_global(
++                        dst_addr,
++                        get_ptr_as_int64(scales, source_word),
++                    )
+             else:
+                 st_shared_u32(dst_addr, Uint32(0))
+                 st_shared_u32(dst_addr + Int32(4), Uint32(0))
+--- b12x_next/moe/_shared/kernels/w4a8_phase1.py
++++ b12x_next/moe/_shared/kernels/w4a8_phase1.py
+@@ -20,6 +20,7 @@
+ 
+ from cutlass.cutlass_dsl import Int32, Int64, Uint32
+ 
++from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_cp_async_16b, coded_expand_16b
+ from b12x_next._lib.intrinsics import (
+     cp_async4_shared_global,
+     cp_async_u32_shared_global,
+@@ -75,8 +76,13 @@
+         trellis_direct_lut: bool = False,
+         n64_repacked: bool = False,
+         n64_tail: bool = False,
++        coded_scales: bool = False,
+     ):
+         self.fast_math = bool(fast_math)
++        # ds41 scale-codes: w13_sfb_rp holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
++        self.coded_scales = bool(coded_scales)
++        if self.coded_scales and not n64_repacked:
++            raise ValueError("coded W4A8 scales require the N64 repack")
+         self.has_swiglu_limit = swiglu_limit is not None
+         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
+         self.n64_repacked = bool(n64_repacked)
+@@ -125,6 +131,8 @@
+                 f"trellis_bits must be 2, 3, or 4, got {trellis_bits!r}"
+             )
+         self.w4a8_trellis = trellis_bits is not None
++        if self.coded_scales and self.w4a8_trellis:
++            raise ValueError("coded W4A8 scales are not defined for trellis weights")
+         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
+         if trellis_intermediate_hadamard and not self.w4a8_trellis:
+             raise ValueError("trellis_intermediate_hadamard requires trellis_bits")
+@@ -336,17 +344,31 @@
+             if transfer < Int32(transfers):
+                 dst_addr = dst_base + (transfer << Int32(4))
+                 if transfer < valid_transfers:
+-                    source_word = (
+-                        Int64(expert_idx) * Int64(expert_words)
+-                        + Int64(projection) * Int64(projection_words)
+-                        + Int64(tile_base)
+-                        + Int64(k128_slice * n_rows)
+-                        + Int64(transfer * Int32(4))
+-                    )
+-                    cp_async4_shared_global(
+-                        dst_addr,
+-                        get_ptr_as_int64(scales, source_word),
+-                    )
++                    if cutlass.const_expr(self.coded_scales):
++                        # ds41 scale codes: header word + 8 code bytes, async, into this slot; expanded in place by
++                        # _expand_n64_sfb after this thread's cp_async_wait_group
++                        coded_cp_async_16b(
++                            scales,
++                            dst_addr,
++                            expert_idx,
++                            Int64(expert_words),
++                            Int64(projection) * Int64(projection_words)
++                            + Int64(tile_base)
++                            + Int64(k128_slice * n_rows)
++                            + Int64(transfer * Int32(4)),
++                        )
++                    else:
++                        source_word = (
++                            Int64(expert_idx) * Int64(expert_words)
++                            + Int64(projection) * Int64(projection_words)
++                            + Int64(tile_base)
++                            + Int64(k128_slice * n_rows)
++                            + Int64(transfer * Int32(4))
++                        )
++                        cp_async4_shared_global(
++                            dst_addr,
++                            get_ptr_as_int64(scales, source_word),
++                        )
+                 else:
+                     st_shared_u32(dst_addr, Uint32(0))
+                     st_shared_u32(dst_addr + Int32(4), Uint32(0))
+@@ -354,6 +376,31 @@
+                     st_shared_u32(dst_addr + Int32(12), Uint32(0))
+ 
+     @cute.jit
++    def _expand_n64_sfb(
++        self,
++        dst_base: Int32,
++        output_tile: Int32,
++        intermediate_tiles: Int32,
++        tid: Int32,
++    ):
++        """ds41 scale codes: rewrite this thread's coded slots of one N64 SFB stage tile in place with the native
++        bytes. Same transfer -> thread mapping and validity as _stage_n64_sfb, so a thread expands exactly the slots
++        its own cp.async filled; call after cp_async_wait_group (own copies landed), before the stage barrier."""
++        n_rows = Int32(128)
++        if cutlass.const_expr(self.n64_tail):
++            if output_tile == intermediate_tiles - Int32(1):
++                n_rows = Int32(64)
++        transfers = 512 // 16
++        valid_transfers = n_rows // Int32(4)
++        for i in cutlass.range_constexpr(
++            (transfers + self.threads_per_cta - 1) // self.threads_per_cta
++        ):
++            transfer = tid + Int32(i * self.threads_per_cta)
++            if transfer < Int32(transfers):
++                if transfer < valid_transfers:
++                    coded_expand_16b(dst_base + (transfer << Int32(4)))
++
++    @cute.jit
+     def _stage_slice(
+         self,
+         packed_a_u32: cute.Tensor,
+@@ -705,6 +752,11 @@
+                 )
+             cute.arch.cp_async_commit_group()
+             cute.arch.cp_async_wait_group(self.stages - 1)
++            if cutlass.const_expr(self.coded_scales):
++                # ds41 scale codes: this thread's copies of the CURRENT stage have landed (wait_group covers its own
++                # groups); it expands the slots it filled, and the barrier below publishes them with the stage
++                self._expand_n64_sfb(gate_sfb_base, output_tile, intermediate_tiles, tid)
++                self._expand_n64_sfb(up_sfb_base, output_tile, intermediate_tiles, tid)
+             cute.arch.fence_proxy("async.shared", space="cta")
+             cute.arch.sync_threads()
+ 
+--- b12x_next/moe/_shared/kernels/w4a8_phase2.py
++++ b12x_next/moe/_shared/kernels/w4a8_phase2.py
+@@ -16,6 +16,7 @@
+ 
+ from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
+ 
++from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_block_base, coded_row2_u32, coded_row4_u32
+ from b12x_next._lib.intrinsics import (
+     cp_async4_shared_global,
+     cp_async_u32_shared_global,
+@@ -78,9 +79,14 @@
+         n64_repacked: bool = False,
+         n64_tail: bool = False,
+         direct_routes: bool = False,
++        coded_scales: bool = False,
+     ):
+         self.n64_repacked = bool(n64_repacked)
+         self.n64_tail = bool(n64_tail)
++        # ds41 scale-codes: down_sfb_rp holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
++        self.coded_scales = bool(coded_scales)
++        if self.coded_scales and not self.n64_repacked:
++            raise ValueError("coded W4A8 scales require the N64 repack")
+         self.direct_routes = bool(direct_routes)
+         if self.direct_routes:
+             if source_tile_m != 1:
+@@ -248,23 +254,41 @@
+         if cutlass.const_expr(self.n64_tail):
+             if k128_slice == Int32(total_k32 // 4):
+                 tile_cols = Int32(2)
+-        for i in cutlass.range_constexpr(
+-            (copies + self.threads_per_cta - 1) // self.threads_per_cta
+-        ):
+-            idx = tid + Int32(i * self.threads_per_cta)
+-            if idx < Int32(copies):
+-                row = idx & Int32(127)
+-                kb = idx >> Int32(7)
+-                value = Uint8(0)
+-                if kb < tile_cols:
+-                    source_byte = (
+-                        Int64(expert_idx) * Int64(expert_bytes)
+-                        + Int64(output_base)
+-                        + Int64(k128_slice * Int32(512))
+-                        + Int64(row * tile_cols + kb)
+-                    )
+-                    value = scales_u8[source_byte]
+-                st_shared_u8(dst_base + row * Int32(4) + kb, value)
++        if cutlass.const_expr(self.coded_scales):
++            # ds41 scale codes, parallel row expansion: one thread per N row writes the row's four bytes as one u32
++            # (native: four byte stores of the same bytes, kb >= tile_cols zero), from one 16-bit code load (8-bit on
++            # the K tail) and the expert's base, loaded once per tile
++            block, base = coded_block_base(scales_u8, expert_idx, Int64(expert_bytes))
++            for i in cutlass.range_constexpr(
++                (128 + self.threads_per_cta - 1) // self.threads_per_cta
++            ):
++                row = tid + Int32(i * self.threads_per_cta)
++                if row < Int32(128):
++                    local = Int64(output_base) + Int64(k128_slice * Int32(512)) + Int64(row * tile_cols)
++                    word = Uint32(0)
++                    if tile_cols == Int32(4):
++                        word = coded_row4_u32(scales_u8, block, base, local)
++                    else:
++                        word = coded_row2_u32(scales_u8, block, base, local)
++                    st_shared_u32(dst_base + row * Int32(4), word)
++        else:
++            for i in cutlass.range_constexpr(
++                (copies + self.threads_per_cta - 1) // self.threads_per_cta
++            ):
++                idx = tid + Int32(i * self.threads_per_cta)
++                if idx < Int32(copies):
++                    row = idx & Int32(127)
++                    kb = idx >> Int32(7)
++                    value = Uint8(0)
++                    if kb < tile_cols:
++                        source_byte = (
++                            Int64(expert_idx) * Int64(expert_bytes)
++                            + Int64(output_base)
++                            + Int64(k128_slice * Int32(512))
++                            + Int64(row * tile_cols + kb)
++                        )
++                        value = scales_u8[source_byte]
++                    st_shared_u8(dst_base + row * Int32(4) + kb, value)
+ 
+     @cute.jit
+     def _stage_slice(
+--- /dev/null
++++ b12x_next/moe/_shared/kernels/w4a8_scale_codes.py
+@@ -0,0 +1,151 @@
++"""Coded W4A8 N64 block scales (ds41 patch b12x_next-scale-codes; idea: Christopher Owen, spark-ds41f
++experiments/2026-10-18-scale-codes).
++
++The N64 in-place repack stores, per expert, ``rows * K/32`` UE8M0 bytes in the order the kernels read them.
++The coded form keeps that order and replaces every byte by a 4-bit delta from one base per expert:
++
++    coded expert block = [16-byte header: base in byte 0, zeros] + [nibbles, two per byte, low nibble first]
++    native byte at expert-local offset o  ==  base + ((block[16 + o // 2] >> (4 * (o % 2))) & 0xF)
++
++so ``coded_expert_bytes = 16 + native_expert_bytes / 2`` and EVERY reader's address arithmetic carries over: a
++16-byte native transfer at expert-local word w is the 8 code bytes at 16 + 2 w. The expansion writes the same
++bytes into the same shared-memory slots, so the MMAs, their order and every reduction see identical operands.
++
++Exactness needs each expert's stored bytes to span at most 16 values; the host converter refuses otherwise.
++The helpers below hold no dynamic control flow (plain trace-time Python over DSL values).
++
++Readers (2026-10-30, parallel row expansion; idea credited to Christopher Owen, spark-ds41f expert-codes-v2 /
++coded-arrive: every thread expands its own rows with the base in a register, after its own copies landed):
++  FC1 (w4a8_phase1), cp.async path: ``coded_cp_async_16b`` copies a native 16-byte transfer's 8 code bytes and the
++      expert's header word ASYNCHRONOUSLY into that transfer's own 16-byte shared slot (header -> +0, codes -> +8);
++      after the thread's ``cp_async_wait_group`` (which covers its OWN copies) ``coded_expand_16b`` rewrites the slot
++      in place with the 16 native bytes, before the stage's CTA barrier publishes it. No synchronous global load on
++      the critical path and no extra barrier: the copier is the expander.
++  FC2 (w4a8_phase2), byte path: ``coded_row4_u32`` / ``coded_row2_u32`` give one thread a whole N row of the K128
++      tile (4 native bytes, or 2 + 2 zero bytes on the K tail) from one 16-bit (8-bit) code load and a base loaded
++      once per tile, stored as one u32 where the native branch stores the same 4 bytes one by one.
++  ``coded_stage_16b`` (synchronous) / ``coded_byte`` stay for the compact micro projection (not selected by the
++  production plans: the adapter pins <= 8 rows to dynamic) and the monolithic dynamic kernel (refused with coded
++  scales by _impl._get_dynamic_kernel).
++"""
++from __future__ import annotations
++
++import os
++
++from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
++
++from b12x_next._lib.intrinsics import (
++    cp_async_u32_shared_global,
++    cp_async_u64_shared_global,
++    get_ptr_as_int64,
++    ld_global_b16,
++    ld_global_nc_u32,
++    ld_global_nc_v2_u32,
++    ld_shared_u32,
++    ld_shared_v2_u32,
++    st_shared_u32,
++    st_shared_v4_u32,
++)
++
++CODE_HEADER_BYTES = 16
++ENV = "B12X_NEXT_W4A8_SCALE_CODES"
++
++
++def scale_codes_enabled() -> bool:
++    """Process-wide switch read where plans compile their compact launches (the dynamic path keys on the
++    tensors' dtype instead). The ds41 adapter sets it from DSV41_MOE_SCALE_CODES before preparing plans."""
++    return os.environ.get(ENV, "0").strip() not in ("", "0", "off", "false")
++
++
++def coded_expert_bytes(native_expert_bytes: int) -> int:
++    if native_expert_bytes % 16:
++        raise ValueError(f"native expert scale bytes must be a multiple of 16, got {native_expert_bytes}")
++    return CODE_HEADER_BYTES + native_expert_bytes // 2
++
++
++def _spread16(c):
++    """Four nibbles of a 16-bit code -> four bytes."""
++    return (
++        (c & Uint32(0xF))
++        | ((c & Uint32(0xF0)) << Uint32(4))
++        | ((c & Uint32(0xF00)) << Uint32(8))
++        | ((c & Uint32(0xF000)) << Uint32(12))
++    )
++
++
++def coded_stage_16b(sfb_u32, dst_addr, expert_idx, native_expert_words, local_word):
++    """Replace ``cp_async4_shared_global(dst_addr, &native_u32[expert * native_expert_words + local_word])``.
++
++    ``local_word`` is a multiple of 4 (one 16-byte transfer). Synchronous load + expand + four st.shared: the
++    bytes land in the same slots before the stage barrier the consumer already waits on."""
++    block_words = Int64(expert_idx) * (Int64(native_expert_words) // Int64(2) + Int64(CODE_HEADER_BYTES // 4))
++    base = ld_global_nc_u32(get_ptr_as_int64(sfb_u32, block_words)) & Uint32(0xFF)
++    b4 = base * Uint32(0x01010101)
++    c0, c1 = ld_global_nc_v2_u32(
++        get_ptr_as_int64(sfb_u32, block_words + Int64(CODE_HEADER_BYTES // 4) + Int64(local_word) // Int64(2))
++    )
++    st_shared_u32(dst_addr, _spread16(c0 & Uint32(0xFFFF)) + b4)
++    st_shared_u32(dst_addr + Int32(4), _spread16(c0 >> Uint32(16)) + b4)
++    st_shared_u32(dst_addr + Int32(8), _spread16(c1 & Uint32(0xFFFF)) + b4)
++    st_shared_u32(dst_addr + Int32(12), _spread16(c1 >> Uint32(16)) + b4)
++
++
++def coded_byte(sfb_u8, expert_idx, native_expert_bytes, local_byte):
++    """The native byte ``sfb_u8[expert * native_expert_bytes + local_byte]`` from the coded buffer."""
++    block = Int64(expert_idx) * (Int64(native_expert_bytes) // Int64(2) + Int64(CODE_HEADER_BYTES))
++    lb = Int64(local_byte)
++    base = Int32(sfb_u8[block])
++    code = Int32(sfb_u8[block + Int64(CODE_HEADER_BYTES) + (lb >> Int64(1))])
++    shift = Int32(lb & Int64(1)) * Int32(4)
++    return Uint8(base + ((code >> shift) & Int32(15)))
++
++
++def coded_cp_async_16b(sfb_u32, dst_addr, expert_idx, native_expert_words, local_word):
++    """Asynchronous half of a coded 16-byte transfer (FC1). Replaces
++    ``cp_async4_shared_global(dst_addr, &native_u32[expert * native_expert_words + local_word])`` with two cp.async
++    copies into the same 16-byte slot: the expert's header word (base in byte 0) -> dst_addr, and the 8 code bytes of
++    that transfer -> dst_addr + 8 (8-byte aligned in global memory: the expert block is 16 + native/2 bytes with
++    native a multiple of 16, and local_word is a multiple of 4). The slot holds no native bytes until
++    ``coded_expand_16b`` runs after this thread's cp_async_wait_group."""
++    block_words = Int64(expert_idx) * (Int64(native_expert_words) // Int64(2) + Int64(CODE_HEADER_BYTES // 4))
++    cp_async_u32_shared_global(dst_addr, get_ptr_as_int64(sfb_u32, block_words))
++    cp_async_u64_shared_global(
++        dst_addr + Int32(8),
++        get_ptr_as_int64(sfb_u32, block_words + Int64(CODE_HEADER_BYTES // 4) + Int64(local_word) // Int64(2)),
++    )
++
++
++def coded_expand_16b(dst_addr):
++    """In-place expansion of a slot filled by ``coded_cp_async_16b`` (the same thread, after its own copies landed):
++    reads the base (+0) and the two code words (+8, +12) first, then writes the 16 native bytes in one v4 store, the
++    exact bytes the native cp.async would have written."""
++    b4 = (ld_shared_u32(dst_addr) & Uint32(0xFF)) * Uint32(0x01010101)
++    c0, c1 = ld_shared_v2_u32(dst_addr + Int32(8))
++    st_shared_v4_u32(
++        dst_addr,
++        _spread16(c0 & Uint32(0xFFFF)) + b4,
++        _spread16(c0 >> Uint32(16)) + b4,
++        _spread16(c1 & Uint32(0xFFFF)) + b4,
++        _spread16(c1 >> Uint32(16)) + b4,
++    )
++
++
++def coded_block_base(sfb_u8, expert_idx, native_expert_bytes):
++    """(first byte of the expert's coded block, its base) for the FC2 row readers; the caller loads the base once."""
++    block = Int64(expert_idx) * (Int64(native_expert_bytes) // Int64(2) + Int64(CODE_HEADER_BYTES))
++    return block, Uint32(sfb_u8[block])
++
++
++def coded_row4_u32(sfb_u8, block, base, local_byte):
++    """One N row of a K128 FC2 scale tile (phase 2, tile_cols == 4): the native bytes at expert-local offsets
++    local_byte .. local_byte + 3 as the u32 the native branch's four byte stores produce. local_byte = 4 * row + an
++    even tile offset, so the 4 codes are one aligned 16-bit load."""
++    code = ld_global_b16(get_ptr_as_int64(sfb_u8, block + Int64(CODE_HEADER_BYTES) + (Int64(local_byte) >> Int64(1))))
++    return _spread16(code & Uint32(0xFFFF)) + base * Uint32(0x01010101)
++
++
++def coded_row2_u32(sfb_u8, block, base, local_byte):
++    """The N64 K tail (tile_cols == 2): the two native bytes at local_byte, local_byte + 1 and two zero bytes above
++    them (the native branch stores 0 for kb >= tile_cols); one 8-bit code load."""
++    code = Uint32(sfb_u8[block + Int64(CODE_HEADER_BYTES) + (Int64(local_byte) >> Int64(1))])
++    return _spread16(code & Uint32(0xFF)) + base * Uint32(0x0101)
+--- b12x_next/moe/fused_moe/_impl.py
++++ b12x_next/moe/fused_moe/_impl.py
+@@ -10728,6 +10728,7 @@
+     quant_mode: str = "nvfp4",
+     w4a8_repacked: bool = False,
+     w4a8_n64_repacked: bool = False,
++    w4a8_coded_scales: bool = False,
+     nvfp4_materialize_intermediate: bool = False,
+     direct_routing: bool = False,
+     external_route_plan: bool = False,
+@@ -10796,6 +10797,8 @@
+     ) or (quant_mode == "nvfp4" and nvfp4_materialize_intermediate)
+     if w4a8_n64_repacked and not w4a8_repacked:
+         raise ValueError("w4a8_n64_repacked requires repacked W4A8 weights")
++    if w4a8_coded_scales and not w4a8_n64_repacked:
++        raise ValueError("w4a8_coded_scales (ds41 scale codes) requires the N64 repack")
+     if w4a8_n64_repacked and n % 64 != 0:
+         raise ValueError("w4a8_n64_repacked requires N divisible by 64")
+     if w4a8_n64_repacked:
+@@ -10847,6 +10850,8 @@
+         str(work_source),
+         bool(w4a8_repacked),
+         bool(w4a8_n64_repacked),
++        # ds41 scale codes: appended only when on, so the native key (and compile cache entry) is unchanged
++        *(("w4a8_coded_scales",) if w4a8_coded_scales else ()),
+         bool(direct_routing),
+         bool(external_route_plan),
+         bool(materialize_intermediate),
+@@ -10922,11 +10927,18 @@
+         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
+         kernel_kwargs["w4a8_n64_repacked"] = w4a8_n64_repacked
+         kernel_kwargs["w4a8_n64_tail"] = bool(w4a8_n64_repacked and n % 128)
++        if w4a8_coded_scales:
++            kernel_kwargs["w4a8_coded_scales"] = True
+     elif is_w6a8:
+         # mxfp6_fmt_a/mxfp6_fmt_b stay at the ctor defaults ("e4m3" MXFP8
+         # activations against "e2m3" FP6 weights).
+         kernel_kwargs["quant_recipe"] = quant_mode
+     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
++    if w4a8_coded_scales and not (getattr(kernel, "external_materialized_fc1", False)
++                                  and getattr(kernel, "external_materialized_fc2", False)):
++        # ds41 scale codes are qualified on the split-materialized phase kernels only (REVIEW_sol_scalecodes R4)
++        raise ValueError("ds41 scale codes: this dynamic plan would stage coded scales in the monolithic kernel; "
++                         "refused (only split-materialized FC1/FC2 are qualified)")
+     if prequantized:
+         if not (kernel.w4a8_split_materialized and not kernel.w4a8_m1_materialized
+                 and not kernel.w4a8_trellis and kernel.share_input_across_experts):
+@@ -11323,6 +11335,13 @@
+     # the sfb slot (the QMMA repack stores int32 scale words there); the
+     # trellis geometry is recovered from the operand extents.
+     w4a8_trellis = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
++    # ds41 scale codes: a coded binding carries uint8 code buffers (4-bit codes + per-expert base) in the
++    # sfb slots; the native one int32 words. Both slots must agree.
++    w4a8_coded_scales = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.uint8
++    if w4a8_coded_scales != (_is_w4a8_quant_mode(quant_mode) and down_sfb_rp.dtype == torch.uint8):
++        raise ValueError("ds41 scale codes: w13 and down scale slots disagree on the coded format")
++    if w4a8_coded_scales and not w4a8_n64_repacked:
++        raise ValueError("ds41 scale codes: coded scales reached a non-N64 W4A8 launch")
+     trellis_bits = 0
+     trellis_intermediate_hadamard = False
+     trellis_lut_tensor = None
+@@ -11507,6 +11526,7 @@
+         quant_mode=quant_mode,
+         w4a8_repacked=w4a8_repacked,
+         w4a8_n64_repacked=w4a8_n64_repacked,
++        w4a8_coded_scales=w4a8_coded_scales,
+         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+         direct_routing=direct_routing,
+         external_route_plan=external_route_plan,
+--- b12x_next/moe/fused_moe/_preparation.py
++++ b12x_next/moe/fused_moe/_preparation.py
+@@ -546,6 +546,8 @@
+     from b12x_next._lib.quant.mxfp8_rows import _get_compiled_mxfp8_rows_quant, mxfp8_rows_quant_launch_options
+     from b12x_next._lib.utils import get_num_sm
+     from b12x_next.moe._shared.kernels.w4a8_compact_micro import _compiled_direct_w4a8_compact
++    from b12x_next.moe._shared.kernels.w4a8_compact_micro import note_prepared_format
++    from b12x_next.moe._shared.kernels.w4a8_scale_codes import scale_codes_enabled
+     from b12x_next.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
+ 
+     m = plan.max_rows // plan.num_topk
+@@ -559,8 +561,10 @@
+         dtype: _compiled_direct_w4a8_compact(
+             ordinal, m, plan.num_topk, plan.k, plan.n, plan.weight_E, dtype,
+             plan.weight_E, plan.weight_E, plan.swiglu_limit, caps.w4a16_fast_math,
++            scale_codes_enabled(),
+         ) for dtype in (torch.int32, torch.int64)
+     }
++    note_prepared_format(kernels, scale_codes_enabled())     # ds41 scale codes: the launch refuses a format mismatch
+     topk_sum = compile_w4a16_topk_sum(m=m, topk=plan.num_topk, hidden_size=plan.k)
+     return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum),
+                            tuple(kernels.values()), quantize, topk_sum)

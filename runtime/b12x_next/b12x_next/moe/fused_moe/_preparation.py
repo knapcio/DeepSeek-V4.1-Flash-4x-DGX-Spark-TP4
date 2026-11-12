@@ -546,6 +546,8 @@ def _compact_launches(plan, caps):
     from b12x_next._lib.quant.mxfp8_rows import _get_compiled_mxfp8_rows_quant, mxfp8_rows_quant_launch_options
     from b12x_next._lib.utils import get_num_sm
     from b12x_next.moe._shared.kernels.w4a8_compact_micro import _compiled_direct_w4a8_compact
+    from b12x_next.moe._shared.kernels.w4a8_compact_micro import note_prepared_format
+    from b12x_next.moe._shared.kernels.w4a8_scale_codes import scale_codes_enabled
     from b12x_next.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
 
     m = plan.max_rows // plan.num_topk
@@ -559,8 +561,10 @@ def _compact_launches(plan, caps):
         dtype: _compiled_direct_w4a8_compact(
             ordinal, m, plan.num_topk, plan.k, plan.n, plan.weight_E, dtype,
             plan.weight_E, plan.weight_E, plan.swiglu_limit, caps.w4a16_fast_math,
+            scale_codes_enabled(),
         ) for dtype in (torch.int32, torch.int64)
     }
+    note_prepared_format(kernels, scale_codes_enabled())     # ds41 scale codes: the launch refuses a format mismatch
     topk_sum = compile_w4a16_topk_sum(m=m, topk=plan.num_topk, hidden_size=plan.k)
     return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum),
                            tuple(kernels.values()), quantize, topk_sum)

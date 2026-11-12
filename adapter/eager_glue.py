@@ -297,13 +297,12 @@ def _vcapk_update(vc, confidence, bs):
 
 
 def _launch_vcapk(vc, confidence, bs, out):
-    thr = vc._state["thr"]
+    # verify_cap's threshold for this batch size (DSV41_VERIFY_CAP's per-bs table); a draft graph is captured per bs, so
+    # its constant is that bs's
+    thr = vc.thresholds(bs)
     thr_t = None
     if isinstance(thr, list):
-        thr_t = vc._state.get("thr_t")
-        if thr_t is None or thr_t.device != confidence.device:
-            t = (thr + [thr[-1]] * 5)[:5]
-            thr_t = vc._state["thr_t"] = torch.tensor(t, dtype=torch.float32, device=confidence.device)
+        thr_t = vc.thr_tensor(thr, 5, confidence.device)
     _vcap_kernel[(1,)](confidence, confidence.stride(0), out, thr_t if thr_t is not None else out,
                        0.0 if thr_t is not None else float(thr), bs, int(vc._state["kmin"]), vc.STRIDE - 1,
                        ORDER=0 if bs == 1 else 1, THR_T=thr_t is not None,

@@ -188,8 +188,9 @@ def test_wrapper_order():
 def test_every_wrapper_unwraps_to_engine():
     """Every install_* of l2_prefetch, every install-time sub-gate on: each engine attribute it replaced unwraps to
     the stock function (the sweep compares every callable of the fake modules, so it catches a new wrapper too).
-    Nine wrappers: no v5 SHPF in this tree, so DeepseekV2MoE._forward_shared_experts and
-    DeepseekV4DecoderLayer._hc_mix_stats must stay the engine's own."""
+    Eleven wrappers: the nine of v2.7.3 plus the two v5 SHPF ones (perf/shpf-nogather-v273-20261110),
+    DeepseekV2MoE._forward_shared_experts (install_router, SHPF on or off) and DeepseekV4DecoderLayer._hc_mix_stats
+    (install_model); prefill_sp hash-pins both through inspect.unwrap."""
     import inspect
 
     def stock(name):
@@ -257,7 +258,8 @@ def test_every_wrapper_unwraps_to_engine():
               ("roce", "RoceOneshotAllReduce", "all_reduce"), ("roce", "RoceOneshotAllReduce", "all_gather"),
               ("v4", "DeepseekV4Model", "forward"), ("v4", "DeepseekV4ForCausalLM", "forward"),
               ("v4", "_apply_wo_a_bf16_matmul"), ("draft", "DeepseekV4ForCausalLMDSpark", "forward"),
-              ("engram", "EngramEmbedding", "_owned_rows")}
+              ("engram", "EngramEmbedding", "_owned_rows"),
+              ("v2", "DeepseekV2MoE", "_forward_shared_experts"), ("v4", "DeepseekV4DecoderLayer", "_hc_mix_stats")}
     assert wrapped == expect, sorted(wrapped ^ expect)
     for k in sorted(wrapped):
         w = after[k]

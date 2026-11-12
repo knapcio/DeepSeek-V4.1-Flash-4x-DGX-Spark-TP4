@@ -216,7 +216,8 @@ def same_as_stock(name, kw, calls=3, expect_error=False):
                     if a != b:
                         if a[0] == b[0] == "compiled" and len(a[2]) == len(b[2]):
                             pos = [x for x in range(len(a[2])) if a[2][x] != b[2][x]]
-                            detail += f"; compiled args differ at {pos}: {a[2][pos[0]]} vs {b[2][pos[0]]}"
+                            detail += (f"; compiled args differ at {pos}: {a[2][pos[0]]} vs {b[2][pos[0]]}" if pos
+                                       else f"; compiled kernel differs: {a[1]} vs {b[1]}")
                         else:
                             detail += f"; first event diff #{j}: {str(a)[:200]} vs {str(b)[:200]}"
                         break
@@ -264,6 +265,42 @@ n_err = sum(same_as_stock(f"too-small scratch {g}", contract(m=g, enough=False),
 check("equivalence: a too-small materialized scratch raises the same error", n_err == 2)
 check("equivalence: an unsupported planned direct routing raises the same error (production plans are grouped)",
       same_as_stock("direct m=96", contract(m=96, direct=True, tile=16), calls=2, expect_error=True))
+
+# ds41 scale codes: a coded binding (uint8 code buffers in both sfb slots) plans the coded kernel, never reuses a
+# native plan of the same scalars, and a mixed or non-N64 coded binding raises the stock error
+CODED = {}
+
+
+def coded(kw, w13=True, down=True):
+    d = dict(kw)
+    key = (kw["E"], kw["k"], kw["n"])
+    if key not in CODED:
+        CODED[key] = (torch.empty(64, dtype=U8), torch.empty(64, dtype=U8))
+    if w13:
+        d["w13_sfb_rp"] = CODED[key][0]
+    if down:
+        d["down_sfb_rp"] = CODED[key][1]
+    return d
+
+
+cgrid = [dict(m=1), dict(m=6), dict(m=34), dict(m=136, tile=64), dict(m=8, det=False, ext=True)]
+n_ok = sum(same_as_stock(f"coded {g}", coded(contract(**g))) for g in cgrid)
+check(f"scale codes: stock == prepared on {len(cgrid)} coded contracts", n_ok == len(cgrid),
+      f"{len(cgrid) - n_ok} failed")
+kc, kn = P._key(coded(contract(m=34))), P._key(contract(m=34))
+check("scale codes: coded and native bindings of the same scalars key different plans", kc != kn)
+pc, pn = P._PLANS.get(kc), P._PLANS.get(kn)
+check("scale codes: the coded plan holds the coded kernel, the native plan the native one",
+      pc is not None and pn is not None and pc.kernel_key is not None and pn.kernel_key is not None
+      and "w4a8_coded_scales" in pc.kernel_key and "w4a8_coded_scales" not in pn.kernel_key,
+      f"{getattr(pc, 'kernel_key', None)} / {getattr(pn, 'kernel_key', None)}")
+check("scale codes: w13 coded, down native raises the stock error",
+      same_as_stock("coded w13 only", coded(contract(m=34), down=False), calls=2, expect_error=True))
+check("scale codes: down coded, w13 native raises the stock error",
+      same_as_stock("coded down only", coded(contract(m=34), w13=False), calls=2, expect_error=True))
+check("scale codes: a coded non-N64 binding raises the stock error",
+      same_as_stock("coded non-N64", coded(contract(m=2048, tile=128, n64=False, n=1152)), calls=2,
+                    expect_error=True))
 
 # negative controls: the comparison catches a stale per-call pointer and a skipped barrier reset
 real_ptr, stale = P._ptr, {}
@@ -354,6 +391,22 @@ if callable(getattr(I, "prequantized_input", None)):
     with I.prequantized_input():
         check("invalidation: pre-quantized input context -> its own plan, equal to stock",
               same_as_stock("prequant", contract(m=4096, tile=64), calls=2))
+if callable(getattr(I, "evict_first_weights", None)):
+    # DSV41_MOE_EVICT_FIRST: an off plan of the same contract exists; inside evict_first_weights() the prepared body
+    # must build its own plan whose kernel is the flag-on one (cache key suffix), and off again reuses the off plan.
+    ef_kw = contract(m=6, tile=16)
+    same_as_stock("ef: off plan first", ef_kw, calls=1)
+    off_ref, _ = run(STOCK_BODY, per_call(ef_kw))
+    with I.evict_first_weights():
+        on_ref, _ = run(STOCK_BODY, per_call(ef_kw))
+        ok_on = same_as_stock("evict-first", ef_kw, calls=2)
+    tagged = [k for k in I._DYNAMIC_KERNEL_CACHE if k and k[-1] == "evict_first_weights"]
+    key_of = [e[1] for e in off_ref if e[0] == "compiled"], [e[1] for e in on_ref if e[0] == "compiled"]
+    check("invalidation: evict-first context -> its own plan (flag-on kernel), equal to stock",
+          ok_on and len(tagged) >= 1 and key_of[0] and key_of[1] and key_of[0] != key_of[1],
+          f"tagged keys {len(tagged)} compiled {key_of}")
+    check("evict-first: off again -> the off plan, equal to stock", same_as_stock("ef off again", ef_kw, calls=2))
+    check("evict-first: the prepared key carries the state", P._evict_first(I) is False)
 
 # fallbacks
 before = P._STATE["stock"]

@@ -1,0 +1,454 @@
+L2 evict_first cache policy on the routed-expert weight copies of the split-materialized W4A8
+phase kernels (W4A8MaterializedPhase1Kernel FC1 / W4A8MaterializedPhase2Kernel FC2), requested per
+launch with fused_moe._impl.evict_first_weights() (adapter/moe_b12x_next.py, DSV41_MOE_EVICT_FIRST,
+decode-sized CUDA-graph captures only). New intrinsic cp_async4_shared_global_l2hint
+(cp.async.cg.shared.global.L2::cache_hint [smem], [gmem], 16, policy) with the policy from the
+existing create_l2_evict_first_policy (createpolicy.fractional.L2::evict_first.b64 policy, 1.0),
+created once per thread at kernel entry. A compile-time flag on both phase kernels; the dynamic
+kernel cache key gains ("evict_first_weights",) only when on, so the stock kernels and their keys
+are unchanged and both coexist in one process. Weight scale words (SFB), activations, the
+intermediate and outputs keep the default policy.
+Idea: Christopher Owen, spark-ds41f #966 (Apache-2.0), there on TileLang TMA weight loads; this is
+a port to the b12x CuTe kernels. Applies after scale-codes; the coded phase kernels share the same weight
+copies (their scale staging is unchanged). Apache License 2.0 (runtime/b12x_next/LICENSE).
+
+--- b12x_next/_lib/intrinsics.py
++++ b12x_next/_lib/intrinsics.py
+@@ -1481,6 +1481,39 @@
+ 
+ 
+ @dsl_user_op
++def cp_async4_shared_global_l2hint(
++    smem_addr: Int32, gmem_addr: Int64, cache_policy: Uint64, *, loc=None, ip=None
++):
++    """16-byte `cp.async.cg.shared.global` copy with an explicit L2 cache policy.
++
++    ds41 patch (b12x_next only): ``cache_policy`` comes from ``create_l2_evict_first_policy``
++    (created once per thread, outside the load loops). Same bytes as ``cp_async4_shared_global``;
++    the policy only changes the L2 replacement priority of the lines the copy brings in.
++
++    The shared destination is passed as a 64-bit shared-window address (zero-extended, then
++    round-tripped through the generic window: the same address). With the plain 32-bit operand,
++    ptxas (CUDA 13.0, sm_121a) folds a uniform shared offset into the LDGSTS and builds that
++    offset in the low register of the cache-policy descriptor pair, so the copy reads a corrupt
++    descriptor (CUDA_ERROR_ILLEGAL_INSTRUCTION at run time).
++    """
++    llvm.inline_asm(
++        None,
++        [
++            Int32(smem_addr).ir_value(loc=loc, ip=ip),
++            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
++            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
++        ],
++        "{ .reg .u64 ef_a, ef_g; cvt.u64.u32 ef_a, $0; cvta.shared.u64 ef_g, ef_a; cvta.to.shared.u64 ef_a, ef_g; cp.async.cg.shared.global.L2::cache_hint [ef_a], [$1], 16, $2; }",
++        "r,l,l",
++        has_side_effects=True,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
+ def cp_async4_shared_global_pred(
+     smem_addr: Int32, gmem_addr: Int64, pred: Int32, *, loc=None, ip=None
+ ):
+--- b12x_next/moe/_shared/kernels/w4a8_phase1.py
++++ b12x_next/moe/_shared/kernels/w4a8_phase1.py
+@@ -23,7 +23,9 @@
+ from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_cp_async_16b, coded_expand_16b
+ from b12x_next._lib.intrinsics import (
+     cp_async4_shared_global,
++    cp_async4_shared_global_l2hint,
+     cp_async_u32_shared_global,
++    create_l2_evict_first_policy,
+     e2m1x8_to_qmma_e2m1x8,
+     fabs_f32,
+     get_ptr_as_int64,
+@@ -77,8 +79,14 @@
+         n64_repacked: bool = False,
+         n64_tail: bool = False,
+         coded_scales: bool = False,
++        evict_first_weights: bool = False,
+     ):
+         self.fast_math = bool(fast_math)
++        # ds41 patch (b12x_next only): the routed-expert FC1 weight copies (packed B, N64 and N256
++        # repacked layouts; not the trellis windows, the SFB scale words, A or SFA) carry an L2
++        # evict_first cache policy. Set by fused_moe._impl._get_dynamic_kernel under
++        # evict_first_weights() (decode-sized launches); compile-time, so False emits the stock code.
++        self.evict_first_weights = bool(evict_first_weights)
+         # ds41 scale-codes: w13_sfb_rp holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
+         self.coded_scales = bool(coded_scales)
+         if self.coded_scales and not n64_repacked:
+@@ -203,6 +211,7 @@
+         packed_half: Int32,
+         k_half: Int32,
+         tid: Int32,
++        ef_policy=None,
+     ):
+         # Prepared weights are [K32, N32-chunk, lane, n8-in-chunk].  Select
+         # two K32 blocks and one tile_n part from the enclosing N256xK128 tile.
+@@ -225,11 +234,18 @@
+                         * Int32(32 * 4)
+                     )
+                     + Int64(lane * Int32(4))
+-                )
+-                cp_async4_shared_global(
+-                    dst_base + (idx << Int32(4)),
+-                    get_ptr_as_int64(weights, src_word),
+                 )
++                if cutlass.const_expr(self.evict_first_weights):
++                    cp_async4_shared_global_l2hint(
++                        dst_base + (idx << Int32(4)),
++                        get_ptr_as_int64(weights, src_word),
++                        ef_policy,
++                    )
++                else:
++                    cp_async4_shared_global(
++                        dst_base + (idx << Int32(4)),
++                        get_ptr_as_int64(weights, src_word),
++                    )
+ 
+     @cute.jit
+     def _stage_sfb_half(
+@@ -269,6 +285,7 @@
+         intermediate_tiles: Int32,
+         total_k32: cutlass.Constexpr,
+         tid: Int32,
++        ef_policy=None,
+     ):
+         logical_n = intermediate_tiles * Int32(128)
+         if cutlass.const_expr(self.n64_tail):
+@@ -302,10 +319,17 @@
+                         + Int64(n32 * Int32(128))
+                         + Int64(lane * Int32(4))
+                     )
+-                    cp_async4_shared_global(
+-                        dst_addr,
+-                        get_ptr_as_int64(weights, source_word),
+-                    )
++                    if cutlass.const_expr(self.evict_first_weights):
++                        cp_async4_shared_global_l2hint(
++                            dst_addr,
++                            get_ptr_as_int64(weights, source_word),
++                            ef_policy,
++                        )
++                    else:
++                        cp_async4_shared_global(
++                            dst_addr,
++                            get_ptr_as_int64(weights, source_word),
++                        )
+                 else:
+                     st_shared_u32(dst_addr, Uint32(0))
+                     st_shared_u32(dst_addr + Int32(4), Uint32(0))
+@@ -419,6 +443,7 @@
+         input_k128_tiles: Int32,
+         intermediate_tiles: Int32,
+         packed_w13_tiles: Int32,
++        ef_policy=None,
+     ):
+         stage = k64_slice & Int32(self.stages - 1)
+         stage_base = smem_base + stage * Int32(self.stage_bytes)
+@@ -535,6 +560,7 @@
+                 intermediate_tiles,
+                 total_k32,
+                 tid,
++                ef_policy,
+             )
+             self._stage_n64_b_k64(
+                 w13_rp,
+@@ -546,6 +572,7 @@
+                 intermediate_tiles,
+                 total_k32,
+                 tid,
++                ef_policy,
+             )
+             self._stage_n64_sfb(
+                 w13_sfb_rp,
+@@ -577,6 +604,7 @@
+                 gate_packed_half,
+                 k_half,
+                 tid,
++                ef_policy,
+             )
+             self._stage_b_half_k64(
+                 w13_rp,
+@@ -585,6 +613,7 @@
+                 up_packed_half,
+                 k_half,
+                 tid,
++                ef_policy,
+             )
+             self._stage_sfb_half(
+                 w13_sfb_rp,
+@@ -658,6 +687,7 @@
+         input_k128_tiles: Int32,
+         intermediate_tiles: Int32,
+         packed_w13_tiles: Int32,
++        ef_policy=None,
+     ):
+         lane = tid & Int32(31)
+         q = lane >> Int32(2)
+@@ -693,6 +723,7 @@
+                     input_k128_tiles,
+                     intermediate_tiles,
+                     packed_w13_tiles,
++                    ef_policy,
+                 )
+             cute.arch.cp_async_commit_group()
+ 
+@@ -749,6 +780,7 @@
+                     input_k128_tiles,
+                     intermediate_tiles,
+                     packed_w13_tiles,
++                    ef_policy,
+                 )
+             cute.arch.cp_async_commit_group()
+             cute.arch.cp_async_wait_group(self.stages - 1)
+@@ -1304,6 +1336,10 @@
+                 lut_copy_i += Int32(self.threads_per_cta)
+             cute.arch.sync_threads()
+ 
++        # ds41 patch: one L2 evict_first policy per thread for every task's expert-weight copies.
++        ef_policy = None
++        if cutlass.const_expr(self.evict_first_weights):
++            ef_policy = create_l2_evict_first_policy()
+         rows_capacity = Int32(token_map.shape[0])
+         output_tiles = intermediate_tiles
+         num_experts = Int32(expert_tile_base.shape[0] - 1)
+@@ -1344,6 +1380,7 @@
+                     input_k128_tiles,
+                     intermediate_tiles,
+                     packed_w13_tiles,
++                    ef_policy,
+                 )
+             task_slot += Int32(gdimz)
+ 
+--- b12x_next/moe/_shared/kernels/w4a8_phase2.py
++++ b12x_next/moe/_shared/kernels/w4a8_phase2.py
+@@ -19,7 +19,9 @@
+ from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_block_base, coded_row2_u32, coded_row4_u32
+ from b12x_next._lib.intrinsics import (
+     cp_async4_shared_global,
++    cp_async4_shared_global_l2hint,
+     cp_async_u32_shared_global,
++    create_l2_evict_first_policy,
+     e2m1x8_to_qmma_e2m1x8,
+     get_ptr_as_int64,
+     ld_shared_u32,
+@@ -80,7 +82,14 @@
+         n64_tail: bool = False,
+         direct_routes: bool = False,
+         coded_scales: bool = False,
++        evict_first_weights: bool = False,
+     ):
++        # ds41 patch (b12x_next only): the routed-expert FC2 weight copies (packed B, N64 and N256
++        # repacked layouts; not the trellis windows, the SFB scale words, the intermediate A / SFA or
++        # the scatter output) carry an L2 evict_first cache policy. Set by
++        # fused_moe._impl._get_dynamic_kernel under evict_first_weights() (decode-sized launches);
++        # compile-time, so False emits the stock code.
++        self.evict_first_weights = bool(evict_first_weights)
+         self.n64_repacked = bool(n64_repacked)
+         self.n64_tail = bool(n64_tail)
+         # ds41 scale-codes: down_sfb_rp holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
+@@ -194,6 +203,7 @@
+         total_output_tiles: Int32,
+         total_k32: cutlass.Constexpr,
+         tid: Int32,
++        ef_policy=None,
+     ):
+         transfers = 4 * 4 * 32
+         total_output_n = total_output_tiles * Int32(128)
+@@ -223,10 +233,17 @@
+                         + Int64(n32 * Int32(128))
+                         + Int64(lane * Int32(4))
+                     )
+-                    cp_async4_shared_global(
+-                        dst_addr,
+-                        get_ptr_as_int64(weights, source_word),
+-                    )
++                    if cutlass.const_expr(self.evict_first_weights):
++                        cp_async4_shared_global_l2hint(
++                            dst_addr,
++                            get_ptr_as_int64(weights, source_word),
++                            ef_policy,
++                        )
++                    else:
++                        cp_async4_shared_global(
++                            dst_addr,
++                            get_ptr_as_int64(weights, source_word),
++                        )
+                 else:
+                     st_shared_u32(dst_addr, Uint32(0))
+                     st_shared_u32(dst_addr + Int32(4), Uint32(0))
+@@ -306,6 +323,7 @@
+         rows_capacity: Int32,
+         intermediate_tiles: Int32,
+         packed_output_tiles: Int32,
++        ef_policy=None,
+     ):
+         stage = intermediate_slice & Int32(self.stages - 1)
+         a_base = smem_base + stage * Int32(self.a_stage_bytes)
+@@ -417,6 +435,7 @@
+                 total_output_tiles,
+                 total_k32,
+                 tid,
++                ef_policy,
+             )
+             self._stage_n64_sfb(
+                 down_sfb_rp,
+@@ -456,10 +475,17 @@
+                         + Int64((packed_n32 + chunk) * Int32(32 * 4))
+                         + Int64(lane * Int32(4))
+                     )
+-                    cp_async4_shared_global(
+-                        b_base + (idx << Int32(4)),
+-                        get_ptr_as_int64(down_rp, src_word),
+-                    )
++                    if cutlass.const_expr(self.evict_first_weights):
++                        cp_async4_shared_global_l2hint(
++                            b_base + (idx << Int32(4)),
++                            get_ptr_as_int64(down_rp, src_word),
++                            ef_policy,
++                        )
++                    else:
++                        cp_async4_shared_global(
++                            b_base + (idx << Int32(4)),
++                            get_ptr_as_int64(down_rp, src_word),
++                        )
+ 
+             # An N32 chunk has four N8 scale rows, each with eight K16 words.
+             sfb_word_base = Int64(b_tile) * Int64(256)
+@@ -500,6 +526,7 @@
+         rows_capacity: Int32,
+         intermediate_tiles: Int32,
+         packed_output_tiles: Int32,
++        ef_policy=None,
+     ):
+         lane = tid & Int32(31)
+         q = lane >> Int32(2)
+@@ -534,6 +561,7 @@
+                     rows_capacity,
+                     intermediate_tiles,
+                     packed_output_tiles,
++                    ef_policy,
+                 )
+             cute.arch.cp_async_commit_group()
+ 
+@@ -583,6 +611,7 @@
+                     rows_capacity,
+                     intermediate_tiles,
+                     packed_output_tiles,
++                    ef_policy,
+                 )
+             cute.arch.cp_async_commit_group()
+             cute.arch.cp_async_wait_group(self.stages - 1)
+@@ -842,6 +871,10 @@
+                 lut_copy_i += Int32(self.threads_per_cta)
+             cute.arch.sync_threads()
+ 
++        # ds41 patch: one L2 evict_first policy per thread for every task's expert-weight copies.
++        ef_policy = None
++        if cutlass.const_expr(self.evict_first_weights):
++            ef_policy = create_l2_evict_first_policy()
+         rows_capacity = Int32(token_map.shape[0])
+         output_tiles = packed_output_tiles * Int32(256 // self.tile_n)
+         if cutlass.const_expr(self.direct_routes):
+@@ -895,6 +928,7 @@
+                     rows_capacity,
+                     intermediate_tiles,
+                     packed_output_tiles,
++                    ef_policy,
+                 )
+             elif cutlass.const_expr(self.direct_routes):
+                 if tid < Int32(self.tile_n):
+--- b12x_next/moe/fused_moe/_impl.py
++++ b12x_next/moe/fused_moe/_impl.py
+@@ -2165,6 +2165,50 @@
+ 
+ def _prequantized_input_requested() -> bool:
+     return bool(getattr(_PREQUANT_STATE, "on", False))
++
++
++# ds41 patch (b12x_next only): L2 evict_first on the routed-expert weight copies. Inside
++# ``evict_first_weights()`` a dynamic launch whose FC1 / FC2 run in the split-materialized W4A8-MX
++# phase kernels (W4A8MaterializedPhase1Kernel / W4A8MaterializedPhase2Kernel: compact N64 M16, or
++# M64 / M128 tiles) resolves the specialization whose packed expert-weight cp.async copies carry
++# ``createpolicy.fractional.L2::evict_first`` (one policy per thread). Every other byte (activations,
++# A / weight scales, the materialized intermediate, route / scatter buffers) keeps the default
++# policy. A decode step streams each routed expert's weights once, so marking them first in L2's
++# replacement order keeps lines other kernels reuse (prefetched shared-expert / wo weights, the
++# gathered input, the intermediate) resident. Only the L2 replacement priority changes: the bytes
++# copied, the arithmetic and the launch geometry are the same, so outputs are bit-identical.
++# Launches that do not use those phase kernels ignore the request (the stock kernel, stock key).
++# Idea: Christopher Owen, spark-ds41f #966 (Apache-2.0), there on TileLang TMA weight loads.
++_EVICT_FIRST_STATE = threading.local()
++_EVICT_FIRST_KEY = "evict_first_weights"
++EVICT_FIRST_STATS = {"compiled": 0, "ineligible": 0}
++
++
++@contextmanager
++def evict_first_weights():
++    prev = getattr(_EVICT_FIRST_STATE, "on", False)
++    _EVICT_FIRST_STATE.on = True
++    try:
++        yield
++    finally:
++        _EVICT_FIRST_STATE.on = prev
++
++
++def _evict_first_weights_requested() -> bool:
++    return bool(getattr(_EVICT_FIRST_STATE, "on", False))
++
++
++def _evict_first_weights_eligible(
++    *, is_w4a8: bool, trellis_bits: int, w4a8_repacked: bool, w4a8_n64_repacked: bool,
++    materialize_intermediate: bool, mma_tiler_mn,
++) -> bool:
++    """True when the dynamic kernel runs FC1 / FC2 in the W4A8 split-materialized phase kernels
++    (mirrors MoEDynamicKernelBackend.w4a8_split_materialized; trellis windows are excluded)."""
++    tile = tuple(int(v) for v in mma_tiler_mn)
++    return bool(
++        is_w4a8 and int(trellis_bits) == 0 and w4a8_repacked and materialize_intermediate
++        and ((w4a8_n64_repacked and tile == (16, 128)) or tile in ((64, 128), (128, 128)))
++    )
+ 
+ 
+ # ds41 patch (b12x_next only): accumulate-into-output top-k sum (prefill residual fold). Inside
+@@ -10893,6 +10937,19 @@
+                 f"direct_routing={direct_routing})"
+             )
+         cache_key = cache_key + ("prequantized_input",)
++    evict_first = bool(
++        _evict_first_weights_requested()
++        and _evict_first_weights_eligible(
++            is_w4a8=is_w4a8, trellis_bits=trellis_bits, w4a8_repacked=w4a8_repacked,
++            w4a8_n64_repacked=w4a8_n64_repacked,
++            materialize_intermediate=materialize_intermediate, mma_tiler_mn=mma_tiler_mn,
++        )
++    )
++    if evict_first:
++        # ds41 patch: appended only when on, so every existing key (and its object cache) is unchanged
++        cache_key = cache_key + (_EVICT_FIRST_KEY,)
++    elif _evict_first_weights_requested():
++        EVICT_FIRST_STATS["ineligible"] += 1
+     reuse_compiled = _first_env(
+         "B12X_NEXT_DYNAMIC_REUSE_COMPILED",
+         "B12X_NEXT_LEVEL10_REUSE_COMPILED",
+@@ -10970,6 +11027,15 @@
+                 f"split-materialized W4A8-MX front-end (tile {tuple(mma_tiler_mn)})"
+             )
+         kernel.prequantized_input = True
++    if evict_first:
++        if not (kernel.w4a8_split_materialized and not kernel.w4a8_trellis):
++            raise ValueError(
++                "evict_first_weights: the resolved dynamic kernel does not run the W4A8 "
++                f"split-materialized phase kernels (tile {tuple(mma_tiler_mn)})"
++            )
++        kernel.materialized_phase1_kernel.evict_first_weights = True
++        kernel.materialized_phase2_kernel.evict_first_weights = True
++        EVICT_FIRST_STATS["compiled"] += 1
+     if is_w4a8:
+         launch = _DynamicMoEW4A8Launch(
+             kernel,

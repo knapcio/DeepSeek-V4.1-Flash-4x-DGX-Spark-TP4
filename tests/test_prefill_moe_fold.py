@@ -394,7 +394,10 @@ class RuntimePatch(unittest.TestCase):
         import hashlib
         build = self.read(ROOT, "scripts", "build_b12x_next.sh")
         names = re.findall(r'"\$HERE/b12x_next-([a-z0-9-]+)\.patch"', build)
-        self.assertEqual(names[-1], "topk-sum-accumulate")
+        # right after the five base patches; v2.7.5 appends scale-codes and evict-first after it, which extend
+        # SOURCE_PATCH below
+        self.assertIn("topk-sum-accumulate", names)
+        self.assertEqual(names.index("topk-sum-accumulate"), names.index("claim-barrier") + 1)
         blob = b""
         for n in names:
             with open(os.path.join(ROOT, "scripts", f"b12x_next-{n}.patch"), "rb") as f:
@@ -485,7 +488,7 @@ class Engine(unittest.TestCase):
                 return self._compute(store["x"], ids, w, out)
 
         geom = Geom()
-        st = types.SimpleNamespace(geom=geom, impl=object(), hidden=K)
+        st = types.SimpleNamespace(geom=geom, impl=object(), hidden=K, coded_impl=None)   # _LayerState fields the stock path reads (coded_impl: scale codes, retain mode)
         w13 = torch.zeros(4)
         mbn._LAYERS[w13.data_ptr()] = st
 

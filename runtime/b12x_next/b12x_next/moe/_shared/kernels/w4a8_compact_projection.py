@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
+from b12x_next.moe._shared.kernels.w4a8_scale_codes import coded_stage_16b
 from b12x_next._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
@@ -31,7 +32,7 @@ class W4A8CompactMicroProjectionKernel:
     num_warps = 4
     threads_per_cta = 128
 
-    def __init__(self, k: int, n: int, num_topk: int):
+    def __init__(self, k: int, n: int, num_topk: int, coded_scales: bool = False):
         if k <= 0 or n < 64 or k % 128 or n % 64:
             raise ValueError(
                 "compact W4A8 projection requires K divisible by 128 and "
@@ -44,6 +45,10 @@ class W4A8CompactMicroProjectionKernel:
         self.num_topk = int(num_topk)
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
         self.n64_tail = self.n % self.tile_n == 64
+        # ds41 scale-codes: w13_scales holds 4-bit codes + a per-expert base (w4a8_scale_codes.py)
+        self.coded_scales = bool(coded_scales)
+        if self.coded_scales and self.n % 128 != 64:
+            raise ValueError("coded W4A8 scales require the N64 repack (N % 128 == 64)")
         self.b_payload_bytes = self.tile_n * self.tile_k // 2
         self.sfb_bytes = (self.tile_n // 8) * 8 * 4
         self.a_offset = 0
@@ -197,16 +202,27 @@ class W4A8CompactMicroProjectionKernel:
         if tid < Int32(32):
             dst_addr = dst_base + (tid << Int32(4))
             if tid < n_rows // Int32(4):
-                source_word = (
-                    Int64(expert_idx) * Int64(self.n * (self.k // 32) // 2)
-                    + Int64(projection) * Int64(self.n * (self.k // 32) // 4)
-                    + Int64(output_tile) * Int64(128 * (self.k // 32) // 4)
-                    + Int64(k128_slice * n_rows + tid * Int32(4))
-                )
-                cp_async4_shared_global(
-                    dst_addr,
-                    get_ptr_as_int64(scales, source_word),
-                )
+                if cutlass.const_expr(self.coded_scales):
+                    coded_stage_16b(
+                        scales,
+                        dst_addr,
+                        expert_idx,
+                        Int64(self.n * (self.k // 32) // 2),
+                        Int64(projection) * Int64(self.n * (self.k // 32) // 4)
+                        + Int64(output_tile) * Int64(128 * (self.k // 32) // 4)
+                        + Int64(k128_slice * n_rows + tid * Int32(4)),
+                    )
+                else:
+                    source_word = (
+                        Int64(expert_idx) * Int64(self.n * (self.k // 32) // 2)
+                        + Int64(projection) * Int64(self.n * (self.k // 32) // 4)
+                        + Int64(output_tile) * Int64(128 * (self.k // 32) // 4)
+                        + Int64(k128_slice * n_rows + tid * Int32(4))
+                    )
+                    cp_async4_shared_global(
+                        dst_addr,
+                        get_ptr_as_int64(scales, source_word),
+                    )
             else:
                 st_shared_u32(dst_addr, Uint32(0))
                 st_shared_u32(dst_addr + Int32(4), Uint32(0))

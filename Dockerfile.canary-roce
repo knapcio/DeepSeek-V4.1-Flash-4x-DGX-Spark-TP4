@@ -196,6 +196,14 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_fast_load_slab.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_moe_b12x_next_cpu.py \
  && PYTHONPATH=/opt/b12x_next python3 /opt/dsv41/tests/test_b12x_next_claim_barrier.py \
+ && CUDA_VISIBLE_DEVICES= DSV41_SGLANG_SOURCE_ROOT=/sgl-workspace/sglang/python PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_scale_codes.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_gpu_gate_compare.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_scale_codes_kernels.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_scale_codes_retain.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter:/opt/b12x_next python3 /opt/dsv41/tests/test_moe_evict_first.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_l2_prefetch_shpf.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_l2_prefetch_shpf_wob2.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_tier16_levers.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_wo_a_w8.py \
  && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_wo_a_w8_evict_first.py \
  && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=0 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_wo_a_w8_evict_first.py \

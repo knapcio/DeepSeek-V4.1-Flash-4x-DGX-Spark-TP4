@@ -1481,6 +1481,39 @@ def cp_async4_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=
 
 
 @dsl_user_op
+def cp_async4_shared_global_l2hint(
+    smem_addr: Int32, gmem_addr: Int64, cache_policy: Uint64, *, loc=None, ip=None
+):
+    """16-byte `cp.async.cg.shared.global` copy with an explicit L2 cache policy.
+
+    ds41 patch (b12x_next only): ``cache_policy`` comes from ``create_l2_evict_first_policy``
+    (created once per thread, outside the load loops). Same bytes as ``cp_async4_shared_global``;
+    the policy only changes the L2 replacement priority of the lines the copy brings in.
+
+    The shared destination is passed as a 64-bit shared-window address (zero-extended, then
+    round-tripped through the generic window: the same address). With the plain 32-bit operand,
+    ptxas (CUDA 13.0, sm_121a) folds a uniform shared offset into the LDGSTS and builds that
+    offset in the low register of the cache-policy descriptor pair, so the copy reads a corrupt
+    descriptor (CUDA_ERROR_ILLEGAL_INSTRUCTION at run time).
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .u64 ef_a, ef_g; cvt.u64.u32 ef_a, $0; cvta.shared.u64 ef_g, ef_a; cvta.to.shared.u64 ef_a, ef_g; cp.async.cg.shared.global.L2::cache_hint [ef_a], [$1], 16, $2; }",
+        "r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cp_async4_shared_global_pred(
     smem_addr: Int32, gmem_addr: Int64, pred: Int32, *, loc=None, ip=None
 ):
