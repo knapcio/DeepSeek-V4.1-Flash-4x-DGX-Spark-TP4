@@ -4,6 +4,66 @@ Every dated table, note and rejected experiment that used to live in the README,
 
 The rows from before the sparkDash 1.8.8 sections were taken with sparkDash up to 1.8.6. sparkDash 1.8.7 replaced the code prompts (c1 and the concurrent waves), so those code columns are not comparable with the 1.8.8 tables; the prose, structured and prefill prompts are unchanged. From v2.6 (2026-10-27) the README reports speedbench only.
 
+## v2.7.5 release, 2026-11-12, speedbench (the README's current results until v2.7.6)
+
+The README's v2.7.5 results and release gate, moved here (headings demoted, links adjusted, text unchanged) when v2.7.6 was released on 2026-11-12. The v2.7.6 numbers are in the [README](../README.md#current-results).
+
+**v2.7.5** (2026-11-12, in production on the four Sparks since 2026-11-12 05:39) is v2.7.4 plus three lossless decode changes in the production profile. The routed experts' scales run as 4-bit codes inside the decode / verify / draft CUDA graphs of two or more rows, beside the native scales (`DSV41_MOE_SCALE_CODES=1 DSV41_MOE_SCALE_CODES_MIN_ROWS=2`, +2.03 GiB per rank; expanded into the same bytes, outputs bit-identical), and the routed-expert weight copies of those graphs carry an L2 evict_first policy that protects a 6 MB shared-expert prefetch window (`DSV41_MOE_EVICT_FIRST=1 DSV41_L2_PREFETCH_SHPF_MB=6 DSV41_L2_PREFETCH_SHPF_EL=0`; cache hints only); the draft-confidence verify threshold is 0.25 at batch sizes 4-7 (`DSV41_VERIFY_CAP=conf:0.1/4:0.25/8:0.1`, 0.1 elsewhere as before; a stopping rule that never changes which token is accepted). The first two are ports of ideas from Christopher Owen's spark-ds41f. In its release gate against two v2.7.4 control boots on the official checkpoint: greedy decode c1 **+1.8 %**, c4 **+3.4 %**, c8 **+2.7 %** and c16 +0.6 % (aggregate, against the mean of the controls), sampled c1 +0.8 % and c4 +1.3 %, speedbench load at c16 **+2.2 %**; the c1 decode step **0.54 ms shorter** (paired per prompt, CI95 -0.57 to -0.51, faster on every one of the 60 stable prompts, with the two controls 0.12 ms apart), the c8 / c16 step 124.3 / 192.7 ms against 127.1-128.7 / 193.7-194.9 ms. None of the three changes runs in prefill: cold prefill x0.987 at 64K, x1.003 at 131K and x0.989 at 1M of the controls' mean (inside the gate's band), a cold 388K prompt's first token in 56.1 s against 56.3-56.7 s. Outputs: qeval 71 / 71 / 71, all 75 T = 0 qeval prompts inside the controls' own spread, KLD 0.004 short / 0.003 long (limit 0.035), draft acceptance on qeval identical on the three boots, reasoning length identical, the flushed 32K / 131K / 1M documents' first tokens and continuations inside the controls' states. Draft acceptance at c4 is 5.1 % lower by design (fewer drafts verified per step, each step cheaper; c4 tok/s is the net). The head's memory low-water is 6.19 GiB instead of 8.36-8.48 GiB (the scale codes' 2.03 GiB per rank). Every rule of the gate passed (see [the release gate](#v275-release-gate)). The image stack, the KV pool (8,541,952 tokens at fraction 0.85), the launch line and every other v2.7.4 key are unchanged.
+
+#### speedbench
+
+[speedbench](https://github.com/knapcio/speedbench) 0.3 (`6733653`), full mode: 73 frozen prompts in six categories (prompt set speedbench-v1), 256 output tokens, thinking off, run on the head. v2.7.5 release-gate boot (2026-11-12, official 1017 checkpoint, KV pool pinned at 8,541,952 tokens as in the production profile), mean of two full runs per greedy cell and one run per sampled cell; c1 is the decode tok/s geometric mean over the prompts, c4 to c16 the aggregate tok/s:
+
+| tok/s | all 73 prompts, c1 | prose, c1 | c4 aggregate | c8 aggregate | c16 aggregate |
+|---|---:|---:|---:|---:|---:|
+| greedy (temperature 0) | **92.4** | 68.5 | **141.5** | 174.9 | **216.8** |
+| sampled (temperature 0.7, top-p 0.95, seed 1) | 89.1 | 66.1 | 137.0 | – | – |
+
+The two v2.7.4 control boots of the same gate gave greedy c1 90.3 / 91.2, c4 136.0 / 137.7, c8 171.6 / 168.9, c16 214.8 / 216.2 and sampled c1 88.5 / 88.3, c4 134.6 / 135.9 tok/s. Speedbench load at c16 gave 232.4 aggregate tok/s, median TTFT 459 ms, per-stream median 17.1 tok/s (controls 227.6 / 227.2 tok/s, 470 / 467 ms). The decode step time was 124.3 ms against 127.1 / 128.7 at c8 and 192.7 against 193.7 / 194.9 at c16. At c4 the verify threshold of 0.25 verifies fewer drafts: 2.76 accepted tokens per step against 2.90 / 2.91 (-5.1 %; the in-boot A/B predicted -4.8 %), on cheaper steps, and c4 tok/s is the net of the two. c8 and c16 tok/s also move with the draft acceptance of the T = 0 text at concurrency, which differs by ~1.3 % between identical controls.
+
+Per category, greedy c1 (same boots, mean of two full runs):
+
+| tok/s | prose | code | structured | agentic | multilingual | long context | all 73 prompts |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| v2.7.5 | **68.5** | 115.7 | 114.4 | 103.6 | 73.7 | 93.7 | **92.4** |
+| v2.7.4 (two control boots) | 67.2 / 67.5 | 113.7 / 114.1 | 112.5 / 112.8 | 99.1 / 103.1 | 72.5 / 72.6 | 91.6 / 91.9 | 90.3 / 91.2 |
+
+v2.7.5 runs: all 92.41 / 92.39, prose 67.94 / 68.98, code 115.09 / 116.31, structured 113.84 / 115.05, agentic 105.19 / 101.96, multilingual 73.12 / 74.29, long context 95.33 / 92.03. Median time to first token 164.7 / 163.9 ms (controls 162.9-166.5 ms); 73 of 73 prompts valid in both runs, none failed. Agentic and long context vary most from run to run.
+
+**Under load** (v2.6, one fresh boot of the v2.6 image and profile, the last full load sweep; speedbench load: closed loop, 90 s per level, 256 output tokens, thinking off)
+
+| concurrency | block tok/s | per stream, median tok/s | TTFT, median |
+|---|---:|---:|---:|
+| c1 | 77.3 | 83.3 | 207 ms |
+| c4 | 131.7 | 38.7 | 310 ms |
+| c16 | **211.0** | 16.0 | 539 ms |
+
+Block tok/s is all completion tokens over the wall time of the level, including request start and prefill, so the c1 value sits below the decode geomean above. The v2.7.5 release gate ran load at c16 only: 232.4 aggregate tok/s, median TTFT 459 ms, per-stream median 17.1 tok/s.
+
+**Prefill, cold** (v2.7.5 release gate, the gate's own probes, not speedbench: 64K, 131K and 1M are the median of three flushed prompts of 62K, 127K and 969K tokens; 388K is the first token of a cold 388,000-token prompt, median of three)
+
+| tok/s | 64K | 131K | 388K | 1M (969K tokens) |
+|---|---:|---:|---:|---:|
+| v2.7.5 | **6,754** | **7,031** | **6,918** (56.1 s) | **5,714** |
+| v2.7.4 (two control boots) | 6,819 / 6,873 | 6,996 / 7,024 | 6,845 / 6,893 (56.7 / 56.3 s) | 5,660 / 5,890 |
+
+None of the three v2.7.5 changes runs in prefill (prefill forwards are eager: they keep the native scales and the stock weight copies, and the verify threshold is a decode rule). The cells are inside the gate's band (x0.987 / x1.003 / x0.989 of the controls' mean at 64K / 131K / 1M; the rule kills below x0.98). The 64K cell is 1.5 % below the 6,860 of v2.7.4's own release gate, while the v2.7.4 code itself gave 6,819 / 6,873 in this gate: boot-to-boot variation. The gate boot was not kept, so no same-boot rerun was possible.
+
+The needle tests at 248K and 969K tokens passed (35.6 s and 168.4 s). The four Sparks serve the abliterated variant in production ([`mrfakename/DeepSeek-V4.1-Flash-1017-abliterated`](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated) `517efab`); its edit touches only `attn.wo_b` and `shared_experts.w2` of the main layers (the DSpark draft layers are identical), so the two run within a few percent of each other. The v2.7.4, v2.7.3, v2.7.2, v2.7.1 and v2.7 tables are in [docs/history.md](history.md).
+
+#### v2.7.5 release gate
+
+v2.7.4 / v2.7.5 / v2.7.4, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU clock capped at 2200 MHz, 2026-11-11/12 (run `run-20261111-232031-341133`, 23:20 to 05:15, then the restore of production). The controls are production v2.7.4's image and profile; the v2.7.5 boot ran a gate image of `52e1f90` (production v2.7.4's image with this release's changed files added) and the production profile, whose only differences are the keys above; KV pool 8,541,952 tokens on all three. Verdict: **PASS -> RELEASE**, every rule passed (decode, sampled, load, decode step time, c1 step, cold prefill, first-token speed of flushed 32K / 131K / 1M documents, exactness, memory, qeval, idle CPU, idle first token, inter-token gaps, long-prompt decode), 0 safety, 0 kill, 0 invalid, restore PASS.
+
+- **Decode.** v2.7.5 against the mean of the controls: greedy c1 x1.018, c4 x1.034, c8 x1.027, c16 x1.006; sampled c1 x1.008, c4 x1.013; load c16 x1.022. The c1 step paired per prompt on identical work: -0.540 ms (CI95 -0.572 to -0.509), faster on all 60 stable prompts, with the two controls 0.120 ms apart (the rule's A / A limit is 0.15 ms). Step time c8 124.3 ms (127.1 / 128.7), c16 192.7 ms (193.7 / 194.9).
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot, all 75 T = 0 prompts inside the controls' bracket, KLD 0.0042 short / 0.0032 long against the controls (limit 0.035), the sampled-token distribution test p 0.998 (12,000 samples), the 16 thinking-on reasoning prompts the same length on all three boots. Exactness (flushed 32K, 131K and 1M documents, the first token's top-20 logprobs and a 64-token greedy continuation): the 32K first token identical in every run on all three boots and its continuations in the controls' two states, every 131K continuation in a control state, 1M inside the controls' spread. Needles at 248K and 969K tokens found.
+- **Draft acceptance** (pooled over the speedbench prompts): c1 x1.005 of the lower control, c4 x0.949 (the verify threshold; this release's floor x0.93), c8 x0.997 and c16 x1.004 reported only; on qeval identical on the three boots (3.979).
+- **Prefill and long prompts.** Cold prefill and the 388K prompt as in the table above; the first token of the flushed documents x0.998 / x1.000 / x0.982 of the controls' mean at 32K / 131K / 1M (x0.999 / x1.002 / x0.998 of the slower control). Long-prompt decode (flushed 32K and 131K documents, each followed by a 512-token greedy continuation) 94.0 tok/s (controls 91.9 / 95.3) at 3.62 tokens per step (3.55 / 3.70).
+- **Memory.** Head low-water 6.19 GiB (controls 8.48 / 8.36), during the cold 1M prompts 6.41 GiB (8.71 / 8.56): the scale codes' declared 2.03 GiB per rank, inside the rule's bound (5.83 GiB) and 2.19 GiB above the hard floor (4.0 GiB). The lowest worker low-water was 5.72 GiB (controls 8.05 / 7.79).
+- **The rest.** Idle first token 192 ms median (192 / 193); load c16 p99 inter-token gap 276 ms (285 / 289); a short prompt beside a cold 131K prefill got its first token in 0.29 s (0.27 / 0.27); the issue-16 soak 285 / 285 requests ok and its companion load 232 requests, 0 failed; no Xid on any boot. Every rank logged the coded experts at all 22 decode graph capacities (M = 5 to 96; 43 layers, native scales 4.05 GiB kept beside 2.03 GiB of codes), the evict-first copies at the same 22 capacities, and the per-batch-size verify threshold armed. A deliberately cold boot of v2.7.5 (tuning caches off) was ready in 211 s with no Xid, core dump or fault line.
+
+In production since 2026-11-12 05:39.
+
 ## v2.7.4 release, 2026-11-11, speedbench (the README's current results until v2.7.5)
 
 The README's v2.7.4 results and release gate, moved here (headings demoted, links adjusted, text unchanged) when v2.7.5 was released on 2026-11-12. The v2.7.5 numbers are in the [README](../README.md#current-results).

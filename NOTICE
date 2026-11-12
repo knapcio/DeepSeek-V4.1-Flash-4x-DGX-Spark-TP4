@@ -121,6 +121,10 @@ Third-party components and their licences:
   chunks") and 0526-0527 (ced.py nonfinal_limits), adapted to SGLang's decoder SWA bounded replay (the late-layer tail
   layout of the dsv4.1 branch); the port's changes are described in the file header. It wraps SGLang's tail metadata
   builder at import and copies no SGLang source.
+- v2.7.6: adapter/greedy_nogather.py (DSV41_GREEDY_NOGATHER) runs SGLang's MarkovHead.sample_block_greedy_fused and
+  _sharded_greedy_finish_kernel (dsv4.1 branch; Apache License 2.0, LICENSE.sglang) inside its greedy graph flavours;
+  its verify-head pair kernel is SGLang's _sharded_greedy_partial_kernel without the Markov bias operand. The graph
+  flavours, their replay rules and the hand-off to the in-graph accept are this repository's own code.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.

@@ -1,12 +1,14 @@
 # Changelog
 
-## v2.7.6 (candidate, release gate pending)
+## 2026-11-12 v2.7.6
 
 v2.7.5 plus one lossless decode change in the production profile (`DSV41_GREEDY_NOGATHER=1` appended to
 `EXTRA_CONTAINER_ENV`). The image stack, the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
 `--swa-prefix-tails 384` and every v2.7.5 key are unchanged; no kernel library changes (one adapter, its hooks and tests).
 Measured on the four Sparks against the v2.7.5 profile in the same boot (in-boot A/B with two control arms, the official
-1017 checkpoint, 2026-11-12). Release gate: TBD.
+1017 checkpoint, 2026-11-12), then in the release gate below (official 1017 checkpoint; verdict INVALID through a new
+host-job rule, re-judged without it and reviewed as release-equivalent). In production on the four Sparks since
+2026-11-12 16:53 (abliterated checkpoint).
 
 - **Decode: greedy steps without the full-vocabulary logits gathers (`DSV41_GREEDY_NOGATHER=1`,
   `adapter/greedy_nogather.py`).** Every draft and target-verify CUDA graph shape is captured a second time as a "greedy
@@ -37,10 +39,76 @@ Measured on the four Sparks against the v2.7.5 profile in the same boot (in-boot
   `graph_set()`, the per-variant capture filter and L2 receipt annotation); the adapter reads its gate from the process
   environment only.
 - **Credits:** the draft flavour body and the finish kernel of the target pairs are upstream SGLang's sharded greedy path
-  (`sample_block_greedy_fused`, `_sharded_greedy_finish_kernel`); the flavour graphs, the pair reduction of the verify
-  head and the accept hand-off are ours.
+  (`sample_block_greedy_fused`, `_sharded_greedy_finish_kernel`, `dsv4.1` branch), and the verify head's pair kernel is
+  upstream's `_sharded_greedy_partial_kernel` without the Markov bias operand; the flavour graphs, their replay rules and
+  the accept hand-off are ours.
 
 Rollback, config only: unset `DSV41_GREEDY_NOGATHER` (= the v2.7.5 profile, same image).
+
+Release gate (run `run-20261112-100257-1582428`, 2026-11-12 10:03 to 15:58, then the restore of production): v2.7.5 /
+v2.7.6 / v2.7.5, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three, GPU clock
+capped at 2200 MHz. The controls are production v2.7.5's image and profile; the v2.7.6 boot ran a gate image of `6ae84f3`
+(production v2.7.5's image with this release's changed files added) with the profile key above. KV pool 8,541,952
+tokens on all three boots. Verdict: **INVALID -> NO-RELEASE**, 0 safety, 0 kill, 15 invalid, restore PASS. All 15
+invalid results came from a host-job rule new in this gate: it dropped every run that any system timer job on any node
+touched (journal intervals padded by 30 s), counting presence rather than load (an idle packagekit daemon waiting out its
+300 s timeout, 0.04-0.08 s fwupd refreshes, 0.1-7 s apt-news / ESM cache / ua-timer runs, one 31 s apt-daily on a
+worker), which left the c1 and c8 decode, sampled, load and cold-probe cells without runs. The flagged runs sit inside or
+next to the clean runs of their own arm. The same judge (`rg27_decide.py` of the gate kit) was rerun on a copy of the run
+with the host-job inputs emptied; the numbers below and in the README are that re-judge's `release-numbers.json`. It
+gives every decode, load, step-time and c1-step rule PASS, sampled c4 INVALID (control spread) and one KILL, cold 64K
+prefill. Reviewed: the 64K cell is a transient state of the v2.7.6 boot, not a prefill cost of the release (below);
+accepted as release-equivalent and deployed.
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.7.5 / v2.7.6 / v2.7.5): greedy c1 all-prompt geomean 92.23 /
+  93.31 / 92.25 tok/s (runs 91.72 / 92.74, 92.37 / 94.26, 92.11 / 92.40) and prose 68.45 / 69.14 / 68.55; c4 141.47 /
+  144.03 / 141.86, c8 175.84 / 179.81 / 175.25 and c16 220.18 / 226.25 / 219.93 aggregate tok/s. Sampled (T 0.7, top-p
+  0.95, one run per cell): c1 88.59 / 89.36 / 90.66 and prose 65.71 / 64.96 / 65.56 tok/s, c4 134.31 / 139.27 / 138.72.
+  Speedbench load c16 230.98 / 237.38 / 230.96 aggregate tok/s (median TTFT 457 / 447 / 453 ms, p99 inter-token gap
+  284 / 278 / 283 ms). v2.7.6 against the slower control: greedy c1 x1.012, c4 x1.018, c8 x1.026, c16 x1.029, load c16
+  x1.028 (against the controls' mean x1.012 / x1.017 / x1.024 / x1.028, load x1.028); sampled c1 x1.009 (x0.986 of the
+  faster control, kill below x0.97); sampled c4 x1.037 / x1.004, INVALID because the controls' single runs were 3.3 %
+  apart (the lower one overlapped a 7 s apt-news job on two workers). The c1 step paired per prompt on identical work:
+  -0.310 ms (CI95 -0.328 to -0.292) against the controls, faster on all 60 stable prompts; the two controls differed by
+  0.021 ms (CI95 -0.003 to 0.044). Decode step time c8 123.33 / 120.74 / 122.89 ms, c16 190.89 / 186.55 / 190.79 ms
+  (step rate x1.022 / x1.023 of the slower control).
+- **Draft acceptance** (pooled over all prompts): c1 x1.004 and c4 x1.002 of the lower control; c8 x1.009 and c16 x1.007
+  reported only; on qeval at T = 0 the per-step histogram is identical on all 75 tasks and the three boots (3.979
+  accepted tokens per verify step).
+- **Prefill, cold** (median of three flushed prompts; v2.7.5 / v2.7.6 / v2.7.5): 64K 6,827 / 6,688 / 6,832 tok/s
+  (x0.9797 of the slower control, KILL below x0.98), 131K 6,988 / 7,012 / 7,009 (x1.004), 1M (969K tokens) 5,223 / 5,706 /
+  5,702 (x1.092; x1.001 of the faster control). A cold 388,000-token prompt (solo, median of three): first token 56.80 /
+  56.35 / 56.36 s (x1.008 / x1.000 the speed of the two controls). The flushed-document first tokens of the exactness
+  probes: 32K 5.03 / 4.99 / 4.97 s, 131K 19.77 / 19.62 / 19.54 s, 1M 182.2 / 180.9 / 179.3 s (x1.001 / x1.002 / x0.999 of
+  the controls' mean speed). The 64K review: the greedy flavours are decode graphs (the verify-head hook acts only inside
+  a target-verify flavour capture) and the prefill path is the stock code; in the v2.7.6 boot the three 64K probes ran
+  their 8192-token chunks over depths 8K-56K at 7,007 / 7,102 / 7,116 tok/s (2-3 % slow, uniformly, recovering from probe
+  1 to 3), while that boot's 131K probes about 30 s later ran the same chunks at 7,268 / 7,294 / 7,316 (controls 64K
+  7,212-7,320, 131K 7,236-7,332; in each control boot 64K and 131K agree within 0.5 %). The same dip appeared in v2.7.5's
+  own release-gate boot (64K chunks 7,134-7,215 against its 131K at 7,249). Only the release boot runs the 6.5-minute
+  sampled-distribution step, right before the 64K probes, a likely cause that is not proven. A 64K prefill cost below
+  about 0.5 % is not excluded.
+- **Exactness** (flushed 32K, 131K and 1M documents; the first token's top-20 logprobs and a 64-token greedy
+  continuation; five samples per boot at 32K, three at 131K, two at 1M): the 32K first token identical in every run on
+  all three boots, its continuations in the controls' two states; every 131K continuation in a control state; the 131K and
+  1M first tokens inside the controls' envelope. Stock-path cell (greedy, logprobs, JSON-schema grammar and penalty
+  requests, alone and mixed in one batch): every output inside the controls', the three logprob requests' logprobs equal
+  to the controls'.
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; all 75 T = 0 prompts inside the
+  controls' bracket (75 stable, 0 outside). KLD against the controls: short 0.0056, long 0.0034 (limit 0.035). T = 1
+  distribution check PASS (p 0.978, 12,000 samples). The 16 thinking-on reasoning prompts gave the same lengths on all
+  three boots (mean 122.7 tokens). Needles 256K (248,062 tokens, 35.7 s) and 1M (968,316 tokens, 169.9 s) found.
+- **Long-prompt decode** (flushed 32K x 2 and 131K x 3 documents, each followed by a 512-token greedy continuation):
+  decode 87.48 / 84.70 / 83.29 tok/s, 3.30 / 3.09 / 3.06 tokens per step.
+- **Memory and the rest.** Head memory low-water over the common phases 5.76 / 5.19 / 5.73 GiB, during the cold 1M
+  prompts 6.00 / 5.42 / 5.97 GiB: inside the rule's bound (3.43 GiB, the flavours' declared 1.8 GiB) and 1.19 GiB above
+  the hard floor (4.0 GiB); head free memory at READY 10.67 / 9.70 / 10.26 GiB. Idle first token 191 / 192 / 192 ms
+  median; a short prompt beside a cold 131K prefill got its first token in 0.29 / 0.27 / 0.26 s; the issue-16 soak 302 /
+  302 requests ok and its companion load 232 requests, 0 failed; no Xid on any boot. Receipts on every rank of the
+  v2.7.6 boot: greedy no-gather armed, 12 draft and 24 verify flavours captured, the last replay receipt 40,533 draft and
+  38,790 verify greedy-flavour replays with 0 fallbacks; none in the controls. A deliberately cold boot of v2.7.6 (tuning
+  caches off) was ready in 192 s with no Xid, core dump or fault line.
+
+In production on the four Sparks since 2026-11-12 16:53 (abliterated checkpoint).
 
 ## 2026-11-12 v2.7.5
 
