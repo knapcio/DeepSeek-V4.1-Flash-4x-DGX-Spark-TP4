@@ -50,6 +50,8 @@ FILES = {} if T.SG is None else {
 }
 
 
+# v2.7.7's production-line tail (the MXFP4 draft head), after v2.7.6's
+V277_TAIL = ["DSV41_DRAFT_HEAD_FP4=1"]
 # v2.7.6's production-line tail (greedy no-gather), after v2.7.5's
 V276_TAIL = ["DSV41_GREEDY_NOGATHER=1"]
 # v2.7.5's production-line tail (scale codes, then the evict-first experts + SHPF window)
@@ -446,7 +448,10 @@ class Profile(unittest.TestCase):
 
     def test_production_line(self):
         items = self._production_line().split('"')[1].split()
-        # v2.7.6's key comes last (V276_TAIL), then v2.7.5's
+        # v2.7.7's key comes last (V277_TAIL), then v2.7.6's
+        self.assertEqual(items[-len(V277_TAIL):], V277_TAIL)
+        items = items[:-len(V277_TAIL)]
+        # v2.7.6's key comes next (V276_TAIL), then v2.7.5's
         self.assertEqual(items[-len(V276_TAIL):], V276_TAIL)
         items = items[:-len(V276_TAIL)]
         # v2.7.5's keys come next (V275_TAIL): checked here, then the v2.7.4 line's checks below run on the rest
