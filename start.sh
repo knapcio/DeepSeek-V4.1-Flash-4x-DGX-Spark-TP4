@@ -13,7 +13,7 @@
 # Usage:
 #   ./start.sh                 doctor → image → share → serve (default)
 #   ./start.sh doctor          connectivity + GPU + checkpoint report
-#   ./start.sh pull            pull lmsysorg/sglang:dev-dsv41 on all 3 nodes
+#   ./start.sh pull            pull the pinned lmsysorg/sglang:dev-dsv41@sha256 base on all 3 nodes
 #   ./start.sh build           docker build the Engram overlay image everywhere
 #   ./start.sh download        hf download the pinned V4.1-Flash revision
 #   ./start.sh share           export spark1 checkpoint; NFS volumes on spark2/3
@@ -99,7 +99,7 @@ HF_REPO="${HF_REPO:-deepseek-ai/DeepSeek-V4.1-Flash}"
 HF_REVISION="${HF_REVISION:-fb2764a5cf321eaa5070ca8f9e892818f477c16d}"
 EXPECTED_SHARDS="${EXPECTED_SHARDS:-48}"
 
-BASE_IMAGE="${BASE_IMAGE:-lmsysorg/sglang:dev-dsv41}"
+BASE_IMAGE="${BASE_IMAGE:-lmsysorg/sglang:dev-dsv41@sha256:3dbc313030a6ef2c5d7de8ecf48e9aece722694a82182cb618cc82b588816349}"
 IMAGE="${IMAGE:-dsv41-3x-spark:local}"
 # What `build` compiles, and extra flags for it. A site that runs one of the optional
 # canary images sets BUILD_DOCKERFILE=Dockerfile.canary so `./start.sh build` produces

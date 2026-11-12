@@ -1,6 +1,8 @@
-# Arm64 sibling of the 0xSero pin (lmsysorg/sglang:dev-dsv41, linux/amd64
+# Base: lmsysorg/sglang:dev-dsv41 pinned by digest (the multi-arch index pulled 2026-09-10; arm64 image built
+# 2026-09-10 05:33 UTC). The tag moves upstream, and the runtime patches check the exact files of this build, so a
+# floating tag fails at patch_v41_tool_constraint.py (issue #78). Arm64 sibling of the 0xSero pin (linux/amd64
 # digest sha256:c4ca651192e57e91989b5176c3665148131b9a171e53861dee87f5e57cef25b5).
-ARG BASE_IMAGE=lmsysorg/sglang:dev-dsv41
+ARG BASE_IMAGE=lmsysorg/sglang:dev-dsv41@sha256:3dbc313030a6ef2c5d7de8ecf48e9aece722694a82182cb618cc82b588816349
 FROM ${BASE_IMAGE}
 WORKDIR /opt/dsv41
 COPY adapter /opt/dsv41/adapter
