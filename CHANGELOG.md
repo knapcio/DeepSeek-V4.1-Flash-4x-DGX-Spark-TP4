@@ -77,7 +77,11 @@ accepted as release-equivalent and deployed.
 - **Prefill, cold** (median of three flushed prompts; v2.7.5 / v2.7.6 / v2.7.5): 64K 6,827 / 6,688 / 6,832 tok/s
   (x0.9797 of the slower control, KILL below x0.98), 131K 6,988 / 7,012 / 7,009 (x1.004), 1M (969K tokens) 5,223 / 5,706 /
   5,702 (x1.092; x1.001 of the faster control). A cold 388,000-token prompt (solo, median of three): first token 56.80 /
-  56.35 / 56.36 s (x1.008 / x1.000 the speed of the two controls). The flushed-document first tokens of the exactness
+  56.35 / 56.36 s (x1.008 / x1.000 the speed of the two controls). Same-version rerun of these cells and the sampled
+  prose c1 cell (all below v2.7.5's published values) with the gate's probes, as a client on the production boot of
+  v2.7.6 (2026-11-12 17:46-18:04, restored 17:27, abliterated variant, no restart, after a discarded warm-up pass):
+  64K 6,934 tok/s (6,963 / 6,934 / 6,835), 131K 6,949, 388K 6,802 (57.0 s), 1M 5,695, sampled prose c1 64.1. The README
+  publishes the rerun's 64K (labeled as such); every other cell keeps its gate value. The flushed-document first tokens of the exactness
   probes: 32K 5.03 / 4.99 / 4.97 s, 131K 19.77 / 19.62 / 19.54 s, 1M 182.2 / 180.9 / 179.3 s (x1.001 / x1.002 / x0.999 of
   the controls' mean speed). The 64K review: the greedy flavours are decode graphs (the verify-head hook acts only inside
   a target-verify flavour capture) and the prefill path is the stock code; in the v2.7.6 boot the three 64K probes ran
