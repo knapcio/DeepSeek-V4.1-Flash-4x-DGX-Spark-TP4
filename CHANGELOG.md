@@ -31,8 +31,10 @@ arms, the official 1017 checkpoint, 2026-11-12). Release gate: TBD.
   receipts) and the A/B key registration of the three `DSV41_DRAFT_HEAD_FP4*` keys; every key is read from the process
   environment.
 - **Credits:** the idea of an MXFP4 drafter head for single-session drafts, with the fp8 copy kept for batched drafts,
-  is lever 1 of pico-dgx-ds4's `docs/stack4.md` (Picom-code), whose flag comes from blaesus/dsgx10. The quantizer, the
-  GEMV and its integration in the fp8 twin's dispatch are ours.
+  is lever 1 of pico-dgx-ds4's `ds41f-4xgx10-switchless/docs/stack4.md` (Picom-code,
+  https://github.com/Picom-code/pico-dgx-ds4/blob/14f3e6ce8c02538d202d6e6040557ff0b7bdc8da/ds41f-4xgx10-switchless/docs/stack4.md; `DSGB10_HEAD4_C1`); the MXFP4 drafter
+  head format (`--draft-head4`) comes from Andy Shu's dsgx10 (https://github.com/blaesus/dsgb10), which pico-dgx-ds4
+  forks. The quantizer, the GEMV and its integration in the fp8 twin's dispatch are ours.
 
 Rollback, config only: unset `DSV41_DRAFT_HEAD_FP4` (= the v2.7.6 profile, same image).
 
