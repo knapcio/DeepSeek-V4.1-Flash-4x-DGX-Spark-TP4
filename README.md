@@ -169,6 +169,8 @@ With `NFS_REUSE_EXPORT=1` the checkpoint is published into the export with hardl
 
 Same launcher as upstream; read [`docs/README-upstream.md`](docs/README-upstream.md) first for the fleet setup (NFS share, Engram packing, fabric). `pack` needs the checkpoint, so download it before the first `pack`.
 
+The base image is pinned by digest (`lmsysorg/sglang:dev-dsv41@sha256:3dbc3130…`, the multi-arch index this recipe was built and tested on). The `dev-dsv41` tag itself moves upstream, and the build-time patches check the exact files of this base, so do not override `BASE_IMAGE` with the bare tag. Build `Dockerfile.canary-roce` (the production image) as below; the plain `Dockerfile` is the old base-image path and its in-image tests expect the canary SGLang tree, so it is not a supported TP4 build.
+
 ```bash
 cp .env.tp4.example .env.tp4          # fill in HEAD_IP / WORKER_* / MODEL_DIR / fabric
 # production: uncomment IMAGE=dsv41-4x-spark:canary-roce, BUILD_DOCKERFILE=Dockerfile.canary-roce
