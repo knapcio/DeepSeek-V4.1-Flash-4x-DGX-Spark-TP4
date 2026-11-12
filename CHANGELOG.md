@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.7.5 (candidate, release gate pending)
+## 2026-11-12 v2.7.5
 
 v2.7.4 plus three lossless decode changes in the production profile (`DSV41_MOE_SCALE_CODES=1
 DSV41_MOE_SCALE_CODES_MIN_ROWS=2 DSV41_MOE_EVICT_FIRST=1 DSV41_L2_PREFETCH_SHPF_MB=6 DSV41_L2_PREFETCH_SHPF_EL=0` appended
@@ -9,7 +9,8 @@ to `EXTRA_CONTAINER_ENV`; `DSV41_VERIFY_CAP` changed in place from `conf:0.1` to
 (scale codes, evict-first; patch chain `... topk-sum-accumulate, scale-codes, evict-first`, `SOURCE_PATCH`
 5e7cd728135ff0df). Each change was measured on the four Sparks against the v2.7.4 profile in the same boot (in-boot A/B
 with two control arms, the official 1017 checkpoint, 2026-11-11); the three were measured in separate boots, never
-together before the release gate. Release gate: TBD.
+together before the release gate below (official 1017 checkpoint, clean PASS). In production on the four Sparks since
+2026-11-12 05:39 (abliterated checkpoint).
 
 - **Decode: routed-expert scales as 4-bit codes in the CUDA graphs (`DSV41_MOE_SCALE_CODES=1`, retain mode,
   `adapter/scale_codes.py`).** Idea: Christopher Owen (spark-ds41f, experiments/2026-10-18-scale-codes). After
@@ -32,8 +33,11 @@ together before the release gate. Release gate: TBD.
   flushing the lines worth keeping; the flag-on kernels have their own cache key and are compiled at load (also for the
   coded experts). The protected window is l2_prefetch v5's SHPF: 6 MB at the FFN-side hyper-connection entry, the shared
   expert's FC1 remainder and FC2, as a plain prefetch. Cache hints only: bit-identical by construction; the SASS gate
-  (`tests/sass_desc_check.py`) and the unit probe check the hinted copies (the first build hit a ptxas descriptor
-  miscompile, fixed with a 64-bit shared address). Measured (tier-12o window P, A / X / A'): c1 paired step **-0.19 ms**
+  (`tests/sass_desc_check.py`) and the unit probe check the hinted copies. ptxas workaround: with a 32-bit shared
+  destination, ptxas (CUDA 13.0, sm_121a) folded a uniform shared offset into the hinted `LDGSTS` and built it in the
+  low half of the cache-policy descriptor pair, so the copy read a corrupt descriptor and faulted on GB10 (illegal
+  instruction); the patch passes the destination as a 64-bit shared-window address, and the SASS gate rejects any
+  hinted copy whose descriptor pair is not the `createpolicy` value on every path. Measured (tier-12o window P, A / X / A'): c1 paired step **-0.19 ms**
   [-0.34, -0.04], c4 per step -0.38 ms [-0.74, -0.01], c4 tok/s +0.83 %; qeval 75 / 75 equal to A. SHPF alone was flat.
 - **Decode: verify threshold per batch size (`DSV41_VERIFY_CAP=conf:0.1/4:0.25/8:0.1`,
   `adapter/vcap_spec.py`).** The draft-confidence stopping threshold is 0.25 at batch sizes 4-7 (0.1 elsewhere, as
@@ -44,9 +48,63 @@ together before the release gate. Release gate: TBD.
 - **Test only:** the in-boot A/B registry keys of the scale-codes and evict-first changes (`adapter/ab_variant.py`). Not taken from the test
   branches: the greedy no-gather draft / verify flavours, the A/B graph-set sharing (`DSV41_AB_GRAPH_SETS`) and the
   per-variant L2 receipt annotation.
-- **Release gate:** TBD.
+- **Credits:** the scale codes port Christopher Owen's spark-ds41f experiment 2026-10-18-scale-codes (per-row base
+  exponent plus 4-bit codes, expanded in the GEMM; he credits Local Inference Lab's B12X MXFP4-CSF lossless scale
+  compression as prior art); the evict-first expert copies port his spark-ds41f #966 (evict_first TMA loads of the
+  routed-expert weights in his TileLang MoE) to b12x_next's CuTe kernels. No spark-ds41f code is included; the b12x_next
+  patches, retain mode, the SHPF window and the per-batch-size verify threshold are ours.
 
-Rollback, config only: unset the five keys (= the v2.7.4 profile, same image).
+Rollback, config only: unset the five keys and set `DSV41_VERIFY_CAP=conf:0.1` (= the v2.7.4 profile, same image).
+
+Release gate (run `run-20261111-232031-341133`, 2026-11-11 23:20 to 2026-11-12 05:15, then the restore of
+production): v2.7.4 / v2.7.5 / v2.7.4, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1`
+on all three, GPU clock capped at 2200 MHz. The controls are production v2.7.4's image and profile; the v2.7.5 boot ran
+a gate image of `52e1f90` (production v2.7.4's image with this release's changed files added) with the profile keys
+above. KV pool 8,541,952 tokens on all three boots. Verdict: **PASS -> RELEASE**, every rule PASS (qeval, decode,
+sampled, load, decode step time, c1 step, cold prefill, first-token speed of the flushed documents, exactness, memory,
+idle CPU, idle first token, inter-token gaps, long-prompt decode), 0 safety, 0 kill, 0 invalid, restore PASS.
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.7.4 / v2.7.5 / v2.7.4): greedy c1 all-prompt geomean 90.34 /
+  92.40 / 91.19 tok/s (runs 89.93 / 90.74, 92.41 / 92.39, 90.73 / 91.66) and prose 67.15 / 68.46 / 67.48; c4 136.04 /
+  141.51 / 137.70, c8 171.63 / 174.87 / 168.91 and c16 214.81 / 216.80 / 216.16 aggregate tok/s. Sampled (T 0.7, top-p
+  0.95, one run per cell): c1 88.49 / 89.14 / 88.32 and prose 65.44 / 66.09 / 65.93 tok/s, c4 134.62 / 137.04 / 135.93.
+  Speedbench load c16 227.57 / 232.37 / 227.17 aggregate tok/s (median TTFT 470 / 459 / 467 ms, p99 inter-token gap
+  285 / 276 / 289 ms). v2.7.5 against the mean of the controls: greedy c1 x1.018, c4 x1.034, c8 x1.027, c16 x1.006;
+  sampled c1 x1.008, c4 x1.013; load c16 x1.022. The c1 step paired per prompt on identical work: -0.540 ms (CI95
+  -0.572 to -0.509) against the controls, faster on all 60 stable prompts; the two controls differed by 0.120 ms (CI95
+  0.075 to 0.166), inside the rule's A / A limit of 0.15 ms. Decode step time c8 127.14 / 124.32 / 128.74 ms, c16
+  193.70 / 192.75 / 194.90 ms.
+- **Draft acceptance** (pooled over all prompts): c1 x1.005 of the lower control; c4 2.758 against 2.905 / 2.905 accepted
+  tokens per verify step (x0.949; the verify threshold of 0.25 at batch sizes 4-7, predicted -4.8 % greedy / -5.2 %
+  sampled by its in-boot A/B, judged against this release's floor of x0.93); c8 x0.997 and c16 x1.004 reported only;
+  qeval at T = 0 3.979 accepted tokens per verify step on all three boots.
+- **Prefill, cold** (median of three flushed prompts; v2.7.4 / v2.7.5 / v2.7.4): 64K 6,819 / 6,754 / 6,873 tok/s
+  (x0.987 of the controls' mean), 131K 6,996 / 7,031 / 7,024 (x1.003), 1M (969K tokens) 5,660 / 5,714 / 5,890 (x0.989),
+  all inside the rule's band (kill below x0.98). None of the three changes runs in prefill (eager forwards keep the native
+  scales and the stock copies). A cold 388,000-token prompt (solo, median of three): first token 56.68 / 56.08 / 56.29 s
+  (x1.011 / x1.004 the speed of the two controls). The flushed-document first tokens of the exactness probes: 32K
+  4.98 / 4.99 / 4.99 s, 131K 19.68 / 19.64 / 19.59 s, 1M 179.1 / 179.4 / 173.5 s (x0.998 / x1.000 / x0.982 of the
+  controls' mean speed).
+- **Exactness** (flushed 32K, 131K and 1M documents; the first token's top-20 logprobs and a 64-token greedy
+  continuation; five samples per boot at 32K, three at 131K, two at 1M): the 32K first token identical in every run on
+  all three boots, its continuations in the controls' two states; every 131K continuation in a control state; the 131K and
+  1M first tokens inside the controls' envelope.
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; all 75 T = 0 prompts inside the
+  controls' bracket (75 stable, 0 outside). KLD against the controls: short 0.0042, long 0.0032 (limit 0.035). T = 1
+  distribution check PASS (p 0.998, 12,000 samples). The 16 thinking-on reasoning prompts gave the same lengths on all
+  three boots (mean 122.7 tokens). Needles 256K (247,967 tokens, 35.6 s) and 1M (968,609 tokens, 168.4 s) found.
+- **Long-prompt decode** (flushed 32K x 2 and 131K x 3 documents, each followed by a 512-token greedy continuation):
+  decode 91.89 / 93.97 / 95.29 tok/s, 3.55 / 3.62 / 3.70 tokens per step.
+- **Memory and the rest.** Head memory low-water over the common phases 8.48 / 6.19 / 8.36 GiB, during the cold 1M
+  prompts 8.71 / 6.41 / 8.56 GiB: the scale codes' declared 2.03 GiB per rank, inside the rule's bound (5.83 GiB) and
+  2.19 GiB above the hard floor (4.0 GiB); the lowest worker 8.05 / 5.72 / 7.79 GiB. NVRM out-of-memory log lines
+  appeared on the first control and on v2.7.5 (283 / 409 / 0 per boot, mostly during the cold 1M prompts), with no Xid
+  on any boot. The issue-16 soak 297 / 285 / 296 requests ok, its companion load 228 / 232 / 232
+  requests, 0 failed; idle first token median 192 / 192 / 193 ms; a short prompt beside a cold 131K prefill answered
+  its first token in 0.27 / 0.29 / 0.27 s. A deliberately cold boot of v2.7.5 (tuning caches off) before the arms:
+  ready in 211 s, no Xid, core dump or fault line on any node.
+- **Receipts** (every rank): the coded experts at all 22 decode graph capacities (M = 5 to 96; 43 layers, native
+  scales 4.054 GiB kept beside 2.027 GiB of codes), the evict-first copies at the same 22 capacities with none refused,
+  and the per-batch-size verify threshold armed; the v2.7.4 receipts (tile table, `wo_a` table, prefill fold) as before.
 
 ## 2026-11-11 v2.7.4
 
