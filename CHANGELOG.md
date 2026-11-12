@@ -1,5 +1,47 @@
 # Changelog
 
+## v2.7.6 (candidate, release gate pending)
+
+v2.7.5 plus one lossless decode change in the production profile (`DSV41_GREEDY_NOGATHER=1` appended to
+`EXTRA_CONTAINER_ENV`). The image stack, the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
+`--swa-prefix-tails 384` and every v2.7.5 key are unchanged; no kernel library changes (one adapter, its hooks and tests).
+Measured on the four Sparks against the v2.7.5 profile in the same boot (in-boot A/B with two control arms, the official
+1017 checkpoint, 2026-11-12). Release gate: TBD.
+
+- **Decode: greedy steps without the full-vocabulary logits gathers (`DSV41_GREEDY_NOGATHER=1`,
+  `adapter/greedy_nogather.py`).** Every draft and target-verify CUDA graph shape is captured a second time as a "greedy
+  flavour", replayed on steps whose batch is all greedy; any other step replays the stock graph. Draft: under forced
+  folded sampling the draft graph all-gathers the full `[bs x 5, V]` fp32 step logits at each of the five Markov steps;
+  the flavour runs upstream SGLang's own sharded greedy Markov step (`sample_block_greedy_fused`: each rank's (max,
+  argmax) over its vocabulary shard, one compact gather), and the `DSV41_SPEC_SYNC_FREE` noise counter still advances
+  once per replay. Target: the verify head's flavour reduces the rank's logits (certified where qualified) to one (max,
+  lowest argmax) pair per 4096 columns and all-gathers the pairs instead of the `[M, V]` logits (c16: a 935 us NCCL
+  gather), then hands the ids to the in-graph greedy accept; it is replayed only when the static epilogue is armed (all
+  greedy, no logit adjustments, penalizers or grammar), without `return_logprob`, and with the draft-capture tap off or
+  the commit folded. The target ids are bitwise those of the stock accept for finite logits; a draft token can differ
+  from the stock folded sampler's only when two distinct values are closer than its exp-key resolution, which changes
+  how many tokens a step accepts, never which tokens are emitted (greedy verification accepts the target's argmax).
+  The draft flavour is installed inside eager_glue's vcap wrapper, so the verify_cap live-length update (with the
+  per-batch-size thresholds) is captured into the flavour graph too; the first test build ran it outside, and its greedy
+  steps verified with a stale length (at most two drafts accepted). Measured (tier-12o window n, 5 rounds, A / X / A',
+  official 1017): c16 per step **-2.28 ms** [-3.85, -0.71] (-1.28 %; negative in all five rounds, c16 tok/s +1.92 %), c4
+  per step **-0.86 ms** [-1.44, -0.28], c1 paired step -0.19 ms [-0.80, +0.43] (-0.41 ms [-0.51, -0.30] without a round
+  that a host apt / ESM cache refresh disturbed); the gather time the trace showed removed (c16 2.79 ms, c4 0.80 ms, c1
+  0.22 ms per step) matches the timed savings. Exactness: qeval 75 / 75 inside the T = 0 bracket, draft acceptance
+  bit-identical to both controls (7003 correct of 11755 proposed drafts in 2351 verifies, the same 6-bin histogram),
+  9050 greedy-flavour replays and 0 fallbacks on rank 0. Sampled cells replay the stock graphs: flat by design, the gain
+  is greedy-only. Memory: the flavours are one more capture of the 12 draft and 24 target shapes in the shared graph pool
+  (the window's head low-water -0.12 GiB against the controls); the release gate reports the head's MemAvailable with
+  production's single graph set plus the flavours.
+- **Not taken from the test branch:** the in-boot A/B plumbing (`adapter/ab_variant.py` keys, `DSV41_AB_GRAPH_SETS`,
+  `graph_set()`, the per-variant capture filter and L2 receipt annotation); the adapter reads its gate from the process
+  environment only.
+- **Credits:** the draft flavour body and the finish kernel of the target pairs are upstream SGLang's sharded greedy path
+  (`sample_block_greedy_fused`, `_sharded_greedy_finish_kernel`); the flavour graphs, the pair reduction of the verify
+  head and the accept hand-off are ours.
+
+Rollback, config only: unset `DSV41_GREEDY_NOGATHER` (= the v2.7.5 profile, same image).
+
 ## 2026-11-12 v2.7.5
 
 v2.7.4 plus three lossless decode changes in the production profile (`DSV41_MOE_SCALE_CODES=1
