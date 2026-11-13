@@ -88,6 +88,80 @@ class BuildTargetTests(unittest.TestCase):
             self.assertIn(f"-f {ROOT}/Dockerfile.canary", calls[0])
             self.assertIn("--build-arg PIP_INDEX=https://mirror.invalid/simple", calls[0])
 
+    def _ship(self, settings, docker_layers='["sha256:a","sha256:b"]', worker_layers='["sha256:a","sha256:b"]'):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "SSH_IDENTITY.pub").write_text("ssh-ed25519 AAAA test\n")
+            log = Path(tmp, "calls.log")
+            code = r"""
+              WORKER_HOSTS=(spark2 spark3)
+              rsync() { return 0; }
+              remote_on() { printf 'remote %s\n' "$*" >> "$LOG"
+                            case "$*" in *"docker image inspect"*) printf '%s\r\n' "$WORKER_LAYERS";; esac; }
+              ssh() { printf 'ssh %s\n' "$*" >> "$LOG"; printf 'stdin %s\n' "$(cat)" >> "$LOG"; }
+              docker() { printf 'docker %s\n' "$*" >> "$LOG"
+                         case "$1 $2" in
+                           "image inspect") case "$*" in *RootFS*) printf '%s\n' "$DOCKER_LAYERS";; *) echo arm64;; esac;;
+                           "save "*) echo "tar-of-$2";;
+                         esac; }
+              cmd_build
+            """
+            env = {"LOG": str(log), "DOCKER_LAYERS": docker_layers, "WORKER_LAYERS": worker_layers}
+            env.update(settings)
+            launcher = launcher_source() + "\n" + code
+            base = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "ROOT": str(ROOT)}
+            for name in ("MODEL_DIR", "COMMON_MODEL", "SSH_IDENTITY", "NCCL_HOST_DIR", "STATE_DIR", "LOG_DIR",
+                         "WORKER_DIR", "WORKER_ENGRAM_DIR", "ENGRAM_DIR", "HF_EXPORT_ROOT"):
+                base[name] = str(Path(tmp) / name)
+            base.update(env)
+            result = subprocess.run(["bash", "-c", launcher], env=base, cwd=ROOT, text=True,
+                                    capture_output=True, timeout=30)
+            return result, log.read_text() if log.exists() else ""
+
+    def test_ship_streams_the_head_image_instead_of_building(self):
+        result, calls = self._ship({"WORKER_IMAGE_SOURCE": "ship", "SHIP_HOSTS": "10.0.0.2 10.0.0.3",
+                                    "IMAGE": "dsv41-4x-spark:local"})
+        check(result)
+        lines = calls.splitlines()
+        self.assertEqual(sum(1 for line in lines if line.startswith("docker build ")), 1, calls)  # the head only
+        self.assertEqual(sum(1 for line in lines if line == "docker save dsv41-4x-spark:local"), 2, calls)
+        ssh = [line for line in lines if line.startswith("ssh ")]
+        self.assertEqual(len(ssh), 2, calls)
+        for line, addr in zip(ssh, ("10.0.0.2", "10.0.0.3")):
+            self.assertIn("-o BatchMode=yes", line)
+            self.assertTrue(line.endswith(f"zurih@{addr} docker load"), line)
+        self.assertEqual(sum(1 for line in lines if line == "stdin tar-of-dsv41-4x-spark:local"), 2, calls)
+        self.assertNotIn("--pull=false .\n", calls)  # no worker build
+
+    def test_ship_defaults_to_the_ssh_names(self):
+        result, calls = self._ship({"WORKER_IMAGE_SOURCE": "ship"})
+        check(result)
+        self.assertEqual([line.rsplit(" ", 3)[1] for line in calls.splitlines() if line.startswith("ssh ")],
+                         ["zurih@spark2", "zurih@spark3"], calls)
+
+    def test_ship_refuses_a_worker_with_other_layers(self):
+        result, _ = self._ship({"WORKER_IMAGE_SOURCE": "ship"}, worker_layers='["sha256:a"]')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("layers differ", result.stdout + result.stderr)
+
+    def test_ship_hosts_must_match_the_workers(self):
+        result, calls = self._ship({"WORKER_IMAGE_SOURCE": "ship", "SHIP_HOSTS": "10.0.0.2"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SHIP_HOSTS and WORKER_HOSTS differ in length", result.stdout + result.stderr)
+        self.assertNotIn("docker build", calls)
+
+    def test_unknown_worker_image_source_is_refused(self):
+        result, calls = self._ship({"WORKER_IMAGE_SOURCE": "copy"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("WORKER_IMAGE_SOURCE must be build or ship", result.stdout + result.stderr)
+        self.assertNotIn("docker build", calls)
+
+    def test_default_still_builds_on_every_worker(self):
+        result, calls = self._ship({})
+        check(result)
+        self.assertEqual(calls.count("--pull=false .\n"), 2, calls)  # one worker build each
+        self.assertNotIn("docker save", calls)
+        self.assertNotIn("\nssh ", "\n" + calls)
+
     def test_worker_builds_the_same_dockerfile(self):
         build = build_source()
         self.assertIn('docker build -f "$ROOT/$dockerfile" -t "$IMAGE"', build)

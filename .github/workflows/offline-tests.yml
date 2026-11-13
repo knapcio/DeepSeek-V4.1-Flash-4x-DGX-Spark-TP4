@@ -31,6 +31,7 @@ jobs:
             tests/test_stop_nfs_filter.py \
             tests/test_required_sglang_args.py \
             tests/test_launcher_build.py \
+            tests/test_dockerfile_layers.py \
             tests/test_sglang_bounded_replay_patch.py \
             tests/test_sglang_layer20_tail_patch.py \
             tests/test_sglang_prefill_interval_min_bs_patch.py \

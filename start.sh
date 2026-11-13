@@ -107,6 +107,12 @@ IMAGE="${IMAGE:-dsv41-3x-spark:local}"
 # BUILD_ARGS carries the rest, e.g. --build-arg PIP_INDEX=<mirror> without pypi.org.
 BUILD_DOCKERFILE="${BUILD_DOCKERFILE:-Dockerfile}"
 BUILD_ARGS="${BUILD_ARGS:-}"
+# How `build` puts $IMAGE on the workers. build (default): every worker runs the same docker build on its rsynced
+# copy (pulls the base, fetches the wheels). ship: the head's image goes over ssh (docker save | docker load, key
+# auth only), so workers need neither the base nor internet. SHIP_HOSTS (WORKER_HOSTS order) sends it over other
+# addresses than the ssh names, e.g. the ConnectX fabric IPs.
+WORKER_IMAGE_SOURCE="${WORKER_IMAGE_SOURCE:-build}"
+SHIP_HOSTS="${SHIP_HOSTS:-}"
 HEAD_CTN="${HEAD_CTN:-dsv41-head}"
 WORKER_CTN="${WORKER_CTN:-dsv41-worker}"
 WORKER_DIR="${WORKER_DIR:-/home/${WORKER_USER}/dsv41-3x-spark}"
@@ -648,8 +654,34 @@ cmd_pull() {
   info "base image present on all nodes"
 }
 
+# docker save on the head | docker load on one worker, then the worker's layer list must equal the head's.
+ship_image() {
+  local host="$1" addr="$2" want got
+  want=$(docker image inspect -f '{{json .RootFS.Layers}}' "$IMAGE")
+  info "docker save $IMAGE | ssh $addr docker load ..."
+  docker save "$IMAGE" | ssh -i "$SSH_IDENTITY" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o StrictHostKeyChecking=accept-new "${WORKER_USER:+${WORKER_USER}@}${addr}" docker load \
+    || die "$host: docker save | docker load of $IMAGE via $addr failed"
+  got=$(remote_on "$host" "docker image inspect -f '{{json .RootFS.Layers}}' $(printf '%q' "$IMAGE")") \
+    || die "$host: $IMAGE missing after docker load"
+  [[ "$got" == *"$want"* ]] || die "$host: $IMAGE layers differ from the head's after docker load"
+}
+
 cmd_build() {
   info "=== build $IMAGE from $ROOT ($BUILD_DOCKERFILE) ==="
+  case "$WORKER_IMAGE_SOURCE" in
+    build|ship) ;;
+    *) die "WORKER_IMAGE_SOURCE must be build or ship (got $WORKER_IMAGE_SOURCE)" ;;
+  esac
+  local ship_hosts=()
+  if [[ "$WORKER_IMAGE_SOURCE" == ship ]]; then
+    if [[ -n "$SHIP_HOSTS" ]]; then
+      read -r -a ship_hosts <<<"$(_list "$SHIP_HOSTS")"
+    else
+      ship_hosts=("${WORKER_HOSTS[@]}")
+    fi
+    [[ ${#ship_hosts[@]} -eq ${#WORKER_HOSTS[@]} ]] || die "SHIP_HOSTS and WORKER_HOSTS differ in length"
+  fi
   local base
   base=$(build_base_image) || return 1
   base_image_ready "$base" || return 1
@@ -663,8 +695,9 @@ cmd_build() {
   info "head built $IMAGE arch=$img_arch"
 
   ensure_ssh_keys
-  local h
+  local h n=0
   for h in "${WORKER_HOSTS[@]}"; do
+    n=$((n + 1))
     info "rsync recipe → $h:$WORKER_DIR"
     remote_on "$h" "mkdir -p $(printf '%q' "$WORKER_DIR")"
     # Anchored on purpose: an unanchored `models` also matches .../sglang/srt/models,
@@ -675,12 +708,16 @@ cmd_build() {
       --exclude '/engram' \
       -e "$(ssh_rsync_e)" \
       "$ROOT/" "${WORKER_USER:+${WORKER_USER}@}${h}:${WORKER_DIR}/"
+    if [[ "$WORKER_IMAGE_SOURCE" == ship ]]; then
+      ship_image "$h" "${ship_hosts[$((n - 1))]}"
+      continue
+    fi
     info "docker build on $h ..."
     remote_on "$h" --timeout "${BUILD_TIMEOUT:-0}" \
       "$(base_image_worker_command "$base")
        cd $(printf '%q' "$WORKER_DIR") && docker build -f $(printf '%q' "$dockerfile") -t $(printf '%q' "$IMAGE") $BUILD_ARGS --build-arg $(printf '%q' "BASE_IMAGE=$base") --pull=false ."
   done
-  info "overlay image on all 3 nodes"
+  info "overlay image on all $NNODES nodes ($WORKER_IMAGE_SOURCE)"
 }
 
 cmd_share() {
