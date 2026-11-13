@@ -1,12 +1,14 @@
 # Changelog
 
-## v2.7.7 (candidate, release gate pending)
+## 2026-11-13 v2.7.7
 
 v2.7.6 plus one lossless decode change in the production profile (`DSV41_DRAFT_HEAD_FP4=1` appended to
 `EXTRA_CONTAINER_ENV`). The image stack, the KV pool pin (8,541,952 tokens at fraction 0.85), the launch line,
 `--swa-prefix-tails 384` and every v2.7.6 key are unchanged; no kernel library changes (one adapter extended, its tests,
 one bench script). Measured on the four Sparks against the v2.7.6 profile in the same boot (in-boot A/B with two control
-arms, the official 1017 checkpoint, 2026-11-12). Release gate: TBD.
+arms, the official 1017 checkpoint, 2026-11-12), then in the release gate below (official 1017 checkpoint; verdict INVALID
+through one 131K greedy continuation that split on an exact logprob tie, reviewed as release-equivalent). In production
+on the four Sparks since 2026-11-13 04:39 (abliterated checkpoint).
 
 - **Decode: the c1 draft LM head from an MXFP4 copy (`DSV41_DRAFT_HEAD_FP4=1`, `adapter/draft_head_fp8.py`).** The
   DSpark draft borrows the target's vocab-parallel LM head (32320 x 5120 per rank) and, since 2026-09-23, reads an fp8
@@ -37,6 +39,76 @@ arms, the official 1017 checkpoint, 2026-11-12). Release gate: TBD.
   forks. The quantizer, the GEMV and its integration in the fp8 twin's dispatch are ours.
 
 Rollback, config only: unset `DSV41_DRAFT_HEAD_FP4` (= the v2.7.6 profile, same image).
+
+Release gate (run `run-20261112-221818-3227676`, 2026-11-12 22:18 to 2026-11-13 04:12, then the restore of production):
+v2.7.6 / v2.7.7 / v2.7.6, three fresh boots in that order on the same four Sparks, official 1017 `1bae0e1` on all three,
+GPU clock capped at 2200 MHz. The controls are production v2.7.6's image and profile; the v2.7.7 boot ran a gate image of
+`cfbbce5` (production v2.7.6's image with this release's changed files added) with the profile key above. KV pool
+8,541,952 tokens on all three boots. Verdict: **INVALID -> NO-RELEASE**, 0 safety, 0 kill, 1 invalid, the other 17 rule
+groups PASS, restore PASS. The one invalid result is the exactness check of the flushed 131K document (`exact d131k
+continuation: 1 X sample(s) outside the noisy controls (3 control states)`). Reviewed as release-equivalent and deployed
+through the reviewed path (below).
+- **The 131K continuation.** Three 64-token greedy continuations per boot; all nine share their first 25 tokens. At token
+  25 one v2.7.7 sample reads " name" where every other sample reads " compatibility": the v2.7.7 boot's two top logprobs
+  there were exactly tied (-0.8676 / -0.8676, bf16) and the tie resolved to the second-listed token, as every tie in this
+  window did. The sample then ends in a state that no control produced in this gate and that the registry of earlier
+  gates' control states (8 states over 28 samples) does not hold. The controls split on exact ties of their own on the
+  same document (one sample at token 46, one at token 62) and ended in three states over six samples; the other two
+  v2.7.7 samples are control states. The near-tie exemption (a control within 0.02 nat at the same position) did not
+  apply: the controls' margins at token 25 were 0.25-1.75 nat on an identical prefix. No systematic shift: mean margin
+  at token 25 1.125 nat against the controls' 1.042, the summed logprob of the 25 shared tokens inside the controls'
+  range. The 131K first tokens are inside the controls' envelope (two v2.7.7 top-20 vectors bit-equal to control
+  vectors). Mechanism: the MXFP4 copy is read only by draft calls; greedy verification commits only the target's argmax
+  of the target's own logits, so the draft changes which rows a verify step computes (and with them the batch
+  composition, the MoE expert rows and the reduction order), which can move an exact tie and nothing else. Same class
+  as v2.7.4's 131K tie at token 11. Over the recent gates about 0.22 fresh stock states per control sample, so at least
+  one fresh state in three samples has about a 53 % chance with no change at all.
+- **Decode** (speedbench 0.3 full, mean of two runs; v2.7.6 / v2.7.7 / v2.7.6): greedy c1 all-prompt geomean 93.00 /
+  94.03 / 93.16 tok/s (runs 92.92 / 93.08, 93.98 / 94.08, 92.37 / 93.95) and prose 69.11 / 69.87 / 69.11; c4 143.27 /
+  143.80 / 143.61 (the first control one run: the host-job rule dropped its second, which overlapped a 31 s apt-daily
+  job on the head), c8 179.50 / 179.61 / 179.35 and c16 225.01 / 226.13 / 223.82 aggregate tok/s. Sampled (T 0.7, top-p
+  0.95, one run per cell): c1 89.12 / 89.52 / 88.43 and prose 65.48 / 65.73 / 65.42 tok/s, c4 139.28 / 139.23 / 139.96.
+  Speedbench load c16 236.97 / 233.76 / 233.83 aggregate tok/s (median TTFT 451 / 460 / 469 ms, p99 inter-token gap
+  279 / 279 / 299 ms). v2.7.7 against the slower control / the controls' mean: greedy c1 x1.011 / x1.010, c4 x1.004 /
+  x1.003, c8 x1.001 / x1.001, c16 x1.010 / x1.008; sampled c1 x1.012 / x1.008, c4 x1.000 / x0.997; load c16 x1.000 /
+  x0.993 (x0.987 of the faster control, kill below x0.982). The c1 step paired per prompt: -0.388 ms (CI95 -0.420 to
+  -0.356), faster on all 59 stable prompts; the two controls differed by 0.002 ms (CI95 -0.019 to 0.016). Mean c1 step
+  33.71 / 33.32 / 33.71 ms; decode step time c8 120.88 / 120.48 / 121.19 ms, c16 185.39 / 185.59 / 187.68 ms. The c4 /
+  c8 / c16, sampled c4 and load cells run v2.7.6's code (batched drafts keep the fp8 twin) and sit below v2.7.6's
+  published 144.0 / 179.8 / 226.3 / 139.3 / 237.4 without a code reason, as do this gate's v2.7.6 controls: boot-to-boot
+  variation; no same-boot rerun was possible.
+- **Draft acceptance** (pooled over all prompts): c1 2.914 / 2.914 / 2.921 accepted tokens per step (x1.000 of the lower
+  control), c4 x1.003; c8 x0.999 and c16 x1.007 reported only. On qeval at T = 0 the drafts change by design: 2.964
+  correct drafts per verify step against 2.979 / 2.979 (x0.995, the in-boot A/B's value), the per-step histogram
+  different on 40 of 75 tasks (reported only).
+- **Prefill, cold** (median of three flushed prompts; v2.7.6 / v2.7.7 / v2.7.6): 64K 6,746 / 6,832 / 6,858 tok/s
+  (x1.004 of the controls' mean), 131K 6,991 / 7,011 / 7,021 (x1.001), 1M (969K tokens) 5,629 / 5,720 / 5,723 (x1.008).
+  A cold 388,000-token prompt (solo, median of three): first token 56.86 / 56.50 / 56.38 s. The flushed-document first
+  tokens of the exactness probes: 32K 4.98 / 4.99 / 5.00 s, 131K 19.69 / 19.68 / 19.84 s, 1M 179.2 / 179.9 / 180.2 s
+  (x1.001 / x1.004 / x0.999 of the controls' mean speed). 64K, 131K and 388K are below v2.7.6's published 6,934 (its
+  same-version rerun; gate value 6,688) / 7,012 / 6,885 without a code reason (the v2.7.6 controls gave 6,746-6,858 /
+  6,991-7,021 / 6,824-6,882 here); 1M is above v2.7.6's 5,706.
+- **Exactness, other documents.** The flushed 32K document's first token identical in every run on all three boots, its
+  five continuations per boot in a control state; the 1M first tokens inside the controls' envelope. Stock-path cell
+  (greedy, logprobs, JSON-schema grammar and penalty requests, alone and mixed in one batch): every output inside the
+  controls', the three logprob requests' logprobs equal to the controls' (the mixed-batch one within 0.01).
+- **Correctness.** qeval 71 / 71 / 71 with the same four failed tasks on every boot; all 75 T = 0 prompts inside the
+  controls' bracket (75 stable, 0 outside). KLD against the controls: short 0.0085, long 0.0049 (limit 0.035). T = 1
+  distribution check PASS (p 0.984, 12,000 samples). The 16 thinking-on reasoning prompts gave the same lengths on all
+  three boots (mean 122.7 tokens). Needles 256K (247,965 tokens, 36.5 s) and 1M (968,695 tokens, 173.4 s) found.
+- **Long-prompt decode** (flushed 32K x 2 and 131K x 3 documents, each followed by a 512-token greedy continuation):
+  decode 94.81 / 93.74 / 93.72 tok/s, 3.58 / 3.48 / 3.54 tokens per step (x0.982 of the lower control; marginal line
+  x0.98).
+- **Memory and the rest.** Head memory low-water over the common phases 5.22 / 5.26 / 5.35 GiB, during the cold 1M
+  prompts 5.50 / 5.34 / 5.48 GiB: inside the rule's bound (4.22 GiB, declared cost 0.5 GiB) and 1.26 GiB above the hard
+  floor (4.0 GiB); head free memory at READY 10.17 / 9.83 / 9.93 GiB. Idle first token 209 / 193 / 191 ms median; a
+  short prompt beside a cold 131K prefill got its first token in 0.28 / 0.28 / 0.28 s; the issue-16 soak 293 / 293
+  requests ok and its companion load 235 requests, 0 failed; no Xid on any boot. Receipts on every rank of the v2.7.7
+  boot: MXFP4 copy of the draft LM head (32320 x 5120, 83.8 MiB) built and armed, the 5-row draft graph captured with
+  the MXFP4 head and the 10- to 60-row draft graphs with the fp8 twin; none in the controls. A deliberately cold boot of
+  v2.7.7 (tuning caches off) was ready in 192 s with no Xid, core dump or fault line.
+
+In production on the four Sparks since 2026-11-13 04:39 (abliterated checkpoint).
 
 ## 2026-11-12 v2.7.6
 
