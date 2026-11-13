@@ -218,6 +218,8 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_folded_fence.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_eager_glue.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_draft_head_fp8.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_draft_head_fp4.py \
+ && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_draft_head_fp4_interp.py \
  && BV_TEST_N=60000 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify_numerics.py \
  && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=/opt/dsv41/adapter:/opt/dsv41/tests python3 /opt/dsv41/tests/test_block_verify_fold.py \

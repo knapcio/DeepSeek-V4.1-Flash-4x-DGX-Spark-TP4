@@ -36,6 +36,8 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_anthropic_thinki
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_sampled_commit_reuse.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_sampled_draft_probs_early.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_draft_head_fp8.py \
+ && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_draft_head_fp4.py \
+ && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_draft_head_fp4_interp.py \
  && BV_TEST_N=60000 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_block_verify_numerics.py \
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_autotune_keep.py \

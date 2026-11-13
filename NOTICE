@@ -125,6 +125,12 @@ Third-party components and their licences:
   _sharded_greedy_finish_kernel (dsv4.1 branch; Apache License 2.0, LICENSE.sglang) inside its greedy graph flavours;
   its verify-head pair kernel is SGLang's _sharded_greedy_partial_kernel without the Markov bias operand. The graph
   flavours, their replay rules and the hand-off to the in-graph accept are this repository's own code.
+- v2.7.7: the MXFP4 draft-head copy in adapter/draft_head_fp8.py (DSV41_DRAFT_HEAD_FP4) follows an idea from
+  pico-dgx-ds4 (Picom-code, https://github.com/Picom-code/pico-dgx-ds4, ds41f-4xgx10-switchless/docs/stack4.md lever 1
+  at commit 14f3e6c: an MXFP4 drafter head for single-session drafts, the FP8 copy kept for batched drafts), a fork of
+  Andy Shu's dsgx10 (https://github.com/blaesus/dsgb10, MIT; its MXFP4 drafter head format). No pico-dgx-ds4 or dsgx10
+  code is copied; the quantizer, the GEMV and the dispatch are this
+  repository's own code.
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.
