@@ -33,7 +33,7 @@ class BackportPackagingTests(unittest.TestCase):
 
     def test_both_canary_images_verify_the_staged_source(self):
         command = (
-            "RUN python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py "
+            "python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py "
             "/sgl-workspace/sglang/python"
         )
         for name in ("Dockerfile.canary", "Dockerfile.canary-roce"):

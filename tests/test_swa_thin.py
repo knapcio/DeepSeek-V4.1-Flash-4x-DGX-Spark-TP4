@@ -485,7 +485,7 @@ class Profile(unittest.TestCase):
 
     def test_dockerfile_runs_this_test(self):
         d = (ROOT / "Dockerfile.canary-roce").read_text()
-        self.assertIn("RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py", d)
+        self.assertIn("CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_thin.py", d)
 
 
 if __name__ == "__main__":

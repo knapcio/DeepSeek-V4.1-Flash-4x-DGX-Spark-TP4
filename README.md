@@ -189,12 +189,12 @@ cp .env.tp4.example .env.tp4          # fill in HEAD_IP / WORKER_* / MODEL_DIR /
 scripts/fetch-sglang-canary.sh        # stages the pinned dsv4.1 branch tree
 scripts/fetch-nccl.sh                 # stages NVIDIA/nccl v2.30.7-1 for the canary-roce nccl-builder stage
 ./start-tp4.sh doctor
-./start-tp4.sh build                  # builds on every node, bakes the adapters, runs the in-image tests
+./start-tp4.sh build                  # builds on every node (WORKER_IMAGE_SOURCE=ship: once, then docker save | load), bakes the adapters, runs the in-image tests
 ./start-tp4.sh share && ./start-tp4.sh pack   # first time only, see upstream README
 ./start-tp4.sh serve                  # ./start-tp4.sh stop | status | logs | smoke
 ```
 
-The canary images have about 148 layers. A node whose Docker storage driver is `overlay2` (`docker info -f '{{.Driver}}'`) refuses images deeper than 128 layers ("max depth exceeded"); use the containerd image store there, or load a flattened copy (`docker export` of a container from the image, `docker import`, then restore `ENV`, `WORKDIR`, `HEALTHCHECK`, `ENTRYPOINT` and `CMD` in a small Dockerfile on top).
+The pinned base has 77 layers and the recipes add 14 (`Dockerfile`), 25 (`Dockerfile.canary`) and 32 (`Dockerfile.canary-roce`). A Docker daemon on the `overlay2` graph driver (`docker info -f '{{.Driver}}'` prints `overlay2`, not `overlayfs`) refuses a build step past 129 layers ("max depth exceeded", #83), so the in-image checks share a few `RUN` steps and `tests/test_dockerfile_layers.py` keeps every recipe at least 10 layers under that limit.
 
 The boot log must show these lines, otherwise the profile is not active:
 

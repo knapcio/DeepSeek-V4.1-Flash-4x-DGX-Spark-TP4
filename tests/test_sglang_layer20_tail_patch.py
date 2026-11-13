@@ -30,7 +30,7 @@ class Layer20BackportPackagingTests(unittest.TestCase):
 
     def test_both_canary_images_verify_the_staged_source(self):
         verifier = (
-            "RUN python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py "
+            "python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py "
             "/sgl-workspace/sglang/python"
         )
         test = "python3 /opt/dsv41/tests/test_sglang_layer20_tail_patch.py"

@@ -41,8 +41,6 @@ COPY runtime/sglang-canary/python /sgl-workspace/sglang/python
 RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark; print('import ok')"
 WORKDIR /opt/dsv41
 COPY adapter /opt/dsv41/adapter
-RUN g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread \
-    adapter/row_store.cpp -o adapter/librow_store.so
 COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 # v2.7: the K8 / PCE module (runtime/flashinfer_pce) and the v41c / v41n / swan module (runtime/flashinfer_v41c) are
 # retired here. Both were generated from or checked against FlashInfer 0.6.18's approved sparse_mla_sm120 closure and
@@ -56,57 +54,62 @@ COPY runtime/flashinfer_pce/dsv41_pce.py /sgl-workspace/sglang/python/sglang/ker
 COPY runtime/flashinfer_v41c/v41c.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv41_v41c.py
 # Fail the build if either pinned textual-placeholder anchor has drifted.
 COPY runtime/patch_encoding_dsv41.py /opt/dsv41/runtime/patch_encoding_dsv41.py
-RUN python3 /opt/dsv41/runtime/patch_encoding_dsv41.py
 COPY boot.py /opt/dsv41/boot.py
 # v2.7: the frozen sparse-MLA calibration (boot.py v41_frozen_calibration; FlashInfer never calibrates in-process)
 COPY files/fi-autotune /opt/dsv41/files/fi-autotune
 COPY scripts /opt/dsv41/scripts
-RUN python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_prefill_interval_min_bs.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_parallel_prompt_encode.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_inline_system.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_tool_images_thinking.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_tool_images_thinking.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_padded_query_buffer.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_padded_query_buffer.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_dp_padding.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_dp_padding.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_mhc_prewarm_no_chunk.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_mhc_prewarm_no_chunk.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_plain_text.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_reasoning_end.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dspark_draft_params.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dspark_accept_outputs.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dspark_softmax_clamp.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dspark_softmax_clamp.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dspark_param_restage.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dspark_param_restage.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_mxfp8_decode_tactics.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_indexer_inplace.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_blocked_kv_dequant.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_blocked_kv_dequant.py
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_align_indexer_width.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_align_indexer_width.py
-# #45804 narrows #45762 to native DeepSeek encoders and covers Responses API.
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_thinking_parity.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_thinking_parity.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_window_history_src.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_window_history_src.py
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_fused_window_layout.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_fused_window_layout.py
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_idle_swa_store.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_idle_swa_store.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_dsv41_draft_metadata_glue.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_dsv41_draft_metadata_glue.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/verify_sglang_greedy_flags_refresh.py /sgl-workspace/sglang/python
-RUN python3 /opt/dsv41/scripts/test_sglang_greedy_flags_refresh.py /sgl-workspace/sglang/python
-COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
-COPY runtime/sglang-canary/upstream-tests/test_plain_text_encode.py /opt/dsv41/upstream-tests/test_plain_text_encode.py
-COPY runtime/sglang-canary/upstream-tests/test_reasoning_parser.py /opt/dsv41/upstream-tests/test_reasoning_parser.py
-RUN PYTHONPATH=/sgl-workspace/sglang/python python3 -m pytest -q /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py
-RUN PYTHONPATH=/sgl-workspace/sglang/python python3 -m pytest -q /opt/dsv41/upstream-tests/test_plain_text_encode.py
-RUN PYTHONPATH=/sgl-workspace/sglang/python python3 /opt/dsv41/scripts/run_sglang_45458_upstream_test.py /opt/dsv41/upstream-tests/test_reasoning_parser.py
+COPY runtime/sglang-canary/upstream-tests/test_parallel_prompt_encode.py \
+     runtime/sglang-canary/upstream-tests/test_plain_text_encode.py \
+     runtime/sglang-canary/upstream-tests/test_reasoning_parser.py /opt/dsv41/upstream-tests/
+# Layer budget (issue #83): the base image has 77 layers and a Docker daemon on the overlay2 graph driver refuses a
+# build step past 129 ("max depth exceeded"), so the checks below share one RUN (set -e, &&: the first failure stops
+# the build), in the order of the former single RUN steps, with their COPYs first; tests/test_dockerfile_layers.py
+# keeps every recipe under the limit.
+# The thinking_parity pair: #45804 narrows #45762 to native DeepSeek encoders and covers Responses API.
+RUN set -e; g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread adapter/row_store.cpp -o adapter/librow_store.so \
+ && python3 /opt/dsv41/runtime/patch_encoding_dsv41.py \
+ && python3 /opt/dsv41/scripts/verify_sglang_bounded_replay.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_layer20_tail.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_prefill_interval_min_bs.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_parallel_prompt_encode.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_inline_system.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_tool_images_thinking.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_tool_images_thinking.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_padded_query_buffer.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_padded_query_buffer.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_dp_padding.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_dp_padding.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_mhc_prewarm_no_chunk.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_mhc_prewarm_no_chunk.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_plain_text.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_reasoning_end.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dspark_draft_params.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dspark_accept_outputs.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dspark_softmax_clamp.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dspark_softmax_clamp.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dspark_param_restage.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dspark_param_restage.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_mxfp8_decode_tactics.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_indexer_inplace.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_blocked_kv_dequant.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_blocked_kv_dequant.py \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_align_indexer_width.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_align_indexer_width.py \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_thinking_parity.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_thinking_parity.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_window_history_src.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_window_history_src.py \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_fused_window_layout.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_fused_window_layout.py \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_idle_swa_store.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_idle_swa_store.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_dsv41_draft_metadata_glue.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_dsv41_draft_metadata_glue.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/verify_sglang_greedy_flags_refresh.py /sgl-workspace/sglang/python \
+ && python3 /opt/dsv41/scripts/test_sglang_greedy_flags_refresh.py /sgl-workspace/sglang/python \
+ && PYTHONPATH=/sgl-workspace/sglang/python python3 -m pytest -q /opt/dsv41/upstream-tests/test_parallel_prompt_encode.py \
+ && PYTHONPATH=/sgl-workspace/sglang/python python3 -m pytest -q /opt/dsv41/upstream-tests/test_plain_text_encode.py \
+ && PYTHONPATH=/sgl-workspace/sglang/python python3 /opt/dsv41/scripts/run_sglang_45458_upstream_test.py /opt/dsv41/upstream-tests/test_reasoning_parser.py
 COPY tests /opt/dsv41/tests
 COPY benchmarks /opt/dsv41/benchmarks
 # Packaging tests below also verify patch provenance and both canary build

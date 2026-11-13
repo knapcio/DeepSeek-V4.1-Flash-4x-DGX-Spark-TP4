@@ -348,7 +348,7 @@ class Profile(unittest.TestCase):
             self.skipTest("not a repo checkout (in an image)")
         with open(os.path.join(root, "Dockerfile.canary-roce")) as f:
             d = f.read()
-        self.assertIn("RUN CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone_v41c.py", d)
+        self.assertIn("CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_swa_cone_v41c.py", d)
 
 
 if __name__ == "__main__":
