@@ -707,13 +707,14 @@ class ConcurrentActivity(unittest.TestCase):
                 act.enter(); heap.dirty_and_free(64); time.sleep(0.02 + 0.01 * k); act.exit(); time.sleep(0.03)
         ts = [threading.Thread(target=tokenizer, args=(k,)) for k in range(4)]
         [t.start() for t in ts]; [t.join() for t in ts]
-        during = len(seen)
         time.sleep(0.6)
         stop.set(); runner.join(5)
-        self.assertEqual(during, 0, seen)
-        self.assertEqual(len(seen), 1, seen)              # one trim once the tokenizers went quiet
-        self.assertEqual(seen[0][0], 0)
-        self.assertGreaterEqual(seen[0][1], 0.15)
+        # The rule is "nothing in flight and IDLE_S of quiet", not "no trim before busy_end": a slow runner (CI)
+        # can leave all four tokenizers asleep for >= IDLE_S, and a trim in that gap is correct.
+        self.assertTrue(seen, seen)                       # at least the trim once the tokenizers went quiet
+        for inflight, quiet_s in seen:
+            self.assertEqual(inflight, 0, seen)
+            self.assertGreaterEqual(quiet_s, 0.15, seen)
 
 
 class Hooks(unittest.TestCase):
