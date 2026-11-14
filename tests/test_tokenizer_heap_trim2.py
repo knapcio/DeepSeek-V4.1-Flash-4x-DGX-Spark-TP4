@@ -511,14 +511,14 @@ class BusyFallback(unittest.TestCase):
         act.hooks.append('test')
         seen = []
 
-        def trim():
-            seen.append(act.inflight)
+        def trim():                                       # which thread trimmed: a gap (tokenizer) or the fallback (runner)
+            seen.append((threading.current_thread().name, act.inflight))
             heap.trim()
         cfg = ht.Config({'DSV41_TOKENIZER_TRIM2_IDLE_S': '5', 'DSV41_TOKENIZER_TRIM2_POLL_S': '0.005',
                          'DSV41_TOKENIZER_TRIM2_MAX_BUSY_S': '0.05', 'DSV41_TOKENIZER_TRIM2_MIN_INTERVAL_S': '0.1'})
         tr = ht.Trimmer(cfg, act, rss_kb=lambda: heap.rss_kb, free_bytes=lambda: heap.free, trim=trim, log=lambda m: None)
         stop = threading.Event()
-        runner = threading.Thread(target=tr.run, args=(stop,)); runner.start()
+        runner = threading.Thread(target=tr.run, args=(stop,), name='runner'); runner.start()
         end = time.monotonic() + 1.0
         lock = threading.Lock()
 
@@ -529,10 +529,14 @@ class BusyFallback(unittest.TestCase):
                     heap.dirty_and_free(64)
                 time.sleep(0.02)
                 act.exit()
-        t = threading.Thread(target=tokenizer); t.start(); t.join()
+        t = threading.Thread(target=tokenizer, name='tokenizer'); t.start(); t.join()
         stop.set(); runner.join(5)
-        self.assertTrue(seen)
-        self.assertEqual(set(seen), {0}, seen)
+        # Gap trims run on the tokenizer thread at the 1 -> 0 edge and must see nothing in flight. A slow runner
+        # (CI) can hold a prompt past MAX_BUSY_S after the trim fell due; then the poll thread runs it by design
+        # (step: wait_gap=False), so its trims may overlap a prompt and are not checked here.
+        gaps = [n for who, n in seen if who == 'tokenizer']
+        self.assertTrue(gaps, seen)
+        self.assertEqual(set(gaps), {0}, seen)
 
 
 class ConfigRange(unittest.TestCase):
@@ -696,7 +700,7 @@ class ConcurrentActivity(unittest.TestCase):
         tr = ht.Trimmer(cfg, act, rss_kb=lambda: heap.rss_kb, free_bytes=lambda: heap.free, trim=trim,
                         log=lines.append)
         stop = threading.Event()
-        runner = threading.Thread(target=tr.run, args=(stop,)); runner.start()
+        runner = threading.Thread(target=tr.run, args=(stop,), name='runner'); runner.start()
         busy_end = time.monotonic() + 1.2
         def tokenizer(k):                                 # 4 tokenizers, gaps < idle_s, heap growing throughout
             while time.monotonic() < busy_end:
